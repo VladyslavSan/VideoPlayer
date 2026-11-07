@@ -74,7 +74,8 @@ pub struct VideoSurface {
 }
 
 impl VideoSurface {
-    pub fn new(parent: HWND, source: &str) -> Result<Self> {
+    /// Starts playing `source` at `start` seconds.
+    pub fn new(parent: HWND, source: &str, start: f64) -> Result<Self> {
         let host = create_host(parent).context("creating the video host window")?;
         let wid = host.0.0 as i64;
         let mpv = Mpv::with_initializer(|init| {
@@ -84,7 +85,8 @@ impl VideoSurface {
             init.set_option("hwdec", "auto-safe")?;
             init.set_option("target-colorspace-hint", "yes")?;
             init.set_option("keep-open", "yes")?;
-            init.set_option("loop-file", "inf")?;
+            // Arrow-key skips land exactly, not on the next keyframe.
+            init.set_option("hr-seek", "yes")?;
             init.set_option("osc", "no")?;
             init.set_option("osd-level", 0i64)?;
             init.set_option("input-default-bindings", "no")?;
@@ -96,7 +98,8 @@ impl VideoSurface {
             Ok(())
         })
         .map_err(|e| anyhow!("initialising mpv: {e}"))?;
-        mpv.command("loadfile", &[source])
+        let start = format!("start={start:.3}");
+        mpv.command("loadfile", &[source, "replace", "-1", &start])
             .map_err(|e| anyhow!("loading {source}: {e}"))?;
         Ok(Self { mpv, host, parent })
     }
@@ -125,6 +128,11 @@ impl VideoSurface {
 
     pub fn duration(&self) -> f64 {
         self.mpv.get_property("duration").unwrap_or(0.0)
+    }
+
+    /// True once playback reaches the end (mpv holds the last frame).
+    pub fn ended(&self) -> bool {
+        self.mpv.get_property("eof-reached").unwrap_or(false)
     }
 
     pub fn paused(&self) -> bool {
