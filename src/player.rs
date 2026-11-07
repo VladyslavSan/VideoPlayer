@@ -51,8 +51,13 @@ fn native_hwnd(window: &Window) -> Result<HWND> {
 
 /// Creates the native video layer for `window`. Kept separate from
 /// `Player::new` so failures surface before the view exists.
-pub fn open_video(window: &Window, source: &str, start: f64) -> Result<VideoSurface> {
-    VideoSurface::new(native_hwnd(window)?, source, start)
+pub fn open_video(
+    window: &Window,
+    source: &str,
+    start: f64,
+    http_header: Option<&str>,
+) -> Result<VideoSurface> {
+    VideoSurface::new(native_hwnd(window)?, source, start, http_header)
 }
 
 fn format_time(seconds: f64) -> String {

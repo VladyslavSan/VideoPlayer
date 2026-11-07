@@ -1,26 +1,32 @@
-//! App shell: the library screens, and switching to and from the player.
+//! App shell: the library screens (local folders and Jellyfin), the Jellyfin
+//! sign-in screen, and switching to and from the player.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use anyhow::{Context as _, Result};
+use anyhow::{Context as _, Result, bail};
 use gpui::{
-    AnyElement, ClickEvent, Context, ElementId, Entity, FocusHandle, FontWeight, KeyDownEvent,
-    ObjectFit, PathPromptOptions, SharedString, Subscription, Window, div, img, prelude::*, px,
-    rgb, rgba,
+    AnyElement, ClickEvent, Context, ElementId, Entity, FocusHandle, Focusable, FontWeight,
+    KeyDownEvent, ObjectFit, PathPromptOptions, SharedString, Subscription, Window, div, img,
+    prelude::*, px, rgb, rgba,
 };
 
-use crate::library::{Db, Item, scan, thumbs};
+use crate::jellyfin::{self, Client, ImageRef, PlaybackReport, Server, discovery};
+use crate::library::{Db, Item, Source, WATCHED_FRACTION, scan, thumbs};
 use crate::player::{self, Player, PlayerEvent};
+use crate::ui::text_input::TextInput;
 
 const BG: u32 = 0x0b0d12;
 const TEXT: u32 = 0xf4f5f7;
 const MUTED: u32 = 0x8f98a8;
 const ACCENT: u32 = 0x4c8dff;
+const ERROR: u32 = 0xff7a7a;
 const CARD_WIDTH: f32 = 256.0;
 const CARD_HEIGHT: f32 = 144.0;
 const CONTINUE_LIMIT: usize = 12;
+const DISCOVERY_WAIT: Duration = Duration::from_millis(1500);
 const PLACEHOLDER_COLORS: [u32; 6] = [0x2b3a55, 0x3d2b55, 0x2b5547, 0x55402b, 0x552b3a, 0x2b4d55];
 
 /// Where the library database and thumbnails live.
@@ -46,10 +52,18 @@ impl Paths {
     }
 }
 
+fn now() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
+}
+
 #[derive(Clone, PartialEq)]
 enum Screen {
     Home,
     Show(String),
+    Connect,
 }
 
 /// What a poster card shows.
@@ -64,21 +78,41 @@ struct Card {
 
 struct ActivePlayer {
     view: Entity<Player>,
+    /// None when playing a file passed on the command line.
+    source: Option<Source>,
+    position: f64,
+    duration: f64,
     _subscription: Subscription,
+}
+
+struct ConnectForm {
+    url: Entity<TextInput>,
+    user: Entity<TextInput>,
+    password: Entity<TextInput>,
+    busy: bool,
+    searching: bool,
+    found: Vec<discovery::Found>,
+    error: Option<SharedString>,
 }
 
 pub struct Shell {
     db: Db,
     paths: Paths,
-    items: Vec<Item>,
+    device_id: String,
+    local: Vec<Item>,
+    remote: Vec<Item>,
     roots: Vec<PathBuf>,
+    servers: Vec<Server>,
     screen: Screen,
     player: Option<ActivePlayer>,
     scanning: bool,
+    loading_servers: HashSet<i64>,
     thumbs_running: bool,
     thumbs_left: usize,
+    artwork_left: usize,
     error: Option<SharedString>,
     focus: FocusHandle,
+    form: ConnectForm,
 }
 
 impl Shell {
@@ -89,47 +123,75 @@ impl Shell {
         cx: &mut Context<Self>,
     ) -> Result<Self> {
         let db = Db::open(&paths.db)?;
+        let device_id = db.device_id()?;
         let focus = cx.focus_handle();
         focus.focus(window);
+        let form = ConnectForm {
+            url: cx.new(|cx| TextInput::new("http://192.168.1.10:8096", false, cx)),
+            user: cx.new(|cx| TextInput::new("Username", false, cx)),
+            password: cx.new(|cx| TextInput::new("Password", true, cx)),
+            busy: false,
+            searching: false,
+            found: Vec::new(),
+            error: None,
+        };
         let mut shell = Self {
             db,
             paths,
-            items: Vec::new(),
+            device_id,
+            local: Vec::new(),
+            remote: Vec::new(),
             roots: Vec::new(),
+            servers: Vec::new(),
             screen: Screen::Home,
             player: None,
             scanning: false,
+            loading_servers: HashSet::new(),
             thumbs_running: false,
             thumbs_left: 0,
+            artwork_left: 0,
             error: None,
             focus,
+            form,
         };
         shell.reload();
-        shell.rescan(cx);
+        shell.refresh(cx);
         shell.generate_thumbs(cx);
         if let Some(source) = source {
             let title = Path::new(&source)
                 .file_name()
                 .map(|n| n.to_string_lossy().into_owned())
                 .unwrap_or_else(|| source.clone());
-            shell.start_player(source, title.into(), 0.0, None, window, cx);
+            shell.start_player(source, None, title.into(), 0.0, None, window, cx);
         }
         Ok(shell)
     }
 
+    fn items(&self) -> impl Iterator<Item = &Item> {
+        self.local.iter().chain(self.remote.iter())
+    }
+
+    /// Re-reads local items, folders and servers from the database.
     fn reload(&mut self) {
-        match self
-            .db
-            .items()
-            .and_then(|items| Ok((items, self.db.roots()?)))
-        {
-            Ok((items, roots)) => {
-                self.items = items;
+        let loaded =
+            (|| Ok::<_, anyhow::Error>((self.db.items()?, self.db.roots()?, self.db.servers()?)))();
+        match loaded {
+            Ok((items, roots, servers)) => {
+                self.local = items;
                 self.roots = roots;
+                self.servers = servers;
             }
             Err(e) => self.error = Some(format!("Couldn't read the library: {e}").into()),
         }
     }
+
+    fn refresh(&mut self, cx: &mut Context<Self>) {
+        self.error = None;
+        self.rescan(cx);
+        self.refresh_remote(cx);
+    }
+
+    // ---- local folders ----
 
     fn rescan(&mut self, cx: &mut Context<Self>) {
         if self.scanning || self.roots.is_empty() {
@@ -156,7 +218,9 @@ impl Shell {
                 .await;
             this.update(cx, |this, cx| {
                 this.scanning = false;
-                this.error = (!errors.is_empty()).then(|| errors.join("; ").into());
+                if !errors.is_empty() {
+                    this.error = Some(errors.join("; ").into());
+                }
                 this.reload();
                 this.generate_thumbs(cx);
                 cx.notify();
@@ -167,7 +231,7 @@ impl Shell {
         cx.notify();
     }
 
-    /// Generates missing thumbnails one at a time in the background.
+    /// Generates missing local thumbnails one at a time in the background.
     fn generate_thumbs(&mut self, cx: &mut Context<Self>) {
         if self.thumbs_running {
             return;
@@ -242,30 +306,333 @@ impl Shell {
         .detach();
     }
 
-    fn play_item(&mut self, id: i64, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(item) = self.items.iter().find(|i| i.id == id).cloned() else {
+    // ---- Jellyfin ----
+
+    fn client(&self, server: i64) -> Option<Client> {
+        let server = self.servers.iter().find(|s| s.id == server)?;
+        Some(Client::for_server(server, &self.device_id))
+    }
+
+    /// Fetches every server's library; artwork follows in the background.
+    fn refresh_remote(&mut self, cx: &mut Context<Self>) {
+        for server in self.servers.clone() {
+            if !self.loading_servers.insert(server.id) {
+                continue;
+            }
+            let client = Client::for_server(&server, &self.device_id);
+            let thumbs = self.paths.thumbs.clone();
+            cx.spawn(async move |this, cx| {
+                let user_id = server.user_id.clone();
+                let server_row = server.id;
+                let fetch_client = client.clone();
+                let fetched = cx
+                    .background_executor()
+                    .spawn(async move {
+                        let items = fetch_client.library(&user_id)?;
+                        Ok::<_, anyhow::Error>(
+                            items
+                                .iter()
+                                .map(|b| (b.to_item(server_row, &thumbs), b.card_image()))
+                                .collect::<Vec<_>>(),
+                        )
+                    })
+                    .await;
+                this.update(cx, |this, cx| {
+                    this.loading_servers.remove(&server.id);
+                    match fetched {
+                        Ok(entries) => {
+                            this.remote.retain(|i| {
+                                !matches!(&i.source, Source::Jellyfin { server: s, .. } if *s == server.id)
+                            });
+                            let mut wanted = Vec::new();
+                            for (item, image) in entries {
+                                if item.thumb.is_none()
+                                    && let Some(image) = image
+                                {
+                                    wanted.push((item.key(), image));
+                                }
+                                this.remote.push(item);
+                            }
+                            this.fetch_artwork(client, wanted, cx);
+                        }
+                        Err(e) => {
+                            this.error = Some(format!("{}: {e:#}", server.name).into());
+                        }
+                    }
+                    cx.notify();
+                })
+                .ok();
+            })
+            .detach();
+        }
+        cx.notify();
+    }
+
+    fn fetch_artwork(
+        &mut self,
+        client: Client,
+        wanted: Vec<(String, ImageRef)>,
+        cx: &mut Context<Self>,
+    ) {
+        // Episodes can share artwork (a show backdrop), so download each file once.
+        let mut by_file: BTreeMap<PathBuf, (ImageRef, Vec<String>)> = BTreeMap::new();
+        for (key, image) in wanted {
+            let path = image.cache_path(&self.paths.thumbs);
+            by_file
+                .entry(path)
+                .or_insert_with(|| (image, Vec::new()))
+                .1
+                .push(key);
+        }
+        if by_file.is_empty() {
+            return;
+        }
+        self.artwork_left += by_file.len();
+        cx.spawn(async move |this, cx| {
+            for (path, (image, keys)) in by_file {
+                let target = path.clone();
+                let download = client.clone();
+                let result = cx
+                    .background_executor()
+                    .spawn(async move {
+                        fs::create_dir_all(target.parent().unwrap())?;
+                        download.download_image(&image, &target)
+                    })
+                    .await;
+                let alive = this.update(cx, |this, cx| {
+                    this.artwork_left = this.artwork_left.saturating_sub(1);
+                    match result {
+                        Ok(()) => {
+                            for item in this.remote.iter_mut().filter(|i| keys.contains(&i.key())) {
+                                item.thumb = Some(path.clone());
+                            }
+                        }
+                        Err(e) => eprintln!("[jellyfin] artwork {}: {e:#}", path.display()),
+                    }
+                    cx.notify();
+                });
+                if alive.is_err() {
+                    return;
+                }
+            }
+        })
+        .detach();
+    }
+
+    /// Tells the server about playback so its resume/watched state follows.
+    fn report(
+        &mut self,
+        source: &Source,
+        kind: PlaybackReport,
+        position: f64,
+        cx: &mut Context<Self>,
+    ) {
+        let Source::Jellyfin { server, id } = source else {
             return;
         };
-        if !item.path.exists() {
-            self.error = Some(format!("{} is not available", item.path.display()).into());
+        let Some(client) = self.client(*server) else {
+            return;
+        };
+        let id = id.clone();
+        cx.spawn(async move |this, cx| {
+            let result = cx
+                .background_executor()
+                .spawn(async move { client.report(kind, &id, position, false) })
+                .await;
+            if let Err(e) = result {
+                eprintln!("[jellyfin] report {kind:?}: {e:#}");
+            }
+            if kind == PlaybackReport::Stopped {
+                this.update(cx, |this, cx| this.refresh_remote(cx)).ok();
+            }
+        })
+        .detach();
+    }
+
+    fn open_connect(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.screen = Screen::Connect;
+        self.form.error = None;
+        window.focus(&self.form.url.focus_handle(cx));
+        if self.form.found.is_empty() && !self.form.searching {
+            self.discover(cx);
+        }
+        cx.notify();
+    }
+
+    fn discover(&mut self, cx: &mut Context<Self>) {
+        self.form.searching = true;
+        cx.spawn(async move |this, cx| {
+            let found = cx
+                .background_executor()
+                .spawn(async move { discovery::discover(DISCOVERY_WAIT) })
+                .await;
+            this.update(cx, |this, cx| {
+                this.form.searching = false;
+                let url_empty = this.form.url.read(cx).text().is_empty();
+                if url_empty && let Some(first) = found.first() {
+                    let address = first.address.clone();
+                    this.form
+                        .url
+                        .update(cx, |input, cx| input.set_text(address, cx));
+                }
+                this.form.found = found;
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    fn connect(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.form.busy {
+            return;
+        }
+        let url = jellyfin::normalize_url(&self.form.url.read(cx).text());
+        let user = self.form.user.read(cx).text().trim().to_string();
+        let password = self.form.password.read(cx).text();
+        if url == "http://" || user.is_empty() {
+            self.form.error = Some("Enter the server address and your username.".into());
             cx.notify();
             return;
         }
-        let source = item.path.to_string_lossy().into_owned();
-        let title = item.display_title().into();
-        self.start_player(source, title, item.resume_position(), Some(id), window, cx);
+        self.form.busy = true;
+        self.form.error = None;
+        let device_id = self.device_id.clone();
+        let focus = self.focus.clone();
+        cx.spawn_in(window, async move |this, cx| {
+            let result = cx
+                .background_executor()
+                .spawn(async move {
+                    let mut client = Client::new(&url, &device_id);
+                    let info = client.public_info()?;
+                    let auth = client.login(&user, &password)?;
+                    if auth.server_id != info.id {
+                        bail!("the server answered with an unexpected id");
+                    }
+                    Ok(Server {
+                        id: 0,
+                        url: client.base().to_string(),
+                        name: info.server_name,
+                        server_id: auth.server_id,
+                        user_id: auth.user.id,
+                        user_name: auth.user.name,
+                        token: auth.access_token,
+                    })
+                })
+                .await;
+            this.update_in(cx, |this, window, cx| {
+                this.form.busy = false;
+                match result.and_then(|server| this.db.save_server(&server)) {
+                    Ok(_) => {
+                        this.form
+                            .password
+                            .update(cx, |input, cx| input.set_text("", cx));
+                        this.reload();
+                        this.screen = Screen::Home;
+                        window.focus(&focus);
+                        this.refresh_remote(cx);
+                    }
+                    Err(e) => this.form.error = Some(format!("{e:#}").into()),
+                }
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
+        cx.notify();
     }
 
+    fn sign_out(&mut self, server_id: i64, cx: &mut Context<Self>) {
+        if let Some(client) = self.client(server_id) {
+            // Best effort: invalidate the token on the server too.
+            cx.background_executor()
+                .spawn(async move {
+                    let _ = client.logout();
+                })
+                .detach();
+        }
+        if let Err(e) = self.db.remove_server(server_id) {
+            self.error = Some(format!("Couldn't sign out: {e}").into());
+        }
+        self.remote.retain(
+            |i| !matches!(&i.source, Source::Jellyfin { server, .. } if *server == server_id),
+        );
+        self.reload();
+        cx.notify();
+    }
+
+    fn focus_next_field(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let fields = [&self.form.url, &self.form.user, &self.form.password];
+        let current = fields
+            .iter()
+            .position(|f| f.focus_handle(cx).is_focused(window));
+        let next = current.map(|i| (i + 1) % fields.len()).unwrap_or(0);
+        window.focus(&fields[next].focus_handle(cx));
+    }
+
+    // ---- playback ----
+
+    fn play(&mut self, key: &str, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(item) = self.items().find(|i| i.key() == key).cloned() else {
+            return;
+        };
+        let title: SharedString = item.display_title().into();
+        let start = item.resume_position();
+        eprintln!("[play] {} ({key}) from {start:.1}s", item.display_title());
+        match &item.source {
+            Source::Local { path, .. } => {
+                if !path.exists() {
+                    self.error = Some(format!("{} is not available", path.display()).into());
+                    cx.notify();
+                    return;
+                }
+                let url = path.to_string_lossy().into_owned();
+                self.start_player(
+                    url,
+                    None,
+                    title,
+                    start,
+                    Some(item.source.clone()),
+                    window,
+                    cx,
+                );
+            }
+            Source::Jellyfin { server, id } => {
+                let Some(client) = self.client(*server) else {
+                    self.error = Some("That server is no longer signed in.".into());
+                    cx.notify();
+                    return;
+                };
+                let url = client.stream_url(id);
+                let header = client.stream_header();
+                self.start_player(
+                    url,
+                    header,
+                    title,
+                    start,
+                    Some(item.source.clone()),
+                    window,
+                    cx,
+                );
+                if self.player.is_some() {
+                    self.report(&item.source, PlaybackReport::Started, start, cx);
+                }
+            }
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
     fn start_player(
         &mut self,
-        source: String,
+        url: String,
+        http_header: Option<String>,
         title: SharedString,
         start: f64,
-        item: Option<i64>,
+        source: Option<Source>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let video = match player::open_video(window, &source, start) {
+        let video = match player::open_video(window, &url, start, http_header.as_deref()) {
             Ok(video) => video,
             Err(e) => {
                 self.error = Some(format!("Couldn't play {title}: {e}").into());
@@ -275,11 +642,14 @@ impl Shell {
         };
         self.error = None;
         let view = cx.new(|cx| Player::new(video, title, window, cx));
-        let subscription = cx.subscribe_in(&view, window, move |this, _, event, window, cx| {
-            this.on_player_event(item, event, window, cx)
+        let subscription = cx.subscribe_in(&view, window, |this, _, event, window, cx| {
+            this.on_player_event(event, window, cx)
         });
         self.player = Some(ActivePlayer {
             view,
+            source,
+            position: start,
+            duration: 0.0,
             _subscription: subscription,
         });
         cx.notify();
@@ -287,17 +657,27 @@ impl Shell {
 
     fn on_player_event(
         &mut self,
-        item: Option<i64>,
         event: &PlayerEvent,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
         match event {
             PlayerEvent::Progress { position, duration } => {
-                if let Some(id) = item
-                    && let Err(e) = self.db.save_progress(id, *position, *duration)
-                {
-                    eprintln!("[library] saving progress: {e}");
+                let Some(active) = self.player.as_mut() else {
+                    return;
+                };
+                active.position = *position;
+                active.duration = *duration;
+                match active.source.clone() {
+                    Some(Source::Local { id, .. }) => {
+                        if let Err(e) = self.db.save_progress(id, *position, *duration) {
+                            eprintln!("[library] saving progress: {e}");
+                        }
+                    }
+                    Some(source @ Source::Jellyfin { .. }) => {
+                        self.report(&source, PlaybackReport::Progress, *position, cx)
+                    }
+                    None => {}
                 }
             }
             PlayerEvent::Exit => {
@@ -305,7 +685,20 @@ impl Shell {
                     window.toggle_fullscreen();
                 }
                 // Dropping the view shuts mpv down and destroys its window.
-                self.player = None;
+                let Some(active) = self.player.take() else {
+                    return;
+                };
+                if let Some(source @ Source::Jellyfin { .. }) = &active.source {
+                    // Update the card now; the refresh after "stopped" confirms it.
+                    let finished = active.duration > 0.0
+                        && active.position >= active.duration * WATCHED_FRACTION;
+                    if let Some(item) = self.remote.iter_mut().find(|i| &i.source == source) {
+                        item.position = if finished { 0.0 } else { active.position };
+                        item.watched |= finished;
+                        item.last_played = Some(now());
+                    }
+                    self.report(source, PlaybackReport::Stopped, active.position, cx);
+                }
                 self.reload();
                 self.focus.focus(window);
                 cx.notify();
@@ -313,12 +706,17 @@ impl Shell {
         }
     }
 
-    fn on_key(&mut self, event: &KeyDownEvent, _: &mut Window, cx: &mut Context<Self>) {
-        if matches!(event.keystroke.key.as_str(), "escape" | "backspace")
-            && self.screen != Screen::Home
-        {
-            self.screen = Screen::Home;
-            cx.notify();
+    fn on_key(&mut self, event: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
+        let key = event.keystroke.key.as_str();
+        match (&self.screen, key) {
+            (Screen::Connect, "enter") => self.connect(window, cx),
+            (Screen::Connect, "tab") => self.focus_next_field(window, cx),
+            (Screen::Connect, "escape") | (Screen::Show(_), "escape" | "backspace") => {
+                self.screen = Screen::Home;
+                window.focus(&self.focus);
+                cx.notify();
+            }
+            _ => {}
         }
     }
 
@@ -326,13 +724,14 @@ impl Shell {
 
     fn button(
         &self,
-        id: &'static str,
-        label: &'static str,
+        id: impl Into<ElementId>,
+        label: impl Into<SharedString>,
         cx: &mut Context<Self>,
         action: impl Fn(&mut Self, &mut Window, &mut Context<Self>) + 'static,
     ) -> AnyElement {
         div()
-            .id(id)
+            .id(id.into())
+            .flex_none()
             .px_3()
             .py_1p5()
             .rounded_md()
@@ -340,46 +739,56 @@ impl Shell {
             .bg(rgba(0xffffff14))
             .hover(|s| s.bg(rgba(0xffffff26)))
             .cursor_pointer()
-            .child(label)
+            .child(label.into())
             .on_click(cx.listener(move |this, _: &ClickEvent, window, cx| action(this, window, cx)))
             .into_any_element()
     }
 
     fn header(&self, cx: &mut Context<Self>) -> AnyElement {
+        let heading =
+            |text: SharedString| div().text_2xl().font_weight(FontWeight::BOLD).child(text);
+        let back = |this: &Self, cx: &mut Context<Self>| {
+            this.button("home", "‹ Library", cx, |this, window, cx| {
+                this.screen = Screen::Home;
+                window.focus(&this.focus);
+                cx.notify();
+            })
+        };
         let title: AnyElement = match &self.screen {
-            Screen::Home => div()
-                .text_2xl()
-                .font_weight(FontWeight::BOLD)
-                .child("Library")
-                .into_any_element(),
+            Screen::Home => heading("Library".into()).into_any_element(),
             Screen::Show(name) => div()
                 .flex()
                 .items_center()
                 .gap_3()
-                .child(self.button("home", "‹ Library", cx, |this, _, cx| {
-                    this.screen = Screen::Home;
-                    cx.notify();
-                }))
-                .child(
-                    div()
-                        .text_2xl()
-                        .font_weight(FontWeight::BOLD)
-                        .child(name.clone()),
-                )
+                .child(back(self, cx))
+                .child(heading(name.clone().into()))
+                .into_any_element(),
+            Screen::Connect => div()
+                .flex()
+                .items_center()
+                .gap_3()
+                .child(back(self, cx))
+                .child(heading("Jellyfin".into()))
                 .into_any_element(),
         };
         let status = if self.scanning {
             Some(SharedString::from("Scanning…"))
+        } else if !self.loading_servers.is_empty() {
+            Some("Loading Jellyfin library…".into())
+        } else if self.artwork_left > 0 {
+            Some(format!("Downloading artwork ({} left)", self.artwork_left).into())
         } else if self.thumbs_left > 0 {
             Some(format!("Generating thumbnails ({} left)", self.thumbs_left).into())
         } else {
             None
         };
+        let can_refresh = !self.roots.is_empty() || !self.servers.is_empty();
         div()
             .flex()
             .flex_none()
             .items_center()
             .justify_between()
+            .gap_4()
             .px_8()
             .py_5()
             .child(title)
@@ -392,10 +801,13 @@ impl Shell {
                     .children(
                         self.error
                             .clone()
-                            .map(|e| div().text_sm().text_color(rgb(0xff7a7a)).child(e)),
+                            .map(|e| div().text_sm().text_color(rgb(ERROR)).truncate().child(e)),
                     )
-                    .children((!self.roots.is_empty()).then(|| {
-                        self.button("rescan", "Rescan", cx, |this, _, cx| this.rescan(cx))
+                    .children(can_refresh.then(|| {
+                        self.button("refresh", "Refresh", cx, |this, _, cx| this.refresh(cx))
+                    }))
+                    .child(self.button("jellyfin", "Jellyfin", cx, |this, window, cx| {
+                        this.open_connect(window, cx)
                     }))
                     .child(self.button("add", "Add Folder", cx, |this, _, cx| this.add_folder(cx))),
             )
@@ -410,7 +822,7 @@ impl Shell {
     ) -> AnyElement {
         let Card {
             id,
-            thumb: item_thumb,
+            thumb,
             title,
             subtitle,
             progress,
@@ -432,7 +844,7 @@ impl Shell {
                 .child(initial.clone())
                 .into_any_element()
         };
-        let art: AnyElement = match item_thumb {
+        let art: AnyElement = match thumb {
             Some(path) => img(path)
                 .size_full()
                 .object_fit(ObjectFit::Cover)
@@ -512,9 +924,9 @@ impl Shell {
             ),
             _ => (item.title.clone(), item.year.map(|y| y.to_string())),
         };
-        let id = item.id;
+        let key = item.key();
         let card = Card {
-            id: SharedString::from(format!("{prefix}-{id}")).into(),
+            id: SharedString::from(format!("{prefix}-{key}")).into(),
             thumb: item.thumb.clone(),
             title,
             subtitle,
@@ -522,7 +934,7 @@ impl Shell {
             watched: item.watched,
         };
         self.card(card, cx, move |this, window, cx| {
-            this.play_item(id, window, cx)
+            this.play(&key, window, cx)
         })
     }
 
@@ -552,12 +964,12 @@ impl Shell {
     }
 
     fn empty_state(&self, cx: &mut Context<Self>) -> AnyElement {
-        let message = if self.roots.is_empty() {
-            "Add a folder with movies or TV shows to get started."
-        } else if self.scanning {
-            "Looking for videos…"
+        let message = if self.scanning || !self.loading_servers.is_empty() {
+            "Loading your library…"
+        } else if self.roots.is_empty() && self.servers.is_empty() {
+            "Connect a Jellyfin server or add a folder with movies or TV shows."
         } else {
-            "No videos found in your folders yet."
+            "No videos found yet."
         };
         div()
             .flex()
@@ -572,23 +984,30 @@ impl Shell {
                     .child("Your library is empty"),
             )
             .child(div().text_color(rgb(MUTED)).child(message))
-            .child(self.button("add-empty", "Add Folder", cx, |this, _, cx| {
-                this.add_folder(cx)
-            }))
+            .child(
+                div()
+                    .flex()
+                    .gap_3()
+                    .child(self.button(
+                        "jellyfin-empty",
+                        "Connect Jellyfin",
+                        cx,
+                        |this, window, cx| this.open_connect(window, cx),
+                    ))
+                    .child(self.button("add-empty", "Add Folder", cx, |this, _, cx| {
+                        this.add_folder(cx)
+                    })),
+            )
             .into_any_element()
     }
 
     fn home(&self, cx: &mut Context<Self>) -> Vec<AnyElement> {
-        if self.items.is_empty() {
+        if self.items().next().is_none() {
             return vec![self.empty_state(cx)];
         }
         let mut sections = Vec::new();
 
-        let mut in_progress: Vec<&Item> = self
-            .items
-            .iter()
-            .filter(|i| i.progress().is_some())
-            .collect();
+        let mut in_progress: Vec<&Item> = self.items().filter(|i| i.progress().is_some()).collect();
         in_progress.sort_by_key(|i| std::cmp::Reverse(i.last_played));
         if !in_progress.is_empty() {
             let cards = in_progress
@@ -608,7 +1027,7 @@ impl Shell {
             ));
         }
 
-        let mut movies: Vec<&Item> = self.items.iter().filter(|i| !i.is_episode()).collect();
+        let mut movies: Vec<&Item> = self.items().filter(|i| !i.is_episode()).collect();
         movies.sort_by_key(|i| i.title.to_lowercase());
         if !movies.is_empty() {
             let cards = movies
@@ -619,7 +1038,7 @@ impl Shell {
         }
 
         let mut shows: BTreeMap<String, Vec<&Item>> = BTreeMap::new();
-        for item in &self.items {
+        for item in self.items() {
             if let Some(show) = &item.show {
                 shows.entry(show.clone()).or_default().push(item);
             }
@@ -657,11 +1076,7 @@ impl Shell {
 
     fn show_page(&self, show: &str, cx: &mut Context<Self>) -> Vec<AnyElement> {
         let mut seasons: BTreeMap<u16, Vec<&Item>> = BTreeMap::new();
-        for item in self
-            .items
-            .iter()
-            .filter(|i| i.show.as_deref() == Some(show))
-        {
+        for item in self.items().filter(|i| i.show.as_deref() == Some(show)) {
             seasons
                 .entry(item.season.unwrap_or(0))
                 .or_default()
@@ -669,7 +1084,8 @@ impl Shell {
         }
         seasons
             .into_iter()
-            .map(|(season, episodes)| {
+            .map(|(season, mut episodes)| {
+                episodes.sort_by_key(|e| e.episode);
                 let title = if season == 0 {
                     "Specials".to_string()
                 } else {
@@ -682,6 +1098,132 @@ impl Shell {
                 Self::section(&title, Self::grid(cards))
             })
             .collect()
+    }
+
+    fn field(label: &str, input: &Entity<TextInput>) -> AnyElement {
+        div()
+            .flex()
+            .flex_col()
+            .gap_1p5()
+            .child(
+                div()
+                    .text_sm()
+                    .text_color(rgb(MUTED))
+                    .child(label.to_string()),
+            )
+            .child(input.clone())
+            .into_any_element()
+    }
+
+    fn connect_page(&self, cx: &mut Context<Self>) -> Vec<AnyElement> {
+        let form = &self.form;
+        let found: Vec<AnyElement> = form
+            .found
+            .iter()
+            .enumerate()
+            .map(|(i, server)| {
+                let address = server.address.clone();
+                self.button(
+                    SharedString::from(format!("found-{i}")),
+                    format!("{} · {}", server.name, server.address),
+                    cx,
+                    move |this, _, cx| {
+                        let address = address.clone();
+                        this.form
+                            .url
+                            .update(cx, |input, cx| input.set_text(address, cx));
+                    },
+                )
+            })
+            .collect();
+        let network_note = if form.searching {
+            Some("Looking for servers on your network…")
+        } else if form.found.is_empty() {
+            Some("No servers found on your network. Enter the address instead.")
+        } else {
+            None
+        };
+
+        let sign_in = div()
+            .flex()
+            .flex_col()
+            .gap_4()
+            .w(px(440.0))
+            .child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap_2()
+                    .children(network_note.map(|n| div().text_sm().text_color(rgb(MUTED)).child(n)))
+                    .child(div().flex().flex_wrap().gap_2().children(found)),
+            )
+            .child(Self::field("Server address", &form.url))
+            .child(Self::field("Username", &form.user))
+            .child(Self::field("Password", &form.password))
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap_3()
+                    .child(self.button(
+                        "sign-in",
+                        if form.busy {
+                            "Signing in…"
+                        } else {
+                            "Sign In"
+                        },
+                        cx,
+                        |this, window, cx| this.connect(window, cx),
+                    ))
+                    .children(
+                        form.error
+                            .clone()
+                            .map(|e| div().text_sm().text_color(rgb(ERROR)).child(e)),
+                    ),
+            );
+
+        let mut sections = vec![Self::section("Sign in to a server", sign_in)];
+        if !self.servers.is_empty() {
+            let rows: Vec<AnyElement> = self
+                .servers
+                .iter()
+                .map(|server| {
+                    let id = server.id;
+                    div()
+                        .flex()
+                        .items_center()
+                        .gap_4()
+                        .child(
+                            div()
+                                .flex()
+                                .flex_col()
+                                .child(
+                                    div()
+                                        .font_weight(FontWeight::MEDIUM)
+                                        .child(server.name.clone()),
+                                )
+                                .child(
+                                    div()
+                                        .text_sm()
+                                        .text_color(rgb(MUTED))
+                                        .child(format!("{} · {}", server.user_name, server.url)),
+                                ),
+                        )
+                        .child(self.button(
+                            SharedString::from(format!("sign-out-{id}")),
+                            "Sign Out",
+                            cx,
+                            move |this, _, cx| this.sign_out(id, cx),
+                        ))
+                        .into_any_element()
+                })
+                .collect();
+            sections.push(Self::section(
+                "Signed in",
+                div().flex().flex_col().gap_3().children(rows),
+            ));
+        }
+        sections
     }
 }
 
@@ -696,6 +1238,7 @@ impl Render for Shell {
         let body = match self.screen.clone() {
             Screen::Home => self.home(cx),
             Screen::Show(name) => self.show_page(&name, cx),
+            Screen::Connect => self.connect_page(cx),
         };
         div()
             .size_full()

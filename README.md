@@ -15,6 +15,19 @@ The app uses a single window. mpv renders into a disabled child window, and GPUI
 DirectComposition layer, which Windows composites above child windows, draws the UI on top.
 mpv keeps its own swapchain, so hardware decoding and HDR output are preserved.
 
+## Jellyfin
+
+Click **Jellyfin** and sign in to your server. Servers on your network are found
+automatically; otherwise type the address (`192.168.1.10:8096`, or a full `https://` URL).
+Only the access token is stored, never your password.
+
+- Movies and episodes appear in the same library as local folders, with the server's artwork.
+- Files are direct-played (no transcoding), so HDR and hardware decoding work as they do for local files.
+- Playback start, progress and stop are reported to the server, so resume positions and watched
+  state stay in sync with other Jellyfin apps.
+
+`cargo test -- --ignored` runs a round trip against Jellyfin's public demo server.
+
 ## Library
 
 Add folders with **Add Folder**. They are scanned in the background, and movie and

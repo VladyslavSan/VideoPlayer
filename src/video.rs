@@ -74,8 +74,9 @@ pub struct VideoSurface {
 }
 
 impl VideoSurface {
-    /// Starts playing `source` at `start` seconds.
-    pub fn new(parent: HWND, source: &str, start: f64) -> Result<Self> {
+    /// Starts playing `source` at `start` seconds. `http_header` (for example
+    /// a server token) is sent with every HTTP request mpv makes.
+    pub fn new(parent: HWND, source: &str, start: f64, http_header: Option<&str>) -> Result<Self> {
         let host = create_host(parent).context("creating the video host window")?;
         let wid = host.0.0 as i64;
         let mpv = Mpv::with_initializer(|init| {
@@ -92,6 +93,9 @@ impl VideoSurface {
             init.set_option("input-default-bindings", "no")?;
             init.set_option("input-vo-keyboard", "no")?;
             init.set_option("input-cursor", "no")?;
+            if let Some(header) = http_header {
+                init.set_option("http-header-fields", header)?;
+            }
             if let Ok(path) = std::env::var("VIDEO_PLAYER_MPV_LOG") {
                 init.set_option("log-file", path.as_str())?;
             }

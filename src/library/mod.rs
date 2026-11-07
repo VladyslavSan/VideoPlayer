@@ -15,10 +15,18 @@ pub const MIN_RESUME_SECONDS: f64 = 10.0;
 /// Fraction of the runtime after which an item counts as watched.
 pub const WATCHED_FRACTION: f64 = 0.92;
 
+/// Where an item lives and how to play it.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum Source {
+    /// A file found by scanning a local folder; `id` is its database row.
+    Local { id: i64, path: PathBuf },
+    /// An item on a signed-in Jellyfin server (`server` is our row id).
+    Jellyfin { server: i64, id: String },
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct Item {
-    pub id: i64,
-    pub path: PathBuf,
+    pub source: Source,
     /// Movie title, or episode title.
     pub title: String,
     pub year: Option<u16>,
@@ -33,6 +41,22 @@ pub struct Item {
 }
 
 impl Item {
+    /// Stable identifier, unique across sources (used for UI element ids).
+    pub fn key(&self) -> String {
+        match &self.source {
+            Source::Local { id, .. } => format!("local-{id}"),
+            Source::Jellyfin { server, id } => format!("jf-{server}-{id}"),
+        }
+    }
+
+    #[cfg(test)]
+    pub fn local_id(&self) -> Option<i64> {
+        match self.source {
+            Source::Local { id, .. } => Some(id),
+            Source::Jellyfin { .. } => None,
+        }
+    }
+
     pub fn is_episode(&self) -> bool {
         self.show.is_some()
     }

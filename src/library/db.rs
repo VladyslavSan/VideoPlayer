@@ -7,7 +7,8 @@ use anyhow::Result;
 use rusqlite::{Connection, Row, params};
 
 use super::parse::Parsed;
-use super::{Item, MIN_RESUME_SECONDS, WATCHED_FRACTION};
+use super::{Item, MIN_RESUME_SECONDS, Source, WATCHED_FRACTION};
+use crate::jellyfin::Server;
 
 const SCHEMA: &str = "
 CREATE TABLE IF NOT EXISTS roots (path TEXT PRIMARY KEY);
@@ -31,6 +32,17 @@ CREATE TABLE IF NOT EXISTS items (
     thumb TEXT
 );
 CREATE INDEX IF NOT EXISTS items_root ON items(root);
+CREATE TABLE IF NOT EXISTS servers (
+    id INTEGER PRIMARY KEY,
+    url TEXT NOT NULL,
+    name TEXT NOT NULL,
+    server_id TEXT NOT NULL,
+    user_id TEXT NOT NULL,
+    user_name TEXT NOT NULL,
+    token TEXT NOT NULL,
+    UNIQUE (server_id, user_id)
+);
+CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT NOT NULL);
 ";
 
 /// A video file found on disk.
@@ -185,7 +197,7 @@ impl Db {
 
     #[cfg(test)]
     pub fn item(&self, id: i64) -> Result<Option<Item>> {
-        Ok(self.items()?.into_iter().find(|i| i.id == id))
+        Ok(self.items()?.into_iter().find(|i| i.local_id() == Some(id)))
     }
 
     /// Records where playback stopped. Near the end, the item is marked
@@ -227,11 +239,90 @@ impl Db {
     }
 }
 
+impl Db {
+    pub fn servers(&self) -> Result<Vec<Server>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, url, name, server_id, user_id, user_name, token FROM servers ORDER BY name",
+        )?;
+        let rows = stmt.query_map([], |r| {
+            Ok(Server {
+                id: r.get(0)?,
+                url: r.get(1)?,
+                name: r.get(2)?,
+                server_id: r.get(3)?,
+                user_id: r.get(4)?,
+                user_name: r.get(5)?,
+                token: r.get(6)?,
+            })
+        })?;
+        Ok(rows.collect::<Result<_, _>>()?)
+    }
+
+    /// Saves a sign-in; signing in again as the same user replaces the token.
+    pub fn save_server(&self, server: &Server) -> Result<i64> {
+        self.conn.execute(
+            "INSERT INTO servers (url, name, server_id, user_id, user_name, token)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+             ON CONFLICT(server_id, user_id) DO UPDATE SET
+                url = excluded.url, name = excluded.name,
+                user_name = excluded.user_name, token = excluded.token",
+            params![
+                server.url,
+                server.name,
+                server.server_id,
+                server.user_id,
+                server.user_name,
+                server.token
+            ],
+        )?;
+        Ok(self.conn.query_row(
+            "SELECT id FROM servers WHERE server_id = ?1 AND user_id = ?2",
+            params![server.server_id, server.user_id],
+            |r| r.get(0),
+        )?)
+    }
+
+    pub fn remove_server(&self, id: i64) -> Result<()> {
+        self.conn
+            .execute("DELETE FROM servers WHERE id = ?1", [id])?;
+        Ok(())
+    }
+
+    /// A random id for this installation, created on first use. Jellyfin
+    /// uses it to tell this player's sessions apart from other devices.
+    pub fn device_id(&self) -> Result<String> {
+        let existing: Option<String> = self
+            .conn
+            .query_row(
+                "SELECT value FROM settings WHERE key = 'device_id'",
+                [],
+                |r| r.get(0),
+            )
+            .ok();
+        if let Some(id) = existing {
+            return Ok(id);
+        }
+        use std::hash::{BuildHasher, RandomState};
+        let id = format!(
+            "{:016x}{:016x}",
+            RandomState::new().hash_one(now()),
+            RandomState::new().hash_one(std::process::id())
+        );
+        self.conn.execute(
+            "INSERT INTO settings (key, value) VALUES ('device_id', ?1)",
+            [&id],
+        )?;
+        Ok(id)
+    }
+}
+
 fn item_from_row(r: &Row) -> rusqlite::Result<Item> {
     let thumb: Option<String> = r.get(11)?;
     Ok(Item {
-        id: r.get(0)?,
-        path: PathBuf::from(r.get::<_, String>(1)?),
+        source: Source::Local {
+            id: r.get(0)?,
+            path: PathBuf::from(r.get::<_, String>(1)?),
+        },
         title: r.get(2)?,
         year: r.get(3)?,
         show: r.get(4)?,
@@ -264,7 +355,7 @@ mod tests {
         let db = Db::open_in_memory()?;
         let root = Path::new(r"D:\Movies");
         db.upsert_file(root, &file(r"D:\Movies\Heat (1995).mkv", 100, 1))?;
-        let id = db.items()?[0].id;
+        let id = db.items()?[0].local_id().unwrap();
         db.save_progress(id, 600.0, 6000.0)?;
         db.set_thumb(id, Some(Path::new(r"C:\thumbs\1.jpg")))?;
 
@@ -280,7 +371,10 @@ mod tests {
         db.upsert_file(root, &file(r"D:\Movies\Heat (1995).mkv", 200, 2))?;
         let item = db.item(id)?.unwrap();
         assert_eq!(item.position, 600.0);
-        assert_eq!(db.pending_thumbs()?, vec![(id, item.path)]);
+        let Source::Local { path, .. } = item.source else {
+            unreachable!()
+        };
+        assert_eq!(db.pending_thumbs()?, vec![(id, path)]);
         Ok(())
     }
 
@@ -288,7 +382,7 @@ mod tests {
     fn progress_rules() -> Result<()> {
         let db = Db::open_in_memory()?;
         db.upsert_file(Path::new("D:"), &file(r"D:\a.mkv", 1, 1))?;
-        let id = db.items()?[0].id;
+        let id = db.items()?[0].local_id().unwrap();
 
         db.save_progress(id, 5.0, 1000.0)?;
         let item = db.item(id)?.unwrap();
@@ -326,10 +420,42 @@ mod tests {
     fn failed_thumb_is_not_retried() -> Result<()> {
         let db = Db::open_in_memory()?;
         db.upsert_file(Path::new("D:"), &file(r"D:\a.mkv", 1, 1))?;
-        let id = db.items()?[0].id;
+        let id = db.items()?[0].local_id().unwrap();
         db.set_thumb(id, None)?;
         assert!(db.pending_thumbs()?.is_empty());
         assert_eq!(db.item(id)?.unwrap().thumb, None);
+        Ok(())
+    }
+
+    #[test]
+    fn servers_upsert_by_user() -> Result<()> {
+        let db = Db::open_in_memory()?;
+        let mut server = Server {
+            id: 0,
+            url: "http://nas:8096".into(),
+            name: "Home".into(),
+            server_id: "s1".into(),
+            user_id: "u1".into(),
+            user_name: "me".into(),
+            token: "old".into(),
+        };
+        let id = db.save_server(&server)?;
+        server.token = "new".into();
+        assert_eq!(db.save_server(&server)?, id);
+        let saved = db.servers()?;
+        assert_eq!(saved.len(), 1);
+        assert_eq!((saved[0].id, saved[0].token.as_str()), (id, "new"));
+        db.remove_server(id)?;
+        assert!(db.servers()?.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn device_id_is_stable() -> Result<()> {
+        let db = Db::open_in_memory()?;
+        let id = db.device_id()?;
+        assert_eq!(id.len(), 32);
+        assert_eq!(db.device_id()?, id);
         Ok(())
     }
 

@@ -1,6 +1,8 @@
+mod jellyfin;
 mod library;
 mod player;
 mod shell;
+mod ui;
 mod video;
 
 use gpui::{
@@ -14,6 +16,7 @@ fn main() {
     let paths = Paths::resolve().expect("couldn't locate the app data directory");
 
     Application::new().run(move |cx: &mut App| {
+        ui::text_input::bind_keys(cx);
         let bounds = Bounds::centered(None, size(px(1280.0), px(800.0)), cx);
         let options = WindowOptions {
             window_bounds: Some(WindowBounds::Windowed(bounds)),
