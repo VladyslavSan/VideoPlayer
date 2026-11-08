@@ -281,6 +281,14 @@ impl Quality {
         }
     }
 
+    /// The label in the quality menu, which says what Original means.
+    pub fn menu_label(self) -> String {
+        match self {
+            Quality::Original => "Original (direct play)".into(),
+            Quality::Bitrate(_) => self.label(),
+        }
+    }
+
     /// Stored form, for the settings table.
     pub fn to_setting(self) -> String {
         match self {

@@ -26,6 +26,7 @@ macro_rules! icons {
 icons! {
     Back => "back.svg",
     Check => "check.svg",
+    ChevronDown => "chevron-down.svg",
     Close => "close.svg",
     Episodes => "episodes.svg",
     NextEpisode => "next-episode.svg",

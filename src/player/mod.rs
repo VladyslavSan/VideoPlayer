@@ -16,7 +16,7 @@ use gpui::{
 use raw_window_handle::{HasWindowHandle, RawWindowHandle};
 use windows::Win32::Foundation::HWND;
 
-use crate::jellyfin::{QUALITIES, Quality};
+use crate::jellyfin::Quality;
 use crate::library::{SubtitlePref, TrackPrefs};
 use crate::video::{ExternalSubtitle, Segment, SegmentKind, Track, TrackKind, VideoSurface};
 
@@ -130,6 +130,8 @@ pub struct Player {
     up_next: Option<Instant>,
     prefs: TrackPrefs,
     quality: Option<Quality>,
+    /// Whether the streaming quality menu is open (in the tracks panel).
+    quality_menu: bool,
     /// When mpv's video output came up for the current source.
     video_ready_since: Option<Instant>,
     /// After `reload`, the new source; until mpv reports it, track and
@@ -284,6 +286,7 @@ impl Player {
             tracks_read: Instant::now(),
             pending_subtitles: Vec::new(),
             panel: None,
+            quality_menu: false,
             drag: None,
             scrub: None,
             seek_hover: None,
@@ -354,16 +357,11 @@ impl Player {
         cx.notify();
     }
 
-    /// Steps the quality up (+1) or down (-1) through the presets.
-    fn step_quality(&mut self, direction: i32, cx: &mut Context<Self>) {
-        let Some(current) = self.quality else {
-            return;
-        };
-        let index = QUALITIES.iter().position(|q| *q == current).unwrap_or(0) as i32;
-        // QUALITIES is best first, so "up" moves toward the start.
-        let next = (index - direction).clamp(0, QUALITIES.len() as i32 - 1) as usize;
-        if QUALITIES[next] != current {
-            cx.emit(PlayerEvent::QualityChosen(QUALITIES[next]));
+    /// Switches to `quality` (from the quality menu).
+    fn choose_quality(&mut self, quality: Quality, cx: &mut Context<Self>) {
+        self.quality_menu = false;
+        if self.quality != Some(quality) {
+            cx.emit(PlayerEvent::QualityChosen(quality));
         }
     }
 
@@ -839,6 +837,7 @@ impl Player {
             "z" => self.step_subtitle_delay(-0.1),
             "x" => self.step_subtitle_delay(0.1),
             "f" => window.toggle_fullscreen(),
+            "escape" if self.quality_menu => self.quality_menu = false,
             "escape" if self.panel.is_some() => self.panel = None,
             "escape" if window.is_fullscreen() => window.toggle_fullscreen(),
             "escape" | "backspace" => return self.exit(cx),

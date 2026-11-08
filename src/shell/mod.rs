@@ -9,8 +9,8 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use anyhow::{Context as _, Result, bail};
 use gpui::{
     AnyElement, ClickEvent, Context, ElementId, Entity, FocusHandle, Focusable, FontWeight,
-    KeyDownEvent, ObjectFit, PathPromptOptions, SharedString, Subscription, Window, div, img,
-    prelude::*, px, rgb, rgba,
+    KeyDownEvent, MouseDownEvent, ObjectFit, PathPromptOptions, SharedString, Subscription, Window,
+    div, img, prelude::*, px, rgb, rgba,
 };
 
 use crate::jellyfin::{
@@ -20,6 +20,7 @@ use crate::jellyfin::{
 use crate::library::{Db, Item, Source, TrackPrefs, WATCHED_FRACTION, scan, thumbs};
 use crate::player::{self, Episode, Playback, Player, PlayerEvent};
 use crate::secrets;
+use crate::ui::menu;
 use crate::ui::text_input::TextInput;
 
 mod browse;
@@ -174,6 +175,8 @@ pub struct Shell {
     error: Option<SharedString>,
     focus: FocusHandle,
     form: ConnectForm,
+    /// The server whose streaming quality menu is open.
+    quality_menu: Option<i64>,
 }
 
 impl Shell {
@@ -214,6 +217,7 @@ impl Shell {
             search,
             details: HashMap::new(),
             details_loading: HashSet::new(),
+            quality_menu: None,
             player: None,
             scanning: false,
             loading_servers: HashSet::new(),
@@ -1165,6 +1169,10 @@ impl Shell {
     fn on_key(&mut self, event: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
         let key = event.keystroke.key.as_str();
         match (&self.screen, key) {
+            (Screen::Connect, "escape") if self.quality_menu.is_some() => {
+                self.quality_menu = None;
+                cx.notify();
+            }
             (Screen::Connect, "enter") => self.connect(window, cx),
             (Screen::Connect, "tab") => self.focus_next_field(window, cx),
             (Screen::Connect, "escape")
@@ -1517,7 +1525,54 @@ impl Shell {
             .into_any_element()
     }
 
-    fn connect_page(&self, cx: &mut Context<Self>) -> Vec<AnyElement> {
+    /// "Streaming" and a button that opens a menu of quality presets, for
+    /// a server on the Jellyfin page.
+    fn quality_picker(&self, server: i64, window: &Window, cx: &mut Context<Self>) -> AnyElement {
+        let current = self.quality_for(server);
+        let open = self.quality_menu == Some(server);
+        let mut picker = div().relative().flex().child(
+            menu::trigger(
+                SharedString::from(format!("quality-{server}")),
+                format!("Streaming: {}", current.label()),
+                open,
+            )
+            .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
+                this.quality_menu = if open { None } else { Some(server) };
+                cx.notify();
+            })),
+        );
+        if open {
+            let items = QUALITIES
+                .iter()
+                .enumerate()
+                .map(|(i, &quality)| {
+                    menu::item(
+                        ("quality-choice", i),
+                        quality.menu_label(),
+                        quality == current,
+                    )
+                    .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
+                        this.set_quality(server, quality);
+                        this.quality_menu = None;
+                        cx.notify();
+                    }))
+                    .into_any_element()
+                })
+                .collect();
+            picker = picker.child(menu::popup(
+                false,
+                items,
+                window,
+                cx.listener(|this, _: &MouseDownEvent, _, cx| {
+                    this.quality_menu = None;
+                    cx.notify();
+                }),
+            ));
+        }
+        picker.into_any_element()
+    }
+
+    fn connect_page(&self, window: &Window, cx: &mut Context<Self>) -> Vec<AnyElement> {
         let form = &self.form;
         let found: Vec<AnyElement> = form
             .found
@@ -1611,25 +1666,7 @@ impl Shell {
                                         .child(format!("{} · {}", server.user_name, server.url)),
                                 ),
                         )
-                        .child({
-                            // Click to step through the qualities.
-                            let quality = self.quality_for(id);
-                            let next = QUALITIES[(QUALITIES
-                                .iter()
-                                .position(|q| *q == quality)
-                                .unwrap_or(0)
-                                + 1)
-                                % QUALITIES.len()];
-                            self.button(
-                                SharedString::from(format!("quality-{id}")),
-                                format!("Streaming: {}", quality.label()),
-                                cx,
-                                move |this, _, cx| {
-                                    this.set_quality(id, next);
-                                    cx.notify();
-                                },
-                            )
-                        })
+                        .child(self.quality_picker(id, window, cx))
                         .child(self.button(
                             SharedString::from(format!("sign-out-{id}")),
                             "Sign Out",
@@ -1665,7 +1702,7 @@ impl Render for Shell {
             Screen::Shows => Err(self.library_grid(Grid::Shows, window, cx)),
             Screen::Show(name) => Ok(self.show_page(&name, cx)),
             Screen::Details(key) => Ok(self.details_page(&key, cx)),
-            Screen::Connect => Ok(self.connect_page(cx)),
+            Screen::Connect => Ok(self.connect_page(window, cx)),
         };
         // Sections scroll as one page; the grids scroll (and virtualize) themselves.
         let content = match body {

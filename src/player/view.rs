@@ -8,7 +8,9 @@ use gpui::{
 };
 
 use super::{Panel, Player, TOAST_DURATION, tracks};
+use crate::jellyfin::{QUALITIES, Quality};
 use crate::ui::icons::{Icon, icon};
+use crate::ui::menu;
 use crate::video::TrackKind;
 
 const TEXT: u32 = 0xf4f5f7;
@@ -541,7 +543,66 @@ impl Player {
             .into_any_element()
     }
 
-    fn track_panel(&self, cx: &mut Context<Self>) -> AnyElement {
+    /// "Streaming quality" with a button that opens a menu of the presets.
+    fn quality_picker(
+        &self,
+        current: Quality,
+        window: &Window,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let open = self.quality_menu;
+        let mut picker = div().relative().flex().child(
+            menu::trigger("quality", current.label(), open).on_click(cx.listener(
+                |this, _: &ClickEvent, _, cx| {
+                    this.quality_menu = !this.quality_menu;
+                    this.poke(cx);
+                },
+            )),
+        );
+        if open {
+            let items = QUALITIES
+                .iter()
+                .enumerate()
+                .map(|(i, &quality)| {
+                    menu::item(
+                        ("quality-choice", i),
+                        quality.menu_label(),
+                        quality == current,
+                    )
+                    .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
+                        this.choose_quality(quality, cx);
+                        this.poke(cx);
+                    }))
+                    .into_any_element()
+                })
+                .collect();
+            picker = picker.child(menu::popup(
+                true,
+                items,
+                window,
+                cx.listener(|this, _: &MouseDownEvent, _, cx| {
+                    this.quality_menu = false;
+                    this.poke(cx);
+                }),
+            ));
+        }
+        div()
+            .flex()
+            .flex_col()
+            .gap_1()
+            .px_2()
+            .py_1()
+            .child(
+                div()
+                    .text_xs()
+                    .text_color(rgb(MUTED))
+                    .child("Streaming quality"),
+            )
+            .child(picker)
+            .into_any_element()
+    }
+
+    fn track_panel(&self, window: &Window, cx: &mut Context<Self>) -> AnyElement {
         let mut audio = Vec::new();
         for (i, track) in self.tracks_of(TrackKind::Audio).enumerate() {
             let label = tracks::label(track, i + 1);
@@ -614,13 +675,7 @@ impl Player {
         ];
         let mut options = options;
         if let Some(quality) = self.quality {
-            options.push(self.stepper(
-                "quality",
-                "Streaming quality",
-                quality.label(),
-                cx,
-                |this, d, cx| this.step_quality(d, cx),
-            ));
+            options.push(self.quality_picker(quality, window, cx));
         }
 
         Self::panel_frame("tracks-panel")
@@ -1019,7 +1074,7 @@ impl Player {
                     .w_full()
                     .max_w(px(BAR_MAX_WIDTH))
                     .children(match self.panel {
-                        Some(Panel::Tracks) => Some(self.track_panel(cx)),
+                        Some(Panel::Tracks) => Some(self.track_panel(window, cx)),
                         Some(Panel::Episodes) => Some(self.episodes_panel(cx)),
                         Some(Panel::Shortcuts) | None => None,
                     })
@@ -1045,6 +1100,10 @@ impl Render for Player {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let visible = self.controls_visible();
         self.place_subtitles(window, visible);
+        // The quality menu lives in the tracks panel and closes with it.
+        if self.panel != Some(Panel::Tracks) {
+            self.quality_menu = false;
+        }
         if self
             .toast
             .as_ref()
