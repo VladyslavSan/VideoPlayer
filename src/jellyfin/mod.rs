@@ -7,7 +7,8 @@ pub mod discovery;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
-use serde::Deserialize;
+use anyhow::Result;
+use serde::{Deserialize, Serialize};
 
 pub use client::{Client, PlaybackReport};
 
@@ -75,7 +76,7 @@ pub struct ItemsPage {
     pub total_record_count: usize,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(rename_all = "PascalCase")]
 pub struct BaseItem {
     pub id: String,
@@ -97,7 +98,7 @@ pub struct BaseItem {
     pub user_data: Option<UserData>,
 }
 
-#[derive(Debug, Clone, Default, Deserialize)]
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
 #[serde(rename_all = "PascalCase")]
 pub struct UserData {
     #[serde(default)]
@@ -249,6 +250,20 @@ impl BaseItem {
     }
 }
 
+/// Saves the library last fetched from a server, so it can be shown at once
+/// on the next start, and when the server can't be reached.
+pub fn save_library_cache(path: &Path, items: &[BaseItem]) -> Result<()> {
+    // Write then rename, so a crash never leaves a half-written cache.
+    let partial = path.with_extension("part");
+    std::fs::write(&partial, serde_json::to_vec(items)?)?;
+    std::fs::rename(&partial, path)?;
+    Ok(())
+}
+
+pub fn load_library_cache(path: &Path) -> Result<Vec<BaseItem>> {
+    Ok(serde_json::from_slice(&std::fs::read(path)?)?)
+}
+
 /// Parses the `2026-11-07T18:11:04.4168678Z` timestamps Jellyfin returns
 /// into Unix seconds. Fractions and the zone suffix are ignored (always UTC).
 pub fn parse_timestamp(s: &str) -> Option<i64> {
@@ -368,6 +383,23 @@ mod tests {
                 },
             ]
         );
+    }
+
+    #[test]
+    fn library_cache_round_trip() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let path = dir.path().join("jellyfin-1.json");
+        let items: Vec<BaseItem> =
+            vec![serde_json::from_str(EPISODE)?, serde_json::from_str(MOVIE)?];
+        save_library_cache(&path, &items)?;
+        let loaded = load_library_cache(&path)?;
+        let thumbs = Path::new("C:/thumbs");
+        let as_items = |list: &[BaseItem]| -> Vec<Item> {
+            list.iter().map(|b| b.to_item(1, thumbs)).collect()
+        };
+        assert_eq!(as_items(&loaded), as_items(&items));
+        assert_eq!(loaded[0].card_image(), items[0].card_image());
+        Ok(())
     }
 
     #[test]

@@ -57,6 +57,11 @@ impl Paths {
             log: base.join("app.log"),
         })
     }
+
+    /// Where the library last fetched from a server is kept.
+    pub fn library_cache(&self, server: i64) -> PathBuf {
+        self.db.with_file_name(format!("jellyfin-{server}.json"))
+    }
 }
 
 fn now() -> i64 {
@@ -164,6 +169,7 @@ impl Shell {
             form,
         };
         shell.reload();
+        shell.load_cached_remote();
         shell.refresh(cx);
         shell.generate_thumbs(cx);
         if let Some(source) = source {
@@ -366,6 +372,7 @@ impl Shell {
             }
             let client = Client::for_server(&server, &self.device_id);
             let thumbs = self.paths.thumbs.clone();
+            let cache = self.paths.library_cache(server.id);
             cx.spawn(async move |this, cx| {
                 let user_id = server.user_id.clone();
                 let server_row = server.id;
@@ -374,6 +381,9 @@ impl Shell {
                     .background_executor()
                     .spawn(async move {
                         let items = fetch_client.library(&user_id)?;
+                        if let Err(e) = jellyfin::save_library_cache(&cache, &items) {
+                            eprintln!("[jellyfin] saving the library cache: {e:#}");
+                        }
                         Ok::<_, anyhow::Error>(
                             items
                                 .iter()
@@ -401,7 +411,18 @@ impl Shell {
                             this.fetch_artwork(client, wanted, cx);
                         }
                         Err(e) => {
-                            this.error = Some(format!("{}: {e:#}", server.name).into());
+                            eprintln!("[jellyfin] {}: {e:#}", server.name);
+                            let cached = this.remote.iter().any(|i| {
+                                matches!(&i.source, Source::Jellyfin { server: s, .. } if *s == server.id)
+                            });
+                            this.error = Some(
+                                if cached {
+                                    format!("{} is offline; showing the saved library", server.name)
+                                } else {
+                                    format!("{}: {e:#}", server.name)
+                                }
+                                .into(),
+                            );
                         }
                     }
                     cx.notify();
@@ -411,6 +432,25 @@ impl Shell {
             .detach();
         }
         cx.notify();
+    }
+
+    /// Shows each server's last fetched library right away; the refresh
+    /// that follows replaces it.
+    fn load_cached_remote(&mut self) {
+        for server in &self.servers {
+            let path = self.paths.library_cache(server.id);
+            if !path.exists() {
+                continue;
+            }
+            match jellyfin::load_library_cache(&path) {
+                Ok(items) => self.remote.extend(
+                    items
+                        .iter()
+                        .map(|b| b.to_item(server.id, &self.paths.thumbs)),
+                ),
+                Err(e) => eprintln!("[jellyfin] reading {}: {e:#}", path.display()),
+            }
+        }
     }
 
     fn fetch_artwork(
@@ -609,6 +649,7 @@ impl Shell {
         if let Err(e) = removed {
             self.error = Some(format!("Couldn't sign out: {e:#}").into());
         }
+        let _ = fs::remove_file(self.paths.library_cache(server_id));
         self.remote.retain(
             |i| !matches!(&i.source, Source::Jellyfin { server, .. } if *server == server_id),
         );
