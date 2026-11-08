@@ -3,18 +3,20 @@ use std::path::Path;
 use std::time::Duration;
 
 use anyhow::{Context as _, Result, bail};
-use serde::Serialize;
 use serde::de::DeserializeOwned;
+use serde::{Deserialize, Serialize};
 use ureq::{Agent, ResponseExt};
 
 use super::{
     AuthResult, BaseItem, ImageRef, InfoPage, ItemInfo, ItemsPage, MediaSegments, PlaybackInfo,
-    PublicInfo, Server, seconds_to_ticks,
+    PublicInfo, Server, UserData, seconds_to_ticks,
 };
 use crate::video::Segment;
 
 const CLIENT_NAME: &str = "VideoPlayer";
 const PAGE_SIZE: usize = 500;
+/// Asking for an item's resume point mustn't hold up playback for long.
+const USER_DATA_TIMEOUT: Duration = Duration::from_secs(3);
 const IMAGE_WIDTH: u32 = 640;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -218,6 +220,40 @@ impl Client {
     }
 
     /// Overview, genres, ratings and stream names, for a details page.
+    /// The user's play state for one item, straight from the server. Asked
+    /// right before playback starts, so it gives up quickly.
+    pub fn user_data(&self, user_id: &str, item_id: &str) -> Result<UserData> {
+        #[derive(Deserialize)]
+        #[serde(rename_all = "PascalCase")]
+        struct Page {
+            items: Vec<Entry>,
+        }
+        #[derive(Deserialize)]
+        #[serde(rename_all = "PascalCase")]
+        struct Entry {
+            user_data: Option<UserData>,
+        }
+        let path = "/Items";
+        let mut response = self
+            .agent
+            .get(&self.url(path))
+            .config()
+            .timeout_global(Some(USER_DATA_TIMEOUT))
+            .build()
+            .header("Authorization", &self.authorization())
+            .query("ids", item_id)
+            .query("userId", user_id)
+            .call()
+            .with_context(|| format!("connecting to {}", self.base))?;
+        Self::check(&response, path)?;
+        let page: Page = response.body_mut().read_json()?;
+        page.items
+            .into_iter()
+            .next()
+            .and_then(|e| e.user_data)
+            .with_context(|| format!("no play state for item {item_id}"))
+    }
+
     pub fn item_info(&self, user_id: &str, item_id: &str) -> Result<ItemInfo> {
         let page: InfoPage = self.get_json(
             "/Items",

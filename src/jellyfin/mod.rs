@@ -452,6 +452,52 @@ pub fn load_library_cache(path: &Path) -> Result<Vec<BaseItem>> {
     Ok(serde_json::from_slice(&std::fs::read(path)?)?)
 }
 
+/// Records a playback result in the cached library, so the next start
+/// (which shows the cache first) has it even before the library refreshes.
+/// A finished item is played and starts over, as on the server.
+pub fn cache_play_state(
+    path: &Path,
+    item_id: &str,
+    position: f64,
+    played: bool,
+    now: i64,
+) -> Result<()> {
+    let mut items = load_library_cache(path)?;
+    let Some(item) = items.iter_mut().find(|i| i.id == item_id) else {
+        return Ok(());
+    };
+    let data = item.user_data.get_or_insert_with(UserData::default);
+    data.playback_position_ticks = if played {
+        0
+    } else {
+        seconds_to_ticks(position)
+    };
+    data.played |= played;
+    data.last_played_date = Some(format_timestamp(now));
+    save_library_cache(path, &items)
+}
+
+/// Unix seconds as Jellyfin's `2026-11-07T18:11:04Z`.
+pub fn format_timestamp(unix: i64) -> String {
+    let (days, secs) = (unix.div_euclid(86_400), unix.rem_euclid(86_400));
+    // Civil date from days (Howard Hinnant's algorithm).
+    let z = days + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z - era * 146_097;
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y = yoe + era * 400 + i64::from(m <= 2);
+    format!(
+        "{y:04}-{m:02}-{d:02}T{:02}:{:02}:{:02}Z",
+        secs / 3600,
+        secs / 60 % 60,
+        secs % 60
+    )
+}
+
 /// Parses the `2026-11-07T18:11:04.4168678Z` timestamps Jellyfin returns
 /// into Unix seconds. Fractions and the zone suffix are ignored (always UTC).
 pub fn parse_timestamp(s: &str) -> Option<i64> {
@@ -688,6 +734,42 @@ mod tests {
         assert_eq!(parse_timestamp("1970-01-01T00:00:00Z"), Some(0));
         assert_eq!(parse_timestamp("2000-03-01T00:00:00.5Z"), Some(951_868_800));
         assert_eq!(parse_timestamp("garbage"), None);
+        assert_eq!(format_timestamp(0), "1970-01-01T00:00:00Z");
+        assert_eq!(format_timestamp(951_868_800), "2000-03-01T00:00:00Z");
+        for t in [1_762_600_000, 1_709_164_799, 4_102_444_800] {
+            assert_eq!(parse_timestamp(&format_timestamp(t)), Some(t));
+        }
+    }
+
+    #[test]
+    fn cached_play_state() {
+        let dir = std::env::temp_dir().join(format!("vp-cache-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("library.json");
+        let item: BaseItem = serde_json::from_str(EPISODE).unwrap();
+        save_library_cache(&path, &[item]).unwrap();
+        let id = "f717d85df782816c2ab75423e32f740b";
+
+        cache_play_state(&path, id, 1095.0, false, 1_762_600_000).unwrap();
+        let data = load_library_cache(&path).unwrap()[0]
+            .user_data
+            .clone()
+            .unwrap();
+        assert_eq!(data.playback_position_ticks, 10_950_000_000);
+        assert!(data.played, "already played stays played");
+        assert_eq!(
+            data.last_played_date.as_deref().and_then(parse_timestamp),
+            Some(1_762_600_000)
+        );
+
+        cache_play_state(&path, id, 1890.0, true, 1_762_600_100).unwrap();
+        let data = load_library_cache(&path).unwrap()[0]
+            .user_data
+            .clone()
+            .unwrap();
+        assert_eq!(data.playback_position_ticks, 0);
+        assert!(data.played);
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]

@@ -18,7 +18,10 @@ const CLOSE_WAIT: Duration = Duration::from_secs(4);
 type Send = Box<dyn FnOnce() -> Result<()> + std::marker::Send>;
 
 struct Job {
-    kind: PlaybackReport,
+    /// For the log, if it fails.
+    label: &'static str,
+    /// A progress report, superseded by any newer one.
+    progress: bool,
     send: Send,
     /// Re-read the library afterwards, so watched state shows up.
     refresh: bool,
@@ -85,17 +88,48 @@ impl Shell {
             }
             reported
         });
-        if kind == PlaybackReport::Progress {
+        let progress = kind == PlaybackReport::Progress;
+        if progress {
             // Only the newest position matters; drop older unsent ones.
-            self.reports
-                .jobs
-                .retain(|j| j.kind != PlaybackReport::Progress);
+            self.reports.jobs.retain(|j| !j.progress);
         }
-        self.reports.jobs.push_back(Job {
-            kind,
-            send,
-            refresh,
-        });
+        let label = match kind {
+            PlaybackReport::Started => "report Started",
+            PlaybackReport::Progress => "report Progress",
+            PlaybackReport::Stopped => "report Stopped",
+        };
+        self.enqueue(
+            Job {
+                label,
+                progress,
+                send,
+                refresh,
+            },
+            cx,
+        );
+    }
+
+    /// Queues other work that belongs with the reports, after those
+    /// already queued (closing the window waits for it too).
+    pub(super) fn queue_task(
+        &mut self,
+        label: &'static str,
+        send: impl FnOnce() -> Result<()> + std::marker::Send + 'static,
+        cx: &mut Context<Self>,
+    ) {
+        self.enqueue(
+            Job {
+                label,
+                progress: false,
+                send: Box::new(send),
+                refresh: false,
+            },
+            cx,
+        );
+    }
+
+    fn enqueue(&mut self, job: Job, cx: &mut Context<Self>) {
+        self.reports.jobs.push_back(job);
         if self.reports.running {
             return;
         }
@@ -110,10 +144,9 @@ impl Shell {
                 let Ok(Some(job)) = next else {
                     break;
                 };
-                let kind = job.kind;
                 let send = job.send;
                 if let Err(e) = cx.background_executor().spawn(async move { send() }).await {
-                    eprintln!("[jellyfin] report {kind:?}: {e:#}");
+                    eprintln!("[jellyfin] {}: {e:#}", job.label);
                 }
                 if job.refresh {
                     let _ = this.update(cx, |this, cx| {

@@ -172,6 +172,9 @@ pub struct Shell {
     player: Option<ActivePlayer>,
     scanning: bool,
     loading_servers: HashSet<i64>,
+    /// Servers to fetch again when their current fetch ends, because
+    /// something changed (playback stopped) after it began.
+    refetch_servers: HashSet<i64>,
     thumbs_running: bool,
     thumbs_left: usize,
     artwork_left: usize,
@@ -181,6 +184,8 @@ pub struct Shell {
     /// The server whose streaming quality menu is open.
     quality_menu: Option<i64>,
     reports: reports::Reports,
+    /// The item whose resume point is being asked from the server.
+    starting: Option<String>,
     /// When the Jellyfin libraries were last fetched.
     remote_refreshed: Option<Instant>,
 }
@@ -225,10 +230,12 @@ impl Shell {
             details_loading: HashSet::new(),
             quality_menu: None,
             reports: reports::Reports::default(),
+            starting: None,
             remote_refreshed: None,
             player: None,
             scanning: false,
             loading_servers: HashSet::new(),
+            refetch_servers: HashSet::new(),
             thumbs_running: false,
             thumbs_left: 0,
             artwork_left: 0,
@@ -455,6 +462,7 @@ impl Shell {
                 continue;
             }
             if !self.loading_servers.insert(server.id) {
+                self.refetch_servers.insert(server.id);
                 continue;
             }
             let client = Client::for_server(&server, &self.device_id);
@@ -511,6 +519,9 @@ impl Shell {
                                 .into(),
                             );
                         }
+                    }
+                    if this.refetch_servers.remove(&server.id) {
+                        this.refresh_remote(cx);
                     }
                     cx.notify();
                 })
@@ -725,19 +736,80 @@ impl Shell {
 
     // ---- playback ----
 
+    /// Plays an item from where it was left off. For a Jellyfin item, that's
+    /// asked from the server first: the library here may be minutes old (it
+    /// refreshes in the background) or the item may have been watched
+    /// elsewhere since.
     fn play(&mut self, key: &str, window: &mut Window, cx: &mut Context<Self>) {
-        self.play_at(key, false, window, cx)
-    }
-
-    fn play_from_start(&mut self, key: &str, window: &mut Window, cx: &mut Context<Self>) {
-        self.play_at(key, true, window, cx)
-    }
-
-    /// Plays an item from where it was left off, or from the start.
-    fn play_at(&mut self, key: &str, restart: bool, window: &mut Window, cx: &mut Context<Self>) {
         let Some(item) = self.items().find(|i| i.key() == key).cloned() else {
             return;
         };
+        let Source::Jellyfin { server, id } = &item.source else {
+            return self.play_at(item, false, window, cx);
+        };
+        let (Some(client), Some(user_id)) = (self.client(*server), self.user_id(*server)) else {
+            return self.play_at(item, false, window, cx);
+        };
+        if self.starting.is_some() {
+            return;
+        }
+        self.starting = Some(item.key());
+        let id = id.clone();
+        cx.spawn_in(window, async move |this, cx| {
+            let fresh = cx
+                .background_executor()
+                .spawn(async move { client.user_data(&user_id, &id) })
+                .await;
+            this.update_in(cx, |this, window, cx| {
+                this.starting = None;
+                let mut item = item;
+                match fresh {
+                    Ok(data) => {
+                        item.position = jellyfin::ticks_to_seconds(data.playback_position_ticks);
+                        item.watched = data.played;
+                        if let Some(cached) = this.remote.iter_mut().find(|i| i.key() == item.key())
+                        {
+                            cached.position = item.position;
+                            cached.watched = item.watched;
+                        }
+                    }
+                    Err(e) => eprintln!("[jellyfin] resume point: {e:#}; using the saved one"),
+                }
+                if this.player.is_none() {
+                    this.play_at(item, false, window, cx);
+                    cx.notify();
+                }
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    fn play_from_start(&mut self, key: &str, window: &mut Window, cx: &mut Context<Self>) {
+        let item = self.items().find(|i| i.key() == key).cloned();
+        if let Some(item) = item {
+            self.play_at(item, true, window, cx)
+        }
+    }
+
+    /// Plays the next episode right away, from the saved resume point.
+    fn play_next_now(&mut self, key: &str, window: &mut Window, cx: &mut Context<Self>) {
+        let item = self.items().find(|i| i.key() == key).cloned();
+        if let Some(item) = item {
+            self.play_at(item, false, window, cx)
+        }
+    }
+
+    fn user_id(&self, server: i64) -> Option<String> {
+        self.servers
+            .iter()
+            .find(|s| s.id == server)
+            .map(|s| s.user_id.clone())
+    }
+
+    /// Plays an item from where it was left off, or from the start.
+    fn play_at(&mut self, item: Item, restart: bool, window: &mut Window, cx: &mut Context<Self>) {
+        let key = item.key();
         // Episodes: the show on top, the episode beside it; movies: title and year.
         let (title, subtitle): (SharedString, Option<SharedString>) = match &item.show {
             Some(show) => (
@@ -1102,7 +1174,7 @@ impl Shell {
             PlayerEvent::Play(key) => {
                 // Straight to the next video; fullscreen stays as it is.
                 self.finish_playback(cx);
-                self.play(key, window, cx);
+                self.play_next_now(key, window, cx);
                 if self.player.is_none() {
                     if window.is_fullscreen() {
                         window.toggle_fullscreen();
@@ -1165,6 +1237,15 @@ impl Shell {
                     active.session.clone(),
                     cx,
                 );
+                // The cached library is what the next start shows first.
+                if let Source::Jellyfin { server, id } = source {
+                    let (cache, id) = (self.paths.library_cache(*server), id.clone());
+                    self.queue_task(
+                        "updating the library cache",
+                        move || jellyfin::cache_play_state(&cache, &id, position, finished, now()),
+                        cx,
+                    );
+                }
             }
             None => {}
         }
