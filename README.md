@@ -79,6 +79,11 @@ shows you're watching), recently added movies and recently updated shows. **Movi
 only draw the rows on screen, so large libraries stay fast. **Search** (Ctrl+F) matches
 movies, shows and episode titles; Esc clears it.
 
+Selecting a movie opens its details: backdrop, year, runtime, rating, genres, overview, the
+video/audio/subtitle tracks (from Jellyfin), **Play** or **Resume**, **Play from beginning** and
+**Mark as watched/unwatched** (synced to the server). A show's page starts with its backdrop,
+overview and a button for the episode to watch next.
+
 Add folders with **Add Folder**. They are scanned in the background, and movie and
 episode names are parsed from file and folder names (`Title (Year)`, `Show.S01E02`,
 `Show - 1x02`, `Show/Season 1/...`). Thumbnails are taken from a frame of each video.

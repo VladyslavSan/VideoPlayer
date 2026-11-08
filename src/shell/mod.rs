@@ -1,7 +1,7 @@
 //! App shell: the library screens (local folders and Jellyfin), the Jellyfin
 //! sign-in screen, and switching to and from the player.
 
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -20,7 +20,9 @@ use crate::secrets;
 use crate::ui::text_input::TextInput;
 
 mod browse;
+mod details;
 use browse::{Grid, Sort};
+use details::Details;
 
 const BG: u32 = 0x0b0d12;
 const TEXT: u32 = 0xf4f5f7;
@@ -80,6 +82,8 @@ enum Screen {
     Movies,
     Shows,
     Show(String),
+    /// A movie's details page, by item key.
+    Details(String),
     Connect,
 }
 
@@ -128,6 +132,9 @@ pub struct Shell {
     movie_sort: Sort,
     show_sort: Sort,
     search: Entity<TextInput>,
+    /// Details pages' extra information, by item key or `show:<name>`.
+    details: HashMap<String, Details>,
+    details_loading: HashSet<String>,
     player: Option<ActivePlayer>,
     scanning: bool,
     loading_servers: HashSet<i64>,
@@ -175,6 +182,8 @@ impl Shell {
             movie_sort: Sort::Title,
             show_sort: Sort::RecentlyWatched,
             search,
+            details: HashMap::new(),
+            details_loading: HashSet::new(),
             player: None,
             scanning: false,
             loading_servers: HashSet::new(),
@@ -686,6 +695,15 @@ impl Shell {
     // ---- playback ----
 
     fn play(&mut self, key: &str, window: &mut Window, cx: &mut Context<Self>) {
+        self.play_at(key, false, window, cx)
+    }
+
+    fn play_from_start(&mut self, key: &str, window: &mut Window, cx: &mut Context<Self>) {
+        self.play_at(key, true, window, cx)
+    }
+
+    /// Plays an item from where it was left off, or from the start.
+    fn play_at(&mut self, key: &str, restart: bool, window: &mut Window, cx: &mut Context<Self>) {
         let Some(item) = self.items().find(|i| i.key() == key).cloned() else {
             return;
         };
@@ -711,7 +729,7 @@ impl Shell {
             current,
             prefs: self.track_prefs(item.show.as_deref()),
         };
-        let start = item.resume_position();
+        let start = if restart { 0.0 } else { item.resume_position() };
         eprintln!("[play] {} ({key}) from {start:.1}s", item.display_title());
         match &item.source {
             Source::Local { path, .. } => {
@@ -1007,7 +1025,8 @@ impl Shell {
         match (&self.screen, key) {
             (Screen::Connect, "enter") => self.connect(window, cx),
             (Screen::Connect, "tab") => self.focus_next_field(window, cx),
-            (Screen::Connect, "escape") | (Screen::Show(_), "escape" | "backspace") => {
+            (Screen::Connect, "escape")
+            | (Screen::Show(_) | Screen::Details(_), "escape" | "backspace") => {
                 self.screen = self.tab.clone();
                 window.focus(&self.focus);
                 cx.notify();
@@ -1064,13 +1083,7 @@ impl Shell {
         };
         let title: AnyElement = match &self.screen {
             Screen::Home | Screen::Movies | Screen::Shows => self.tabs(cx),
-            Screen::Show(name) => div()
-                .flex()
-                .items_center()
-                .gap_3()
-                .child(back(self, cx))
-                .child(heading(name.clone().into()))
-                .into_any_element(),
+            Screen::Show(_) | Screen::Details(_) => back(self, cx),
             Screen::Connect => div()
                 .flex()
                 .items_center()
@@ -1248,8 +1261,13 @@ impl Shell {
             progress: item.progress(),
             watched: item.watched,
         };
+        let open_details = !item.is_episode() && prefix != "continue";
         self.card(card, cx, move |this, window, cx| {
-            this.play(&key, window, cx)
+            if open_details {
+                this.open_details(key.clone(), cx)
+            } else {
+                this.play(&key, window, cx)
+            }
         })
     }
 
@@ -1324,9 +1342,9 @@ impl Shell {
                 .or_default()
                 .push(item);
         }
-        seasons
-            .into_iter()
-            .map(|(season, mut episodes)| {
+        let header = self.show_header(show, cx);
+        std::iter::once(header)
+            .chain(seasons.into_iter().map(|(season, mut episodes)| {
                 episodes.sort_by_key(|e| e.episode);
                 let title = if season == 0 {
                     "Specials".to_string()
@@ -1338,7 +1356,7 @@ impl Shell {
                     .map(|e| self.item_card("episode", e, false, cx))
                     .collect();
                 Self::section(&title, Self::grid(cards))
-            })
+            }))
             .collect()
     }
 
@@ -1485,6 +1503,7 @@ impl Render for Shell {
             Screen::Movies => Err(self.library_grid(Grid::Movies, window, cx)),
             Screen::Shows => Err(self.library_grid(Grid::Shows, window, cx)),
             Screen::Show(name) => Ok(self.show_page(&name, cx)),
+            Screen::Details(key) => Ok(self.details_page(&key, cx)),
             Screen::Connect => Ok(self.connect_page(cx)),
         };
         // Sections scroll as one page; the grids scroll (and virtualize) themselves.

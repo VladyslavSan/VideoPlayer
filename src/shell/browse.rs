@@ -156,6 +156,18 @@ impl Shell {
     }
 
     fn open_show(&mut self, name: String, cx: &mut Context<Self>) {
+        // The show's overview and backdrop come from the server, via any of
+        // its episodes there.
+        let episode = self
+            .items()
+            .find(|i| {
+                i.show.as_deref() == Some(name.as_str())
+                    && matches!(i.source, crate::library::Source::Jellyfin { .. })
+            })
+            .cloned();
+        if let Some(episode) = episode {
+            self.load_details(format!("show:{name}"), episode, true, cx);
+        }
         self.screen = Screen::Show(name);
         cx.notify();
     }

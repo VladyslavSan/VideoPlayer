@@ -224,6 +224,15 @@ impl Db {
     }
 
     /// `None` records a failed attempt so it isn't retried on every launch.
+    /// Marks a file watched or not; either way it starts from the beginning.
+    pub fn set_watched(&self, id: i64, watched: bool) -> Result<()> {
+        self.conn.execute(
+            "UPDATE items SET watched = ?2, position = 0, last_played = ?3 WHERE id = ?1",
+            params![id, watched, watched.then(now)],
+        )?;
+        Ok(())
+    }
+
     pub fn set_thumb(&self, id: i64, thumb: Option<&Path>) -> Result<()> {
         let value = thumb.map(path_key).unwrap_or_default();
         self.conn.execute(
@@ -570,6 +579,21 @@ mod tests {
         .or(db.track_prefs("general")?);
         assert_eq!(merged.audio.as_deref(), Some("eng"));
         assert_eq!(merged.subtitle, Some(SubtitlePref::Language("eng".into())));
+        Ok(())
+    }
+
+    #[test]
+    fn marking_watched() -> Result<()> {
+        let db = Db::open_in_memory()?;
+        let root = Path::new(r"D:\Movies");
+        db.upsert_file(root, &file(r"D:\Movies\Film (2001).mkv", 1, 1))?;
+        let id = db.items()?[0].local_id().unwrap();
+        db.save_progress(id, 300.0, 1000.0)?;
+        db.set_watched(id, true)?;
+        let item = db.item(id)?.unwrap();
+        assert!(item.watched && item.position == 0.0 && item.last_played.is_some());
+        db.set_watched(id, false)?;
+        assert!(!db.item(id)?.unwrap().watched);
         Ok(())
     }
 

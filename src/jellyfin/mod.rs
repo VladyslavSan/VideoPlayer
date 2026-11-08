@@ -172,6 +172,61 @@ impl PlaybackInfo {
     }
 }
 
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "PascalCase")]
+pub struct InfoPage {
+    #[serde(default)]
+    pub items: Vec<ItemInfo>,
+}
+
+/// What a details page shows about a movie, episode or series.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "PascalCase")]
+pub struct ItemInfo {
+    pub id: String,
+    pub overview: Option<String>,
+    #[serde(default)]
+    pub genres: Vec<String>,
+    #[serde(default)]
+    pub taglines: Vec<String>,
+    pub community_rating: Option<f32>,
+    pub official_rating: Option<String>,
+    pub series_id: Option<String>,
+    #[serde(default)]
+    pub backdrop_image_tags: Vec<String>,
+    #[serde(default)]
+    pub media_streams: Vec<StreamInfo>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "PascalCase")]
+pub struct StreamInfo {
+    #[serde(rename = "Type")]
+    pub kind: String,
+    pub display_title: Option<String>,
+}
+
+impl ItemInfo {
+    /// The item's own backdrop, for a large header image.
+    pub fn backdrop(&self) -> Option<ImageRef> {
+        self.backdrop_image_tags.first().map(|tag| ImageRef {
+            item_id: self.id.clone(),
+            kind: "Backdrop",
+            index: 0,
+            tag: tag.clone(),
+        })
+    }
+
+    /// Display names of the streams of one type ("Video", "Audio", "Subtitle").
+    pub fn streams(&self, kind: &str) -> Vec<String> {
+        self.media_streams
+            .iter()
+            .filter(|s| s.kind == kind)
+            .filter_map(|s| s.display_title.clone())
+            .collect()
+    }
+}
+
 /// Intro/credits markers (Jellyfin 10.10+, filled in by plugins such as
 /// Intro Skipper).
 #[derive(Debug, Deserialize)]
@@ -225,6 +280,15 @@ impl ImageRef {
     /// Tags change whenever the image does, so the file name doubles as a cache key.
     pub fn cache_path(&self, dir: &Path) -> PathBuf {
         dir.join(format!("jf-{}-{}.jpg", self.kind.to_lowercase(), self.tag))
+    }
+
+    /// Cache file for a larger copy (details page backdrops).
+    pub fn cache_path_width(&self, dir: &Path, width: u32) -> PathBuf {
+        dir.join(format!(
+            "jf-{}-{width}-{}.jpg",
+            self.kind.to_lowercase(),
+            self.tag
+        ))
     }
 }
 
@@ -468,6 +532,32 @@ mod tests {
                     end: 2600.0
                 },
             ]
+        );
+    }
+
+    #[test]
+    fn item_info_from_demo_response() {
+        let info: ItemInfo = serde_json::from_str(
+            r#"{"Name": "The Boy in the Plastic Bubble", "Id": "m1", "CommunityRating": 5.7,
+                "OfficialRating": "PG", "Genres": ["TV Movie", "Drama"],
+                "Taglines": ["A lifetime of loneliness...Or one day of love"],
+                "Overview": "Tod Lubitch is born with a deficient immune system.",
+                "BackdropImageTags": ["b9"],
+                "MediaStreams": [
+                    {"Type": "Video", "DisplayTitle": "480p H264 SDR"},
+                    {"Type": "Audio", "DisplayTitle": "AAC - Stereo - Default"},
+                    {"Type": "Subtitle", "DisplayTitle": "English - SRT - External"}
+                ]}"#,
+        )
+        .unwrap();
+        assert_eq!(info.streams("Video"), vec!["480p H264 SDR"]);
+        assert_eq!(info.streams("Subtitle"), vec!["English - SRT - External"]);
+        assert_eq!(info.community_rating, Some(5.7));
+        assert_eq!(
+            info.backdrop()
+                .unwrap()
+                .cache_path_width(Path::new("t"), 1920),
+            Path::new("t").join("jf-backdrop-1920-b9.jpg")
         );
     }
 

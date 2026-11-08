@@ -8,8 +8,8 @@ use serde::de::DeserializeOwned;
 use ureq::{Agent, ResponseExt};
 
 use super::{
-    AuthResult, BaseItem, ImageRef, ItemsPage, MediaSegments, PlaybackInfo, PublicInfo, Server,
-    seconds_to_ticks,
+    AuthResult, BaseItem, ImageRef, InfoPage, ItemInfo, ItemsPage, MediaSegments, PlaybackInfo,
+    PublicInfo, Server, seconds_to_ticks,
 };
 use crate::video::{ExternalSubtitle, Segment};
 
@@ -183,6 +183,11 @@ impl Client {
     }
 
     pub fn download_image(&self, image: &ImageRef, out: &Path) -> Result<()> {
+        self.download_image_width(image, out, IMAGE_WIDTH)
+    }
+
+    /// Downloads artwork scaled to at most `width` pixels across.
+    pub fn download_image_width(&self, image: &ImageRef, out: &Path, width: u32) -> Result<()> {
         let path = format!(
             "/Items/{}/Images/{}/{}",
             image.item_id, image.kind, image.index
@@ -192,7 +197,7 @@ impl Client {
             .get(&self.url(&path))
             .header("Authorization", &self.authorization())
             .query("tag", &image.tag)
-            .query("maxWidth", IMAGE_WIDTH.to_string())
+            .query("maxWidth", width.to_string())
             .query("quality", "85")
             .call()?;
         Self::check(&response, &path)?;
@@ -202,6 +207,41 @@ impl Client {
         fs::write(&partial, bytes)?;
         fs::rename(partial, out)?;
         Ok(())
+    }
+
+    /// Overview, genres, ratings and stream names, for a details page.
+    pub fn item_info(&self, user_id: &str, item_id: &str) -> Result<ItemInfo> {
+        let page: InfoPage = self.get_json(
+            "/Items",
+            &[
+                ("ids", item_id.to_string()),
+                ("userId", user_id.to_string()),
+                ("Fields", "Overview,Genres,Taglines,MediaStreams".into()),
+            ],
+        )?;
+        page.items
+            .into_iter()
+            .next()
+            .with_context(|| format!("item {item_id} not found"))
+    }
+
+    /// Marks an item watched or unwatched for the user.
+    pub fn set_played(&self, user_id: &str, item_id: &str, played: bool) -> Result<()> {
+        let url = self.url(&format!("/UserPlayedItems/{item_id}"));
+        let response = if played {
+            self.agent
+                .post(&url)
+                .query("userId", user_id)
+                .header("Authorization", &self.authorization())
+                .send_empty()?
+        } else {
+            self.agent
+                .delete(&url)
+                .query("userId", user_id)
+                .header("Authorization", &self.authorization())
+                .call()?
+        };
+        Self::check(&response, "Marking as watched")
     }
 
     /// External subtitle files for an item, ready to hand to mpv.
