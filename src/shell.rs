@@ -14,7 +14,7 @@ use gpui::{
 };
 
 use crate::jellyfin::{self, Client, ImageRef, PlaybackReport, Server, discovery};
-use crate::library::{Db, Item, Source, TrackPrefs, WATCHED_FRACTION, scan, thumbs};
+use crate::library::{self, Db, Item, Source, TrackPrefs, WATCHED_FRACTION, scan, thumbs};
 use crate::player::{self, Episode, Playback, Player, PlayerEvent};
 use crate::secrets;
 use crate::ui::text_input::TextInput;
@@ -752,10 +752,7 @@ impl Shell {
             .items()
             .filter(|i| i.show.as_ref() == Some(show))
             .collect();
-        items.sort_by_key(|i| {
-            let season = i.season.unwrap_or(0);
-            (season == 0, season, i.episode, i.title.to_lowercase())
-        });
+        items.sort_by_key(|i| i.watch_order());
         let key = item.key();
         let current = items.iter().position(|i| i.key() == key);
         let episodes = items
@@ -1289,13 +1286,20 @@ impl Shell {
         }
         let mut sections = Vec::new();
 
-        let mut in_progress: Vec<&Item> = self.items().filter(|i| i.progress().is_some()).collect();
-        in_progress.sort_by_key(|i| std::cmp::Reverse(i.last_played));
-        if !in_progress.is_empty() {
-            let cards = in_progress
+        // Half-watched videos, and the next episode of shows being watched,
+        // most recently watched first.
+        let mut continuing: Vec<(Option<i64>, &Item)> = self
+            .items()
+            .filter(|i| i.progress().is_some())
+            .map(|i| (i.last_played, i))
+            .collect();
+        continuing.extend(library::next_up(self.items()));
+        continuing.sort_by_key(|(played, _)| std::cmp::Reverse(*played));
+        if !continuing.is_empty() {
+            let cards = continuing
                 .into_iter()
                 .take(CONTINUE_LIMIT)
-                .map(|i| self.item_card("continue", i, true, cx))
+                .map(|(_, i)| self.item_card("continue", i, true, cx))
                 .collect::<Vec<_>>();
             sections.push(Self::section(
                 "Continue Watching",

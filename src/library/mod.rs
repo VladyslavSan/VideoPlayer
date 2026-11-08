@@ -6,6 +6,7 @@ pub mod parse;
 pub mod scan;
 pub mod thumbs;
 
+use std::collections::BTreeMap;
 use std::path::PathBuf;
 
 pub use db::Db;
@@ -108,11 +109,121 @@ impl Item {
         Some(format!("S{} · E{}", self.season?, self.episode?))
     }
 
+    /// Sort key for watching a show in order: seasons in order, specials
+    /// (season 0) last, then episode number.
+    pub fn watch_order(&self) -> (bool, u16, Option<u16>, String) {
+        let season = self.season.unwrap_or(0);
+        (season == 0, season, self.episode, self.title.to_lowercase())
+    }
+
     /// Title for headings: the movie title, or `Show · S1 · E4`.
     pub fn display_title(&self) -> String {
         match (&self.show, self.episode_label()) {
             (Some(show), Some(label)) => format!("{show} · {label}"),
             _ => self.title.clone(),
         }
+    }
+}
+
+/// The next episode of each show being watched: if a show's most recently
+/// played episode was finished, the first unwatched one after it. Paired
+/// with when the show was last watched, for sorting.
+pub fn next_up<'a>(items: impl Iterator<Item = &'a Item>) -> Vec<(Option<i64>, &'a Item)> {
+    let mut shows: BTreeMap<&str, Vec<&Item>> = BTreeMap::new();
+    for item in items {
+        if let Some(show) = &item.show {
+            shows.entry(show.as_str()).or_default().push(item);
+        }
+    }
+    shows
+        .into_values()
+        .filter_map(|mut episodes| {
+            episodes.sort_by_key(|e| e.watch_order());
+            let (last_index, last) = episodes
+                .iter()
+                .enumerate()
+                .filter(|(_, e)| e.last_played.is_some())
+                .max_by_key(|(_, e)| e.last_played)?;
+            if last.progress().is_some() {
+                return None; // still in progress: it's continued, not next
+            }
+            let next = episodes[last_index + 1..].iter().find(|e| !e.watched)?;
+            Some((last.last_played, *next))
+        })
+        .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn episode(show: &str, season: u16, number: u16) -> Item {
+        Item {
+            source: Source::Jellyfin {
+                server: 1,
+                id: format!("{show}-{season}-{number}"),
+            },
+            title: format!("Episode {number}"),
+            year: None,
+            show: Some(show.into()),
+            season: Some(season),
+            episode: Some(number),
+            duration: Some(1000.0),
+            position: 0.0,
+            watched: false,
+            last_played: None,
+            thumb: None,
+        }
+    }
+
+    fn keys(list: &[(Option<i64>, &Item)]) -> Vec<String> {
+        list.iter().map(|(_, i)| i.key()).collect()
+    }
+
+    #[test]
+    fn next_up_follows_the_last_finished_episode() {
+        let mut items = [
+            episode("A", 1, 1),
+            episode("A", 1, 2),
+            episode("A", 2, 1),
+            episode("A", 0, 1), // special: watched last
+            episode("B", 1, 1),
+            episode("B", 1, 2),
+            episode("C", 1, 1),
+        ];
+        // A: finished S1E2 most recently -> S2E1 is next.
+        items[0].watched = true;
+        items[0].last_played = Some(100);
+        items[1].watched = true;
+        items[1].last_played = Some(200);
+        // B: E1 half-watched -> continued, not "next".
+        items[4].position = 500.0;
+        items[4].last_played = Some(300);
+        // C: never played -> nothing.
+        let next = next_up(items.iter());
+        assert_eq!(keys(&next), vec!["jf-1-A-2-1"]);
+        assert_eq!(next[0].0, Some(200));
+
+        // Finishing the last regular episode leads to the specials.
+        items[2].watched = true;
+        items[2].last_played = Some(400);
+        assert_eq!(keys(&next_up(items.iter())), vec!["jf-1-A-0-1"]);
+
+        // Everything watched: nothing next.
+        items[3].watched = true;
+        items[3].last_played = Some(500);
+        assert!(next_up(items.iter()).is_empty());
+    }
+
+    #[test]
+    fn rewatching_an_early_episode_skips_watched_ones() {
+        let mut items = [episode("A", 1, 1), episode("A", 1, 2), episode("A", 1, 3)];
+        for item in &mut items {
+            item.watched = true;
+        }
+        items[2].watched = false;
+        items[0].last_played = Some(900); // rewatched E1 last
+        items[1].last_played = Some(100);
+        assert_eq!(keys(&next_up(items.iter())), vec!["jf-1-A-1-3"]);
     }
 }
