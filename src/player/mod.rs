@@ -22,6 +22,10 @@ use crate::video::{ExternalSubtitle, Segment, SegmentKind, Track, TrackKind, Vid
 
 const TICK: Duration = Duration::from_millis(100);
 const CONTROLS_TIMEOUT: Duration = Duration::from_millis(2500);
+/// While the controls are hidden, the mouse has to travel this far within
+/// `REVEAL_WINDOW` to bring them back, so small nudges don't.
+const REVEAL_DISTANCE: f32 = 40.0;
+const REVEAL_WINDOW: Duration = Duration::from_millis(500);
 const PROGRESS_INTERVAL: Duration = Duration::from_secs(5);
 const TOAST_DURATION: Duration = Duration::from_millis(1200);
 /// How long mpv's video output must be up before the black backdrop is
@@ -152,6 +156,9 @@ pub struct Player {
     /// Mouse x over the seek bar, for the time preview.
     seek_hover: Option<Pixels>,
     bar_hovered: bool,
+    /// Where (and when) the mouse started moving while the controls were
+    /// hidden; they come back once it has moved far enough from there.
+    reveal_from: Option<(Point<Pixels>, Instant)>,
     toast: Option<(SharedString, Instant)>,
     /// Subtitle position last sent to mpv, in percent of the window height.
     subtitle_position: f64,
@@ -281,6 +288,7 @@ impl Player {
             scrub: None,
             seek_hover: None,
             bar_hovered: false,
+            reveal_from: None,
             toast: None,
             subtitle_position: 100.0,
             exited: false,
@@ -890,7 +898,36 @@ impl Player {
         }
     }
 
+    /// Whether a mouse move should bring hidden controls back: only a
+    /// deliberate one, not a nudge or jitter.
+    fn reveals(&mut self, position: Point<Pixels>) -> bool {
+        let now = Instant::now();
+        match self.reveal_from {
+            Some((origin, since)) if now.duration_since(since) < REVEAL_WINDOW => {
+                let (dx, dy) = (
+                    f32::from(position.x - origin.x),
+                    f32::from(position.y - origin.y),
+                );
+                if dx.hypot(dy) >= REVEAL_DISTANCE {
+                    self.reveal_from = None;
+                    true
+                } else {
+                    false
+                }
+            }
+            // Start measuring from here (also after a pause, so slow drift
+            // never adds up).
+            _ => {
+                self.reveal_from = Some((position, now));
+                false
+            }
+        }
+    }
+
     fn on_mouse_move(&mut self, event: &MouseMoveEvent, _: &mut Window, cx: &mut Context<Self>) {
+        if !self.controls_visible() && !self.reveals(event.position) {
+            return;
+        }
         match self.drag {
             Some(_) if event.pressed_button != Some(MouseButton::Left) => {
                 // The button was released outside the window.

@@ -40,7 +40,8 @@ encrypts it for your user account; `library.db` keeps only the server address an
 ## Player
 
 A floating control bar appears when you move the mouse and hides after a few seconds of
-playback (the pointer hides with it). While it's showing, subtitles move up so the bar never
+playback (the pointer hides with it). Once hidden, it only comes back for a deliberate move
+(about 40 px within half a second), not a nudge. While it's showing, subtitles move up so the bar never
 covers them. The subtitles button opens a panel with audio tracks, subtitle tracks (including
 external subtitle files on a Jellyfin server), playback speed, subtitle size and subtitle delay.
 The volume is remembered between videos.
