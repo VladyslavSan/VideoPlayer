@@ -17,7 +17,7 @@ use raw_window_handle::{HasWindowHandle, RawWindowHandle};
 use windows::Win32::Foundation::HWND;
 
 use crate::jellyfin::Quality;
-use crate::library::{SubtitlePref, TrackPrefs};
+use crate::library::{SubtitlePref, TrackPrefs, WATCHED_FRACTION};
 use crate::video::{ExternalSubtitle, Segment, SegmentKind, Track, TrackKind, VideoSurface};
 
 const TICK: Duration = Duration::from_millis(100);
@@ -39,6 +39,8 @@ pub const SPEEDS: [f64; 7] = [0.5, 0.75, 1.0, 1.25, 1.5, 1.75, 2.0];
 
 /// Seconds the "Up next" card counts down before playing the next episode.
 const UP_NEXT_SECONDS: u64 = 8;
+/// Credits that start after this fraction of the video are its end credits.
+const END_CREDITS_FROM: f64 = 0.7;
 
 pub enum PlayerEvent {
     /// Periodic and final position report, for resume.
@@ -326,6 +328,25 @@ impl Player {
 
     pub fn position(&self) -> f64 {
         self.status.position
+    }
+
+    pub fn duration(&self) -> f64 {
+        self.status.duration
+    }
+
+    /// Whether the video counts as watched: it ended, it's nearly over, or
+    /// the end credits have started.
+    pub fn finished(&self) -> bool {
+        let (position, duration) = (self.status.position, self.status.duration);
+        duration > 0.0
+            && (self.status.ended
+                || position >= duration * WATCHED_FRACTION
+                || self.segments.iter().any(|s| {
+                    // Only closing credits: some files mark opening ones too.
+                    s.kind == SegmentKind::Credits
+                        && s.start >= duration * END_CREDITS_FROM
+                        && position >= s.start
+                }))
     }
 
     /// Switches to another stream of the same video (a different quality),

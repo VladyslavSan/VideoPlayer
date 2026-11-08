@@ -4,7 +4,7 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context as _, Result, bail};
 use gpui::{
@@ -17,7 +17,7 @@ use crate::jellyfin::{
     self, Client, ImageRef, PlaySession, PlaybackInfo, PlaybackReport, QUALITIES, Quality, Server,
     discovery,
 };
-use crate::library::{Db, Item, Source, TrackPrefs, WATCHED_FRACTION, scan, thumbs};
+use crate::library::{Db, Item, Source, TrackPrefs, scan, thumbs};
 use crate::player::{self, Episode, Playback, Player, PlayerEvent};
 use crate::secrets;
 use crate::ui::menu;
@@ -25,6 +25,7 @@ use crate::ui::text_input::TextInput;
 
 mod browse;
 mod details;
+mod reports;
 use browse::{Grid, Sort};
 use details::Details;
 
@@ -39,6 +40,8 @@ const CONTINUE_LIMIT: usize = 12;
 const VOLUME_SETTING: &str = "volume";
 const GENERAL_PREFS: &str = "general";
 const DISCOVERY_WAIT: Duration = Duration::from_millis(1500);
+/// Switching back to the app re-reads Jellyfin libraries older than this.
+const REFRESH_ON_FOCUS_AFTER: Duration = Duration::from_secs(60);
 const PLACEHOLDER_COLORS: [u32; 6] = [0x2b3a55, 0x3d2b55, 0x2b5547, 0x55402b, 0x552b3a, 0x2b4d55];
 
 /// Where the library database and thumbnails live.
@@ -177,6 +180,9 @@ pub struct Shell {
     form: ConnectForm,
     /// The server whose streaming quality menu is open.
     quality_menu: Option<i64>,
+    reports: reports::Reports,
+    /// When the Jellyfin libraries were last fetched.
+    remote_refreshed: Option<Instant>,
 }
 
 impl Shell {
@@ -218,6 +224,8 @@ impl Shell {
             details: HashMap::new(),
             details_loading: HashSet::new(),
             quality_menu: None,
+            reports: reports::Reports::default(),
+            remote_refreshed: None,
             player: None,
             scanning: false,
             loading_servers: HashSet::new(),
@@ -228,6 +236,23 @@ impl Shell {
             focus,
             form,
         };
+        // Closing the window while a video is open still reports it.
+        let this = cx.weak_entity();
+        window.on_window_should_close(cx, move |_, cx| {
+            this.update(cx, |this, cx| this.close_requested(cx))
+                .unwrap_or(true)
+        });
+        // Coming back to the app picks up changes made elsewhere (watched in
+        // another app, marked watched on the web).
+        cx.observe_window_activation(window, |this, window, cx| {
+            let stale = this
+                .remote_refreshed
+                .is_none_or(|at| at.elapsed() >= REFRESH_ON_FOCUS_AFTER);
+            if window.is_window_active() && this.player.is_none() && stale {
+                this.refresh_remote(cx);
+            }
+        })
+        .detach();
         shell.reload();
         shell.load_cached_remote();
         shell.refresh(cx);
@@ -416,6 +441,7 @@ impl Shell {
 
     /// Fetches every server's library; artwork follows in the background.
     fn refresh_remote(&mut self, cx: &mut Context<Self>) {
+        self.remote_refreshed = Some(Instant::now());
         for server in self.servers.clone() {
             if server.token.is_empty() {
                 // Removed from the credential store outside the app.
@@ -560,46 +586,6 @@ impl Shell {
                 if alive.is_err() {
                     return;
                 }
-            }
-        })
-        .detach();
-    }
-
-    /// Tells the server about playback so its resume/watched state follows.
-    fn report(
-        &mut self,
-        source: &Source,
-        kind: PlaybackReport,
-        position: f64,
-        session: Option<PlaySession>,
-        cx: &mut Context<Self>,
-    ) {
-        let (Source::Jellyfin { server, id }, Some(session)) = (source, session) else {
-            return;
-        };
-        let Some(client) = self.client(*server) else {
-            return;
-        };
-        let id = id.clone();
-        cx.spawn(async move |this, cx| {
-            let result = cx
-                .background_executor()
-                .spawn(async move {
-                    let reported = client.report(kind, &id, position, false, &session);
-                    if kind == PlaybackReport::Stopped && session.transcoding {
-                        // Don't leave the server transcoding for nobody.
-                        if let Err(e) = client.stop_transcoding(&session) {
-                            eprintln!("[jellyfin] stopping transcoding: {e:#}");
-                        }
-                    }
-                    reported
-                })
-                .await;
-            if let Err(e) = result {
-                eprintln!("[jellyfin] report {kind:?}: {e:#}");
-            }
-            if kind == PlaybackReport::Stopped {
-                this.update(cx, |this, cx| this.refresh_remote(cx)).ok();
             }
         })
         .detach();
@@ -938,21 +924,17 @@ impl Shell {
         });
         active.session = Some(session.clone());
         eprintln!("[jellyfin] quality {} ({})", quality.label(), session.id);
-        cx.background_executor()
-            .spawn(async move {
-                if let Some(old) = old {
-                    let _ = client.report(PlaybackReport::Stopped, &id, position, false, &old);
-                    if old.transcoding {
-                        let _ = client.stop_transcoding(&old);
-                    }
-                }
-                if let Err(e) =
-                    client.report(PlaybackReport::Started, &id, position, false, &session)
-                {
-                    eprintln!("[jellyfin] report Started: {e:#}");
-                }
-            })
-            .detach();
+        // The old session stops (ending its transcode) and the new one starts.
+        let source = Source::Jellyfin { server, id };
+        self.queue_report(&source, PlaybackReport::Stopped, position, old, false, cx);
+        self.queue_report(
+            &source,
+            PlaybackReport::Started,
+            position,
+            Some(session),
+            false,
+            cx,
+        );
     }
 
     fn saved_volume(&self) -> f64 {
@@ -1146,22 +1128,45 @@ impl Shell {
         {
             eprintln!("[library] saving volume: {e}");
         }
-        if let Some(source @ Source::Jellyfin { .. }) = &active.source {
-            // Update the card now; the refresh after "stopped" confirms it.
-            let finished =
-                active.duration > 0.0 && active.position >= active.duration * WATCHED_FRACTION;
-            if let Some(item) = self.remote.iter_mut().find(|i| &i.source == source) {
-                item.position = if finished { 0.0 } else { active.position };
-                item.watched |= finished;
-                item.last_played = Some(now());
+        // The player's own position is the freshest (progress events come
+        // every few seconds). A finished video is reported at its full
+        // runtime, so the server marks it watched even when it was left
+        // during the end credits, before the server's own 90% mark.
+        let player = active.view.read(cx);
+        let (position, duration, finished) = if player.duration() > 0.0 {
+            (player.position(), player.duration(), player.finished())
+        } else {
+            (active.position, active.duration, false)
+        };
+        let reported = if finished { duration } else { position };
+        match &active.source {
+            Some(Source::Local { id, .. }) => {
+                if duration > 0.0
+                    && let Err(e) = self.db.save_progress(*id, reported, duration)
+                {
+                    eprintln!("[library] saving progress: {e}");
+                }
             }
-            self.report(
-                source,
-                PlaybackReport::Stopped,
-                active.position,
-                active.session.clone(),
-                cx,
-            );
+            Some(source @ Source::Jellyfin { .. }) => {
+                // Update the card now; the refresh after "stopped" confirms it.
+                if let Some(item) = self.remote.iter_mut().find(|i| &i.source == source) {
+                    item.position = if finished { 0.0 } else { position };
+                    item.watched |= finished;
+                    item.last_played = Some(now());
+                }
+                eprintln!(
+                    "[jellyfin] stopped at {position:.0}/{duration:.0} s{}",
+                    if finished { " (watched)" } else { "" }
+                );
+                self.report(
+                    source,
+                    PlaybackReport::Stopped,
+                    reported,
+                    active.session.clone(),
+                    cx,
+                );
+            }
+            None => {}
         }
         self.reload();
     }

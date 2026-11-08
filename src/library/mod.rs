@@ -13,8 +13,9 @@ pub use db::Db;
 
 /// Saved positions shorter than this are treated as "not started".
 pub const MIN_RESUME_SECONDS: f64 = 10.0;
-/// Fraction of the runtime after which an item counts as watched.
-pub const WATCHED_FRACTION: f64 = 0.92;
+/// Fraction of the runtime after which an item counts as watched (Jellyfin's
+/// default too, so local and server state agree).
+pub const WATCHED_FRACTION: f64 = 0.9;
 
 /// Remembered audio and subtitle choices, as language codes.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
