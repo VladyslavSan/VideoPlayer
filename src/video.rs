@@ -242,6 +242,12 @@ impl VideoSurface {
             > 0
     }
 
+    /// True once mpv has set up its video output for the current file, so
+    /// its window shows frames rather than nothing.
+    pub fn video_configured(&self) -> bool {
+        self.mpv.get_property("vo-configured").unwrap_or(false)
+    }
+
     /// Stalled waiting for the network.
     pub fn buffering(&self) -> bool {
         self.mpv.get_property("paused-for-cache").unwrap_or(false)

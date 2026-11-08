@@ -1088,6 +1088,8 @@ impl Render for Player {
             .id("stage")
             .size_full()
             .relative()
+            // Black until the video is on screen; transparent after, so it shows.
+            .when(!self.status.video_shown, |d| d.bg(rgb(0x000000)))
             .track_focus(&self.focus)
             .when(!visible, |d| d.cursor(CursorStyle::None))
             .on_key_down(cx.listener(Self::on_key))

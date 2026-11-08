@@ -24,6 +24,9 @@ const TICK: Duration = Duration::from_millis(100);
 const CONTROLS_TIMEOUT: Duration = Duration::from_millis(2500);
 const PROGRESS_INTERVAL: Duration = Duration::from_secs(5);
 const TOAST_DURATION: Duration = Duration::from_millis(1200);
+/// How long mpv's video output must be up before the black backdrop is
+/// lifted, so its first frame is on screen first.
+const VIDEO_SETTLE: Duration = Duration::from_millis(150);
 /// How often the track list is re-read while the track panel is open.
 const TRACKS_REFRESH: Duration = Duration::from_secs(1);
 const SKIP_SECONDS: f64 = 10.0;
@@ -99,6 +102,10 @@ struct Status {
     paused: bool,
     buffering: bool,
     ended: bool,
+    /// The video is on screen. Until then the player paints black: the
+    /// window has no backing of its own, so unpainted areas would show the
+    /// desktop behind it.
+    video_shown: bool,
     volume: f64,
     muted: bool,
     speed: f64,
@@ -119,6 +126,8 @@ pub struct Player {
     up_next: Option<Instant>,
     prefs: TrackPrefs,
     quality: Option<Quality>,
+    /// When mpv's video output came up for the current source.
+    video_ready_since: Option<Instant>,
     /// After `reload`, the new source; until mpv reports it, track and
     /// load state still describe the old one.
     expected_path: Option<String>,
@@ -242,6 +251,7 @@ impl Player {
             up_next: None,
             prefs,
             quality,
+            video_ready_since: None,
             expected_path: None,
             audio_settled: false,
             subtitle_settled: false,
@@ -256,6 +266,7 @@ impl Player {
                 paused: false,
                 buffering: true,
                 ended: false,
+                video_shown: false,
                 volume,
                 muted: false,
                 speed: 1.0,
@@ -322,6 +333,8 @@ impl Player {
             return cx.notify();
         }
         self.expected_path = Some(url.to_string());
+        self.video_ready_since = None;
+        self.status.video_shown = false;
         self.tracks.clear();
         self.pending_subtitles = subtitles;
         self.audio_settled = false;
@@ -358,6 +371,7 @@ impl Player {
             paused: v.paused(),
             buffering: v.buffering() || !v.loaded(),
             ended: v.ended(),
+            video_shown: self.status.video_shown,
             volume: v.volume(),
             muted: v.muted(),
             speed: v.speed(),
@@ -374,6 +388,13 @@ impl Player {
             Some(expected) => self.video.path().as_deref() == Some(expected.as_str()),
             None => true,
         };
+        if switched && self.video.video_configured() {
+            let since = *self.video_ready_since.get_or_insert_with(Instant::now);
+            self.status.video_shown = since.elapsed() >= VIDEO_SETTLE;
+        } else {
+            self.video_ready_since = None;
+            self.status.video_shown = false;
+        }
         if switched && self.video.loaded() {
             self.expected_path = None;
             let mut added = false;
