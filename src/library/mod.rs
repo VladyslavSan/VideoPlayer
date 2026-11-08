@@ -128,8 +128,9 @@ impl Item {
     }
 }
 
-/// The next episode of each show being watched: if a show's most recently
-/// played episode was finished, the first unwatched one after it. Paired
+/// The next episode of each show being watched: the most recently played
+/// episode if it wasn't finished (and has no resume point, or it would be
+/// continued instead), else the first unwatched one after it. Paired
 /// with when the show was last watched, for sorting.
 pub fn next_up<'a>(items: impl Iterator<Item = &'a Item>) -> Vec<(Option<i64>, &'a Item)> {
     let mut shows: BTreeMap<&str, Vec<&Item>> = BTreeMap::new();
@@ -150,7 +151,10 @@ pub fn next_up<'a>(items: impl Iterator<Item = &'a Item>) -> Vec<(Option<i64>, &
             if last.progress().is_some() {
                 return None; // still in progress: it's continued, not next
             }
-            let next = episodes[last_index + 1..].iter().find(|e| !e.watched)?;
+            // Starting from the last one itself: one that was left in its
+            // first minutes has no resume point (Jellyfin drops positions
+            // under 5%), but it isn't finished either.
+            let next = episodes[last_index..].iter().find(|e| !e.watched)?;
             Some((last.last_played, *next))
         })
         .collect()
@@ -229,5 +233,16 @@ mod tests {
         items[0].last_played = Some(900); // rewatched E1 last
         items[1].last_played = Some(100);
         assert_eq!(keys(&next_up(items.iter())), vec!["jf-1-A-1-3"]);
+    }
+
+    #[test]
+    fn an_episode_left_early_is_still_next() {
+        let mut items = [episode("A", 1, 1), episode("A", 1, 2), episode("A", 1, 3)];
+        items[0].watched = true;
+        items[0].last_played = Some(100);
+        // Opened E2 and closed it after a few seconds: no resume point, not
+        // watched. It's still the one to watch, not E3.
+        items[1].last_played = Some(200);
+        assert_eq!(keys(&next_up(items.iter())), vec!["jf-1-A-1-2"]);
     }
 }
