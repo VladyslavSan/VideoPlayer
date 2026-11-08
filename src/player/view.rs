@@ -453,7 +453,7 @@ impl Player {
         secondary: SharedString,
         selected: bool,
         cx: &mut Context<Self>,
-        action: impl Fn(&mut Self) + 'static,
+        action: impl Fn(&mut Self, &mut Context<Self>) + 'static,
     ) -> AnyElement {
         div()
             .id(id)
@@ -485,7 +485,7 @@ impl Player {
                     }),
             )
             .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
-                action(this);
+                action(this, cx);
                 this.poke(cx);
             }))
             .into_any_element()
@@ -552,7 +552,7 @@ impl Player {
                 label.secondary.into(),
                 track.selected,
                 cx,
-                move |this| this.select_audio(id),
+                move |this, cx| this.select_audio(id, cx),
             ));
         }
         if audio.is_empty() {
@@ -573,7 +573,7 @@ impl Player {
             SharedString::default(),
             !any_subtitle,
             cx,
-            |this| this.select_subtitle(None),
+            |this, cx| this.select_subtitle(None, cx),
         )];
         for (i, track) in self.tracks_of(TrackKind::Subtitle).enumerate() {
             let label = tracks::label(track, i + 1);
@@ -584,7 +584,7 @@ impl Player {
                 label.secondary.into(),
                 track.selected,
                 cx,
-                move |this| this.select_subtitle(Some(id)),
+                move |this, cx| this.select_subtitle(Some(id), cx),
             ));
         }
 

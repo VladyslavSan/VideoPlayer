@@ -7,7 +7,7 @@ use anyhow::Result;
 use rusqlite::{Connection, OptionalExtension, Row, params};
 
 use super::parse::Parsed;
-use super::{Item, MIN_RESUME_SECONDS, Source, WATCHED_FRACTION};
+use super::{Item, MIN_RESUME_SECONDS, Source, SubtitlePref, TrackPrefs, WATCHED_FRACTION};
 use crate::jellyfin::Server;
 
 const SCHEMA: &str = "
@@ -45,6 +45,9 @@ CREATE TABLE IF NOT EXISTS servers (
     UNIQUE (server_id, user_id)
 );
 CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+-- Remembered track choices. scope: 'general' or 'show:<name>'.
+-- subtitle: NULL = no choice yet, '' = off, else a language code.
+CREATE TABLE IF NOT EXISTS track_prefs (scope TEXT PRIMARY KEY, audio TEXT, subtitle TEXT);
 ";
 
 /// A video file found on disk.
@@ -297,6 +300,50 @@ impl Db {
         Ok(())
     }
 
+    pub fn track_prefs(&self, scope: &str) -> Result<TrackPrefs> {
+        let row: Option<(Option<String>, Option<String>)> = self
+            .conn
+            .query_row(
+                "SELECT audio, subtitle FROM track_prefs WHERE scope = ?1",
+                [scope],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .optional()?;
+        let (audio, subtitle) = row.unwrap_or_default();
+        Ok(TrackPrefs {
+            audio,
+            subtitle: subtitle.map(|s| {
+                if s.is_empty() {
+                    SubtitlePref::Off
+                } else {
+                    SubtitlePref::Language(s)
+                }
+            }),
+        })
+    }
+
+    pub fn save_audio_pref(&self, scope: &str, lang: &str) -> Result<()> {
+        self.conn.execute(
+            "INSERT INTO track_prefs (scope, audio) VALUES (?1, ?2)
+             ON CONFLICT(scope) DO UPDATE SET audio = excluded.audio",
+            [scope, lang],
+        )?;
+        Ok(())
+    }
+
+    pub fn save_subtitle_pref(&self, scope: &str, pref: &SubtitlePref) -> Result<()> {
+        let value = match pref {
+            SubtitlePref::Off => "",
+            SubtitlePref::Language(lang) => lang.as_str(),
+        };
+        self.conn.execute(
+            "INSERT INTO track_prefs (scope, subtitle) VALUES (?1, ?2)
+             ON CONFLICT(scope) DO UPDATE SET subtitle = excluded.subtitle",
+            [scope, value],
+        )?;
+        Ok(())
+    }
+
     pub fn setting(&self, key: &str) -> Result<Option<String>> {
         Ok(self
             .conn
@@ -492,6 +539,36 @@ mod tests {
         assert_eq!(saved[0].token, "old-token");
         db.clear_token(saved[0].id)?;
         assert_eq!(db.servers()?[0].token, "");
+        Ok(())
+    }
+
+    #[test]
+    fn track_prefs_round_trip() -> Result<()> {
+        let db = Db::open_in_memory()?;
+        assert_eq!(db.track_prefs("show:X")?, TrackPrefs::default());
+        db.save_audio_pref("show:X", "ukr")?;
+        db.save_subtitle_pref("show:X", &SubtitlePref::Off)?;
+        assert_eq!(
+            db.track_prefs("show:X")?,
+            TrackPrefs {
+                audio: Some("ukr".into()),
+                subtitle: Some(SubtitlePref::Off)
+            }
+        );
+        db.save_subtitle_pref("show:X", &SubtitlePref::Language("eng".into()))?;
+        let prefs = db.track_prefs("show:X")?;
+        assert_eq!(prefs.audio.as_deref(), Some("ukr"));
+        assert_eq!(prefs.subtitle, Some(SubtitlePref::Language("eng".into())));
+        // Show choices win; gaps come from the general ones.
+        db.save_audio_pref("general", "eng")?;
+        db.save_subtitle_pref("general", &SubtitlePref::Off)?;
+        let merged = TrackPrefs {
+            audio: None,
+            ..prefs
+        }
+        .or(db.track_prefs("general")?);
+        assert_eq!(merged.audio.as_deref(), Some("eng"));
+        assert_eq!(merged.subtitle, Some(SubtitlePref::Language("eng".into())));
         Ok(())
     }
 

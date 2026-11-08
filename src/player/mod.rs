@@ -15,6 +15,7 @@ use gpui::{
 use raw_window_handle::{HasWindowHandle, RawWindowHandle};
 use windows::Win32::Foundation::HWND;
 
+use crate::library::{SubtitlePref, TrackPrefs};
 use crate::video::{ExternalSubtitle, Track, TrackKind, VideoSurface};
 
 const TICK: Duration = Duration::from_millis(100);
@@ -37,6 +38,10 @@ pub enum PlayerEvent {
     Exit,
     /// Switch to another item (an episode of the same show), by library key.
     Play(String),
+    /// The viewer picked an audio track in this language, to remember.
+    AudioChosen(String),
+    /// The viewer picked subtitles (or turned them off), to remember.
+    SubtitleChosen(SubtitlePref),
 }
 
 /// An episode of the show being played, for the episode list and "next".
@@ -60,6 +65,8 @@ pub struct Playback {
     pub episodes: Vec<Episode>,
     /// Index of the playing episode in `episodes`.
     pub current: Option<usize>,
+    /// Remembered track choices to apply once the tracks are known.
+    pub prefs: TrackPrefs,
 }
 
 /// The panel open above the control bar, if any.
@@ -103,6 +110,11 @@ pub struct Player {
     episode_season: u16,
     /// When the video has ended and the next episode will start.
     up_next: Option<Instant>,
+    prefs: TrackPrefs,
+    /// Set once the remembered choice is applied, or the viewer picks one;
+    /// after that, tracks are left alone.
+    audio_settled: bool,
+    subtitle_settled: bool,
     status: Status,
     tracks: Vec<Track>,
     tracks_read: Instant,
@@ -181,6 +193,7 @@ impl Player {
             subtitle,
             episodes,
             current,
+            prefs,
         } = playback;
         let episode_season = current
             .and_then(|i| episodes.get(i))
@@ -209,6 +222,9 @@ impl Player {
             current,
             episode_season,
             up_next: None,
+            prefs,
+            audio_settled: false,
+            subtitle_settled: false,
             status: Status {
                 position: 0.0,
                 duration: 0.0,
@@ -275,19 +291,25 @@ impl Player {
             self.pipeline = pipeline;
         }
         if self.video.loaded() {
+            let mut added = false;
             if !self.pending_subtitles.is_empty() {
                 for subtitle in std::mem::take(&mut self.pending_subtitles) {
                     if let Err(e) = self.video.add_subtitle(&subtitle) {
                         eprintln!("[video] {e:#}");
                     }
                 }
-                self.read_tracks();
+                added = true;
             }
-            if self.tracks.is_empty()
+            if added
+                || self.tracks.is_empty()
                 || (self.panel == Some(Panel::Tracks)
                     && self.tracks_read.elapsed() >= TRACKS_REFRESH)
             {
                 self.read_tracks();
+            }
+            // Once when the file opens, and again when subtitle files arrive.
+            if added || !self.audio_settled {
+                self.apply_prefs();
             }
         }
         if self.video.ended() {
@@ -418,18 +440,81 @@ impl Player {
         self.video.set_muted(self.status.muted);
     }
 
-    fn select_audio(&mut self, id: i64) {
-        self.video.select_audio(id);
-        self.read_tracks();
+    /// Selects the remembered languages, if the file has them. A subtitle
+    /// language that isn't there yet may still arrive as an external file.
+    fn apply_prefs(&mut self) {
+        let mut changed = false;
+        if !self.audio_settled {
+            if let Some(id) = self
+                .prefs
+                .audio
+                .as_deref()
+                .and_then(|lang| tracks::pick_audio(&self.tracks, lang))
+                && !self.tracks.iter().any(|t| t.id == id && t.selected)
+            {
+                self.video.select_audio(id);
+                changed = true;
+            }
+            self.audio_settled = true;
+        }
+        if !self.subtitle_settled {
+            match &self.prefs.subtitle {
+                None => self.subtitle_settled = true,
+                Some(SubtitlePref::Off) => {
+                    self.video.select_subtitle(None);
+                    self.subtitle_settled = true;
+                    changed = true;
+                }
+                Some(SubtitlePref::Language(lang)) => {
+                    if let Some(id) = tracks::pick_subtitle(&self.tracks, lang) {
+                        self.video.select_subtitle(Some(id));
+                        self.subtitle_settled = true;
+                        changed = true;
+                    }
+                }
+            }
+        }
+        if changed {
+            self.read_tracks();
+        }
     }
 
-    fn select_subtitle(&mut self, id: Option<i64>) {
-        self.video.select_subtitle(id);
+    /// The viewer's pick; remembered for next time.
+    fn select_audio(&mut self, id: i64, cx: &mut Context<Self>) {
+        self.video.select_audio(id);
+        self.audio_settled = true;
         self.read_tracks();
+        if let Some(lang) = self
+            .tracks
+            .iter()
+            .find(|t| t.id == id)
+            .and_then(|t| t.lang.clone())
+        {
+            cx.emit(PlayerEvent::AudioChosen(lang));
+        }
+    }
+
+    /// The viewer's pick (`None` = off); remembered for next time.
+    fn select_subtitle(&mut self, id: Option<i64>, cx: &mut Context<Self>) {
+        self.video.select_subtitle(id);
+        self.subtitle_settled = true;
+        self.read_tracks();
+        let pref = match id {
+            None => Some(SubtitlePref::Off),
+            Some(id) => self
+                .tracks
+                .iter()
+                .find(|t| t.id == id)
+                .and_then(|t| t.lang.clone())
+                .map(SubtitlePref::Language),
+        };
+        if let Some(pref) = pref {
+            cx.emit(PlayerEvent::SubtitleChosen(pref));
+        }
     }
 
     /// Steps to the next track of `kind`; subtitles include "off".
-    fn cycle(&mut self, kind: TrackKind) {
+    fn cycle(&mut self, kind: TrackKind, cx: &mut Context<Self>) {
         self.read_tracks();
         let ids: Vec<i64> = self.tracks_of(kind).map(|t| t.id).collect();
         let current = self.tracks_of(kind).find(|t| t.selected).map(|t| t.id);
@@ -450,8 +535,8 @@ impl Player {
             .map_or(0, |i| (i + 1) % choices.len());
         let choice = choices[next];
         match kind {
-            TrackKind::Audio => self.select_audio(choice.unwrap_or_default()),
-            TrackKind::Subtitle => self.select_subtitle(choice),
+            TrackKind::Audio => self.select_audio(choice.unwrap_or_default(), cx),
+            TrackKind::Subtitle => self.select_subtitle(choice, cx),
         }
         let name = choice
             .and_then(|id| {
@@ -561,8 +646,8 @@ impl Player {
                     "Sound on"
                 });
             }
-            "s" => self.cycle(TrackKind::Subtitle),
-            "a" => self.cycle(TrackKind::Audio),
+            "s" => self.cycle(TrackKind::Subtitle, cx),
+            "a" => self.cycle(TrackKind::Audio, cx),
             "c" => self.toggle_panel(Panel::Tracks),
             "[" => self.step_speed(-1),
             "]" => self.step_speed(1),

@@ -1,6 +1,37 @@
-//! Human-readable names for audio and subtitle tracks.
+//! Human-readable names for audio and subtitle tracks, and picking tracks
+//! by remembered language.
 
 use crate::video::{Track, TrackKind};
+
+/// Whether two language codes mean the same language: files mix ISO 639-1
+/// and 639-2 (`en`, `eng`), and 639-2 has two forms for some (`ger`, `deu`).
+pub fn same_language(a: &str, b: &str) -> bool {
+    match (language_name(a), language_name(b)) {
+        (Some(x), Some(y)) => x == y,
+        _ => a.eq_ignore_ascii_case(b),
+    }
+}
+
+/// The audio track to use for a preferred language.
+pub fn pick_audio(tracks: &[Track], lang: &str) -> Option<i64> {
+    tracks
+        .iter()
+        .filter(|t| t.kind == TrackKind::Audio)
+        .find(|t| t.lang.as_deref().is_some_and(|l| same_language(l, lang)))
+        .map(|t| t.id)
+}
+
+/// The subtitle track to use for a preferred language: full subtitles
+/// rather than a forced-only track when there is a choice.
+pub fn pick_subtitle(tracks: &[Track], lang: &str) -> Option<i64> {
+    let mut matching: Vec<&Track> = tracks
+        .iter()
+        .filter(|t| t.kind == TrackKind::Subtitle)
+        .filter(|t| t.lang.as_deref().is_some_and(|l| same_language(l, lang)))
+        .collect();
+    matching.sort_by_key(|t| t.forced);
+    matching.first().map(|t| t.id)
+}
 
 /// Two lines for a track menu row: `English` / `SDH · SRT · External`.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -160,6 +191,41 @@ mod tests {
             external: false,
             forced: false,
         }
+    }
+
+    fn with(kind: TrackKind, id: i64, lang: &str, forced: bool) -> Track {
+        Track {
+            id,
+            lang: Some(lang.into()),
+            forced,
+            ..track(kind)
+        }
+    }
+
+    #[test]
+    fn languages_match_across_code_styles() {
+        assert!(same_language("en", "eng"));
+        assert!(same_language("ger", "deu"));
+        assert!(same_language("UKR", "uk"));
+        assert!(!same_language("en", "uk"));
+        assert!(same_language("tlh", "TLH"));
+    }
+
+    #[test]
+    fn picks_tracks_by_language() {
+        let tracks = vec![
+            with(TrackKind::Audio, 1, "eng", false),
+            with(TrackKind::Audio, 2, "ukr", false),
+            with(TrackKind::Subtitle, 3, "uk", true),
+            with(TrackKind::Subtitle, 4, "ukr", false),
+            with(TrackKind::Subtitle, 5, "eng", false),
+        ];
+        assert_eq!(pick_audio(&tracks, "uk"), Some(2));
+        assert_eq!(pick_audio(&tracks, "fr"), None);
+        // Full Ukrainian subtitles beat the forced-only track.
+        assert_eq!(pick_subtitle(&tracks, "ukr"), Some(4));
+        assert_eq!(pick_subtitle(&tracks, "en"), Some(5));
+        assert_eq!(pick_subtitle(&tracks, "de"), None);
     }
 
     #[test]

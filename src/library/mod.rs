@@ -15,6 +15,30 @@ pub const MIN_RESUME_SECONDS: f64 = 10.0;
 /// Fraction of the runtime after which an item counts as watched.
 pub const WATCHED_FRACTION: f64 = 0.92;
 
+/// Remembered audio and subtitle choices, as language codes.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct TrackPrefs {
+    pub audio: Option<String>,
+    pub subtitle: Option<SubtitlePref>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SubtitlePref {
+    Off,
+    Language(String),
+}
+
+impl TrackPrefs {
+    /// `self`, with gaps filled from `fallback` (for example a show's
+    /// choices over the general ones).
+    pub fn or(self, fallback: TrackPrefs) -> TrackPrefs {
+        TrackPrefs {
+            audio: self.audio.or(fallback.audio),
+            subtitle: self.subtitle.or(fallback.subtitle),
+        }
+    }
+}
+
 /// Where an item lives and how to play it.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum Source {

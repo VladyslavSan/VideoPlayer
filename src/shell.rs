@@ -14,7 +14,7 @@ use gpui::{
 };
 
 use crate::jellyfin::{self, Client, ImageRef, PlaybackReport, Server, discovery};
-use crate::library::{Db, Item, Source, WATCHED_FRACTION, scan, thumbs};
+use crate::library::{Db, Item, Source, TrackPrefs, WATCHED_FRACTION, scan, thumbs};
 use crate::player::{self, Episode, Playback, Player, PlayerEvent};
 use crate::secrets;
 use crate::ui::text_input::TextInput;
@@ -28,6 +28,7 @@ const CARD_WIDTH: f32 = 256.0;
 const CARD_HEIGHT: f32 = 144.0;
 const CONTINUE_LIMIT: usize = 12;
 const VOLUME_SETTING: &str = "volume";
+const GENERAL_PREFS: &str = "general";
 const DISCOVERY_WAIT: Duration = Duration::from_millis(1500);
 const PLACEHOLDER_COLORS: [u32; 6] = [0x2b3a55, 0x3d2b55, 0x2b5547, 0x55402b, 0x552b3a, 0x2b4d55];
 
@@ -88,6 +89,8 @@ struct ActivePlayer {
     source: Option<Source>,
     position: f64,
     duration: f64,
+    /// The show being watched, whose track choices are remembered.
+    show: Option<String>,
     _subscription: Subscription,
 }
 
@@ -173,6 +176,7 @@ impl Shell {
                 subtitle: None,
                 episodes: Vec::new(),
                 current: None,
+                prefs: shell.track_prefs(None),
             };
             shell.start_player(source, None, playback, 0.0, None, window, cx);
         }
@@ -647,6 +651,7 @@ impl Shell {
             subtitle,
             episodes,
             current,
+            prefs: self.track_prefs(item.show.as_deref()),
         };
         let start = item.resume_position();
         eprintln!("[play] {} ({key}) from {start:.1}s", item.display_title());
@@ -691,6 +696,9 @@ impl Shell {
                 }
             }
         }
+        if let Some(active) = &mut self.player {
+            active.show = item.show.clone();
+        }
     }
 
     /// The show's episodes in watching order (seasons in order, specials
@@ -722,6 +730,25 @@ impl Shell {
             })
             .collect();
         (episodes, current)
+    }
+
+    /// Remembered track choices: the show's own, then the general ones.
+    fn track_prefs(&self, show: Option<&str>) -> TrackPrefs {
+        let load = |scope: &str| self.db.track_prefs(scope).unwrap_or_default();
+        let general = load(GENERAL_PREFS);
+        match show {
+            Some(show) => load(&format!("show:{show}")).or(general),
+            None => general,
+        }
+    }
+
+    /// Where a track choice made now is remembered: for the current show
+    /// (if it's an episode) and as the general preference.
+    fn pref_scopes(&self) -> Vec<String> {
+        let show = self.player.as_ref().and_then(|p| p.show.clone());
+        let mut scopes = vec![GENERAL_PREFS.to_string()];
+        scopes.extend(show.map(|s| format!("show:{s}")));
+        scopes
     }
 
     fn saved_volume(&self) -> f64 {
@@ -804,6 +831,7 @@ impl Shell {
             source,
             position: start,
             duration: 0.0,
+            show: None,
             _subscription: subscription,
         });
         cx.notify();
@@ -841,6 +869,20 @@ impl Shell {
                 self.finish_playback(cx);
                 self.focus.focus(window);
                 cx.notify();
+            }
+            PlayerEvent::AudioChosen(lang) => {
+                for scope in self.pref_scopes() {
+                    if let Err(e) = self.db.save_audio_pref(&scope, lang) {
+                        eprintln!("[library] saving audio choice: {e}");
+                    }
+                }
+            }
+            PlayerEvent::SubtitleChosen(pref) => {
+                for scope in self.pref_scopes() {
+                    if let Err(e) = self.db.save_subtitle_pref(&scope, pref) {
+                        eprintln!("[library] saving subtitle choice: {e}");
+                    }
+                }
             }
             PlayerEvent::Play(key) => {
                 // Straight to the next video; fullscreen stays as it is.
