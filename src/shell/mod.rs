@@ -14,10 +14,13 @@ use gpui::{
 };
 
 use crate::jellyfin::{self, Client, ImageRef, PlaybackReport, Server, discovery};
-use crate::library::{self, Db, Item, Source, TrackPrefs, WATCHED_FRACTION, scan, thumbs};
+use crate::library::{Db, Item, Source, TrackPrefs, WATCHED_FRACTION, scan, thumbs};
 use crate::player::{self, Episode, Playback, Player, PlayerEvent};
 use crate::secrets;
 use crate::ui::text_input::TextInput;
+
+mod browse;
+use browse::{Grid, Sort};
 
 const BG: u32 = 0x0b0d12;
 const TEXT: u32 = 0xf4f5f7;
@@ -74,6 +77,8 @@ fn now() -> i64 {
 #[derive(Clone, PartialEq)]
 enum Screen {
     Home,
+    Movies,
+    Shows,
     Show(String),
     Connect,
 }
@@ -118,6 +123,11 @@ pub struct Shell {
     roots: Vec<PathBuf>,
     servers: Vec<Server>,
     screen: Screen,
+    /// The library tab to go back to from a show page.
+    tab: Screen,
+    movie_sort: Sort,
+    show_sort: Sort,
+    search: Entity<TextInput>,
     player: Option<ActivePlayer>,
     scanning: bool,
     loading_servers: HashSet<i64>,
@@ -149,6 +159,9 @@ impl Shell {
             found: Vec::new(),
             error: None,
         };
+        let search = cx.new(|cx| TextInput::new("Search", false, cx));
+        // Re-render results as the query changes.
+        cx.observe(&search, |_, _, cx| cx.notify()).detach();
         let mut shell = Self {
             db,
             paths,
@@ -158,6 +171,10 @@ impl Shell {
             roots: Vec::new(),
             servers: Vec::new(),
             screen: Screen::Home,
+            tab: Screen::Home,
+            movie_sort: Sort::Title,
+            show_sort: Sort::RecentlyWatched,
+            search,
             player: None,
             scanning: false,
             loading_servers: HashSet::new(),
@@ -991,8 +1008,20 @@ impl Shell {
             (Screen::Connect, "enter") => self.connect(window, cx),
             (Screen::Connect, "tab") => self.focus_next_field(window, cx),
             (Screen::Connect, "escape") | (Screen::Show(_), "escape" | "backspace") => {
-                self.screen = Screen::Home;
+                self.screen = self.tab.clone();
                 window.focus(&self.focus);
+                cx.notify();
+            }
+            (Screen::Home | Screen::Movies | Screen::Shows, "escape") => {
+                // Clear the search and leave the field.
+                self.search.update(cx, |input, cx| input.set_text("", cx));
+                window.focus(&self.focus);
+                cx.notify();
+            }
+            (Screen::Home | Screen::Movies | Screen::Shows, "f")
+                if event.keystroke.modifiers.control =>
+            {
+                window.focus(&self.search.focus_handle(cx));
                 cx.notify();
             }
             _ => {}
@@ -1028,13 +1057,13 @@ impl Shell {
             |text: SharedString| div().text_2xl().font_weight(FontWeight::BOLD).child(text);
         let back = |this: &Self, cx: &mut Context<Self>| {
             this.button("home", "‹ Library", cx, |this, window, cx| {
-                this.screen = Screen::Home;
+                this.screen = this.tab.clone();
                 window.focus(&this.focus);
                 cx.notify();
             })
         };
         let title: AnyElement = match &self.screen {
-            Screen::Home => heading("Library".into()).into_any_element(),
+            Screen::Home | Screen::Movies | Screen::Shows => self.tabs(cx),
             Screen::Show(name) => div()
                 .flex()
                 .items_center()
@@ -1179,7 +1208,14 @@ impl Shell {
                     .truncate()
                     .child(title),
             )
-            .children(subtitle.map(|s| div().text_xs().text_color(rgb(MUTED)).truncate().child(s)))
+            .child(
+                div()
+                    .h(px(16.0))
+                    .text_xs()
+                    .text_color(rgb(MUTED))
+                    .truncate()
+                    .child(subtitle.unwrap_or_default()),
+            )
             .on_click(
                 cx.listener(move |this, _: &ClickEvent, window, cx| on_click(this, window, cx)),
             )
@@ -1278,86 +1314,6 @@ impl Shell {
                     })),
             )
             .into_any_element()
-    }
-
-    fn home(&self, cx: &mut Context<Self>) -> Vec<AnyElement> {
-        if self.items().next().is_none() {
-            return vec![self.empty_state(cx)];
-        }
-        let mut sections = Vec::new();
-
-        // Half-watched videos, and the next episode of shows being watched,
-        // most recently watched first.
-        let mut continuing: Vec<(Option<i64>, &Item)> = self
-            .items()
-            .filter(|i| i.progress().is_some())
-            .map(|i| (i.last_played, i))
-            .collect();
-        continuing.extend(library::next_up(self.items()));
-        continuing.sort_by_key(|(played, _)| std::cmp::Reverse(*played));
-        if !continuing.is_empty() {
-            let cards = continuing
-                .into_iter()
-                .take(CONTINUE_LIMIT)
-                .map(|(_, i)| self.item_card("continue", i, true, cx))
-                .collect::<Vec<_>>();
-            sections.push(Self::section(
-                "Continue Watching",
-                div()
-                    .id("continue-row")
-                    .flex()
-                    .gap_5()
-                    .pb_2()
-                    .overflow_x_scroll()
-                    .children(cards),
-            ));
-        }
-
-        let mut movies: Vec<&Item> = self.items().filter(|i| !i.is_episode()).collect();
-        movies.sort_by_key(|i| i.title.to_lowercase());
-        if !movies.is_empty() {
-            let cards = movies
-                .into_iter()
-                .map(|i| self.item_card("movie", i, true, cx))
-                .collect();
-            sections.push(Self::section("Movies", Self::grid(cards)));
-        }
-
-        let mut shows: BTreeMap<String, Vec<&Item>> = BTreeMap::new();
-        for item in self.items() {
-            if let Some(show) = &item.show {
-                shows.entry(show.clone()).or_default().push(item);
-            }
-        }
-        if !shows.is_empty() {
-            let cards = shows
-                .into_iter()
-                .map(|(show, episodes)| {
-                    let thumb = episodes.iter().find_map(|e| e.thumb.clone());
-                    let unwatched = episodes.iter().filter(|e| !e.watched).count();
-                    let subtitle = match unwatched {
-                        0 => format!("{} episodes · all watched", episodes.len()),
-                        n if n == episodes.len() => format!("{n} episodes"),
-                        n => format!("{} episodes · {n} unwatched", episodes.len()),
-                    };
-                    let name = show.clone();
-                    let card = Card {
-                        id: SharedString::from(format!("show-{show}")).into(),
-                        thumb,
-                        title: show,
-                        subtitle: Some(subtitle),
-                        progress: None,
-                        watched: unwatched == 0,
-                    };
-                    self.card(card, cx, move |this, _, cx| {
-                        this.screen = Screen::Show(name.clone());
-                        cx.notify();
-                    })
-                })
-                .collect();
-            sections.push(Self::section("TV Shows", Self::grid(cards)));
-        }
-        sections
     }
 
     fn show_page(&self, show: &str, cx: &mut Context<Self>) -> Vec<AnyElement> {
@@ -1514,17 +1470,35 @@ impl Shell {
 }
 
 impl Render for Shell {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         if let Some(player) = &self.player {
             return div()
                 .size_full()
                 .child(player.view.clone())
                 .into_any_element();
         }
-        let body = match self.screen.clone() {
-            Screen::Home => self.home(cx),
-            Screen::Show(name) => self.show_page(&name, cx),
-            Screen::Connect => self.connect_page(cx),
+        let query = self.search_query(cx);
+        let on_tab = matches!(self.screen, Screen::Home | Screen::Movies | Screen::Shows);
+        let body: Result<Vec<AnyElement>, AnyElement> = match self.screen.clone() {
+            _ if on_tab && !query.is_empty() => Ok(self.search_results(&query, cx)),
+            Screen::Home => Ok(self.home(cx)),
+            Screen::Movies => Err(self.library_grid(Grid::Movies, window, cx)),
+            Screen::Shows => Err(self.library_grid(Grid::Shows, window, cx)),
+            Screen::Show(name) => Ok(self.show_page(&name, cx)),
+            Screen::Connect => Ok(self.connect_page(cx)),
+        };
+        // Sections scroll as one page; the grids scroll (and virtualize) themselves.
+        let content = match body {
+            Ok(sections) => div()
+                .id("content")
+                .flex_1()
+                .min_h(px(0.0))
+                .overflow_y_scroll()
+                .px_8()
+                .pb_10()
+                .children(sections)
+                .into_any_element(),
+            Err(grid) => grid,
         };
         div()
             .size_full()
@@ -1535,16 +1509,7 @@ impl Render for Shell {
             .track_focus(&self.focus)
             .on_key_down(cx.listener(Self::on_key))
             .child(self.header(cx))
-            .child(
-                div()
-                    .id("content")
-                    .flex_1()
-                    .min_h(px(0.0))
-                    .overflow_y_scroll()
-                    .px_8()
-                    .pb_10()
-                    .children(body),
-            )
+            .child(content)
             .into_any_element()
     }
 }

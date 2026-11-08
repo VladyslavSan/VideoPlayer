@@ -73,6 +73,12 @@ Press **F1** (or `?`) in the player to see all shortcuts.
 
 ## Library
 
+The library has three tabs. **Home** shows Continue Watching (including the next episode of
+shows you're watching), recently added movies and recently updated shows. **Movies** and
+**TV Shows** are full grids with sorting (title, recently added, recently watched, year); they
+only draw the rows on screen, so large libraries stay fast. **Search** (Ctrl+F) matches
+movies, shows and episode titles; Esc clears it.
+
 Add folders with **Add Folder**. They are scanned in the background, and movie and
 episode names are parsed from file and folder names (`Title (Year)`, `Show.S01E02`,
 `Show - 1x02`, `Show/Season 1/...`). Thumbnails are taken from a frame of each video.

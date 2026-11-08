@@ -167,7 +167,7 @@ impl Client {
                 ("userId", user_id.to_string()),
                 ("Recursive", "true".into()),
                 ("IncludeItemTypes", "Movie,Episode".into()),
-                ("Fields", "ParentBackdropItemId".into()),
+                ("Fields", "ParentBackdropItemId,DateCreated".into()),
                 ("EnableUserData", "true".into()),
                 ("SortBy", "SortName".into()),
                 ("StartIndex", items.len().to_string()),

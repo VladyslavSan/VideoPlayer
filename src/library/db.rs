@@ -192,7 +192,7 @@ impl Db {
     pub fn items(&self) -> Result<Vec<Item>> {
         let mut stmt = self.conn.prepare(
             "SELECT id, path, title, year, show, season, episode, duration, position,
-                    watched, last_played, thumb
+                    watched, last_played, thumb, added
              FROM items
              ORDER BY show COLLATE NOCASE, season, episode, title COLLATE NOCASE",
         )?;
@@ -407,6 +407,7 @@ fn item_from_row(r: &Row) -> rusqlite::Result<Item> {
         watched: r.get(9)?,
         last_played: r.get(10)?,
         thumb: thumb.filter(|t| !t.is_empty()).map(PathBuf::from),
+        added: r.get(12)?,
     })
 }
 

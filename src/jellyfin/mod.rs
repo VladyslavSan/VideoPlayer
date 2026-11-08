@@ -96,6 +96,7 @@ pub struct BaseItem {
     pub parent_backdrop_image_tags: Vec<String>,
     pub parent_backdrop_item_id: Option<String>,
     pub user_data: Option<UserData>,
+    pub date_created: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
@@ -286,6 +287,7 @@ impl BaseItem {
                 .card_image()
                 .map(|img| img.cache_path(thumbs))
                 .filter(|p| p.exists()),
+            added: self.date_created.as_deref().and_then(parse_timestamp),
         }
     }
 }

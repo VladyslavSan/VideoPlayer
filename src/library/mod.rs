@@ -63,6 +63,8 @@ pub struct Item {
     pub watched: bool,
     pub last_played: Option<i64>,
     pub thumb: Option<PathBuf>,
+    /// When it joined the library (Unix seconds), for "recently added".
+    pub added: Option<i64>,
 }
 
 impl Item {
@@ -173,6 +175,7 @@ mod tests {
             watched: false,
             last_played: None,
             thumb: None,
+            added: None,
         }
     }
 
