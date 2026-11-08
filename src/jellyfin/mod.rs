@@ -10,7 +10,7 @@ use std::path::{Path, PathBuf};
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
 
-pub use client::{Client, PlaybackReport};
+pub use client::{Client, PlaySession, PlaybackReport};
 
 use crate::library::{Item, Source};
 use crate::video::{ExternalSubtitle, Segment, SegmentKind};
@@ -141,19 +141,39 @@ impl PlaybackInfo {
     /// Subtitle files stored next to the video on the server. Subtitles
     /// inside the video file aren't listed: mpv finds those itself.
     /// `base` is the server address; URLs need the auth header to download.
-    pub fn external_subtitles(&self, base: &str, item_id: &str) -> Vec<ExternalSubtitle> {
+    /// Subtitles to load as separate files. Direct play needs only the
+    /// external ones (mpv reads the rest from the file). A transcoded stream
+    /// carries no subtitles, so then the text ones inside the file are
+    /// fetched too (Jellyfin extracts them); picture-based ones can't be.
+    pub fn subtitle_files(
+        &self,
+        base: &str,
+        item_id: &str,
+        transcoding: bool,
+    ) -> Vec<ExternalSubtitle> {
         let Some(source) = self.media_sources.first() else {
             return Vec::new();
+        };
+        let is_text = |codec: &str| {
+            matches!(
+                codec,
+                "subrip" | "srt" | "ass" | "ssa" | "webvtt" | "vtt" | "mov_text"
+            )
         };
         source
             .media_streams
             .iter()
-            .filter(|s| s.kind == "Subtitle" && s.is_external)
+            .filter(|s| s.kind == "Subtitle")
+            .filter(|s| {
+                s.is_external
+                    || (transcoding
+                        && is_text(&s.codec.as_deref().unwrap_or("").to_ascii_lowercase()))
+            })
             .map(|s| {
                 let codec = s.codec.as_deref().unwrap_or("srt").to_ascii_lowercase();
                 // Jellyfin converts text formats on request; others are sent as-is.
                 let format = match codec.as_str() {
-                    "subrip" | "srt" => "srt",
+                    "subrip" | "srt" | "mov_text" => "srt",
                     "webvtt" | "vtt" => "vtt",
                     "ass" | "ssa" => codec.as_str(),
                     "pgssub" => "sup",
@@ -224,6 +244,60 @@ impl ItemInfo {
             .filter(|s| s.kind == kind)
             .filter_map(|s| s.display_title.clone())
             .collect()
+    }
+}
+
+/// How Jellyfin videos are streamed: the original file, or transcoded by
+/// the server to fit a bitrate (bits per second).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Quality {
+    Original,
+    Bitrate(u32),
+}
+
+/// Best first.
+pub const QUALITIES: [Quality; 7] = [
+    Quality::Original,
+    Quality::Bitrate(40_000_000),
+    Quality::Bitrate(20_000_000),
+    Quality::Bitrate(10_000_000),
+    Quality::Bitrate(6_000_000),
+    Quality::Bitrate(3_000_000),
+    Quality::Bitrate(1_500_000),
+];
+
+impl Quality {
+    pub fn label(self) -> String {
+        match self {
+            Quality::Original => "Original".into(),
+            Quality::Bitrate(bps) => {
+                let mbps = bps as f64 / 1_000_000.0;
+                if mbps.fract() == 0.0 {
+                    format!("{mbps:.0} Mbps")
+                } else {
+                    format!("{mbps:.1} Mbps")
+                }
+            }
+        }
+    }
+
+    /// Stored form, for the settings table.
+    pub fn to_setting(self) -> String {
+        match self {
+            Quality::Original => "original".into(),
+            Quality::Bitrate(bps) => bps.to_string(),
+        }
+    }
+
+    pub fn from_setting(value: &str) -> Quality {
+        value
+            .parse()
+            .map(Quality::Bitrate)
+            .unwrap_or(Quality::Original)
+    }
+
+    pub fn transcodes(self) -> bool {
+        self != Quality::Original
     }
 }
 
@@ -475,7 +549,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(
-            info.external_subtitles("http://nas:8096", "item1"),
+            info.subtitle_files("http://nas:8096", "item1", false),
             vec![
                 ExternalSubtitle {
                     url: "http://nas:8096/Videos/item1/src1/Subtitles/3/Stream.srt".into(),
@@ -558,6 +632,46 @@ mod tests {
                 .unwrap()
                 .cache_path_width(Path::new("t"), 1920),
             Path::new("t").join("jf-backdrop-1920-b9.jpg")
+        );
+    }
+
+    #[test]
+    fn qualities() {
+        assert_eq!(Quality::Original.label(), "Original");
+        assert_eq!(Quality::Bitrate(20_000_000).label(), "20 Mbps");
+        assert_eq!(Quality::Bitrate(1_500_000).label(), "1.5 Mbps");
+        for q in QUALITIES {
+            assert_eq!(Quality::from_setting(&q.to_setting()), q);
+        }
+        assert_eq!(Quality::from_setting("junk"), Quality::Original);
+    }
+
+    #[test]
+    fn transcoding_fetches_embedded_text_subtitles() {
+        let info: PlaybackInfo = serde_json::from_str(
+            r#"{"MediaSources": [{"Id": "src", "MediaStreams": [
+                {"Type": "Subtitle", "Index": 2, "Codec": "subrip", "Language": "eng"},
+                {"Type": "Subtitle", "Index": 3, "Codec": "PGSSUB", "Language": "eng"},
+                {"Type": "Subtitle", "Index": 4, "Codec": "ass", "Language": "ukr", "IsExternal": true}
+            ]}]}"#,
+        )
+        .unwrap();
+        let urls = |transcoding| {
+            info.subtitle_files("http://nas", "i", transcoding)
+                .into_iter()
+                .map(|s| s.url)
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            urls(false),
+            vec!["http://nas/Videos/i/src/Subtitles/4/Stream.ass"]
+        );
+        assert_eq!(
+            urls(true),
+            vec![
+                "http://nas/Videos/i/src/Subtitles/2/Stream.srt",
+                "http://nas/Videos/i/src/Subtitles/4/Stream.ass"
+            ]
         );
     }
 

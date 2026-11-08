@@ -27,7 +27,11 @@ encrypts it for your user account; `library.db` keeps only the server address an
 **Sign Out** revokes the token on the server and deletes it locally.
 
 - Movies and episodes appear in the same library as local folders, with the server's artwork.
-- Files are direct-played (no transcoding), so HDR and hardware decoding work as they do for local files.
+- Files are direct-played by default, so HDR and hardware decoding work as they do for local files.
+  For slow or remote connections, pick a **streaming quality** (40 down to 1.5 Mbps): per server
+  on the Jellyfin page ("Streaming: …"), or while watching under Options in the audio/subtitles
+  panel, which switches at once and keeps your place. The server then transcodes to HLS; text
+  subtitles are fetched as separate files (picture-based ones like PGS aren't available then).
 - Playback start, progress and stop are reported to the server, so resume positions and watched
   state stay in sync with other Jellyfin apps.
 

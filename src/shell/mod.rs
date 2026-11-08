@@ -13,7 +13,10 @@ use gpui::{
     prelude::*, px, rgb, rgba,
 };
 
-use crate::jellyfin::{self, Client, ImageRef, PlaybackReport, Server, discovery};
+use crate::jellyfin::{
+    self, Client, ImageRef, PlaySession, PlaybackInfo, PlaybackReport, QUALITIES, Quality, Server,
+    discovery,
+};
 use crate::library::{Db, Item, Source, TrackPrefs, WATCHED_FRACTION, scan, thumbs};
 use crate::player::{self, Episode, Playback, Player, PlayerEvent};
 use crate::secrets;
@@ -69,6 +72,28 @@ impl Paths {
     }
 }
 
+/// A fresh id for a Jellyfin play session.
+fn new_session_id() -> String {
+    use std::hash::{BuildHasher, RandomState};
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or_default();
+    format!(
+        "{:016x}{:016x}",
+        RandomState::new().hash_one(nanos),
+        RandomState::new().hash_one(std::process::id())
+    )
+}
+
+/// Where to stream an item from at `quality`.
+fn stream_url(client: &Client, item_id: &str, session: &PlaySession, quality: Quality) -> String {
+    match quality {
+        Quality::Original => client.stream_url(item_id),
+        Quality::Bitrate(bitrate) => client.transcode_url(item_id, session, bitrate),
+    }
+}
+
 fn now() -> i64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -105,6 +130,11 @@ struct ActivePlayer {
     duration: f64,
     /// The show being watched, whose track choices are remembered.
     show: Option<String>,
+    /// Jellyfin playback: the session reports and transcoding belong to.
+    session: Option<PlaySession>,
+    /// The item's streams, to rebuild the subtitle list when the quality
+    /// changes (a transcoded stream needs more of them as files).
+    playback_info: Option<PlaybackInfo>,
     _subscription: Subscription,
 }
 
@@ -209,6 +239,7 @@ impl Shell {
                 episodes: Vec::new(),
                 current: None,
                 prefs: shell.track_prefs(None),
+                quality: None,
             };
             shell.start_player(source, None, playback, 0.0, None, window, cx);
         }
@@ -536,9 +567,10 @@ impl Shell {
         source: &Source,
         kind: PlaybackReport,
         position: f64,
+        session: Option<PlaySession>,
         cx: &mut Context<Self>,
     ) {
-        let Source::Jellyfin { server, id } = source else {
+        let (Source::Jellyfin { server, id }, Some(session)) = (source, session) else {
             return;
         };
         let Some(client) = self.client(*server) else {
@@ -548,7 +580,16 @@ impl Shell {
         cx.spawn(async move |this, cx| {
             let result = cx
                 .background_executor()
-                .spawn(async move { client.report(kind, &id, position, false) })
+                .spawn(async move {
+                    let reported = client.report(kind, &id, position, false, &session);
+                    if kind == PlaybackReport::Stopped && session.transcoding {
+                        // Don't leave the server transcoding for nobody.
+                        if let Err(e) = client.stop_transcoding(&session) {
+                            eprintln!("[jellyfin] stopping transcoding: {e:#}");
+                        }
+                    }
+                    reported
+                })
                 .await;
             if let Err(e) = result {
                 eprintln!("[jellyfin] report {kind:?}: {e:#}");
@@ -728,6 +769,7 @@ impl Shell {
             episodes,
             current,
             prefs: self.track_prefs(item.show.as_deref()),
+            quality: None,
         };
         let start = if restart { 0.0 } else { item.resume_position() };
         eprintln!("[play] {} ({key}) from {start:.1}s", item.display_title());
@@ -755,8 +797,17 @@ impl Shell {
                     cx.notify();
                     return;
                 };
-                let url = client.stream_url(id);
+                let quality = self.quality_for(*server);
+                let session = PlaySession {
+                    id: new_session_id(),
+                    transcoding: quality.transcodes(),
+                };
+                let url = stream_url(&client, id, &session, quality);
                 let header = client.stream_header();
+                let playback = Playback {
+                    quality: Some(quality),
+                    ..playback
+                };
                 self.start_player(
                     url,
                     header,
@@ -766,8 +817,15 @@ impl Shell {
                     window,
                     cx,
                 );
-                if self.player.is_some() {
-                    self.report(&item.source, PlaybackReport::Started, start, cx);
+                if let Some(active) = &mut self.player {
+                    active.session = Some(session.clone());
+                    self.report(
+                        &item.source,
+                        PlaybackReport::Started,
+                        start,
+                        Some(session),
+                        cx,
+                    );
                     self.load_server_extras(client, *server, id.clone(), cx);
                 }
             }
@@ -824,6 +882,75 @@ impl Shell {
         scopes
     }
 
+    /// The streaming quality chosen for a server (Original by default).
+    fn quality_for(&self, server: i64) -> Quality {
+        self.db
+            .setting(&format!("quality:{server}"))
+            .ok()
+            .flatten()
+            .map(|v| Quality::from_setting(&v))
+            .unwrap_or(Quality::Original)
+    }
+
+    fn set_quality(&mut self, server: i64, quality: Quality) {
+        if let Err(e) = self
+            .db
+            .set_setting(&format!("quality:{server}"), &quality.to_setting())
+        {
+            eprintln!("[library] saving quality: {e}");
+        }
+    }
+
+    /// Switches the playing Jellyfin video to another quality, keeping the
+    /// position: a new play session replaces the old one on the server.
+    fn change_quality(&mut self, quality: Quality, cx: &mut Context<Self>) {
+        let Some(active) = &self.player else {
+            return;
+        };
+        let Some(Source::Jellyfin { server, id }) = active.source.clone() else {
+            return;
+        };
+        self.set_quality(server, quality);
+        let Some(client) = self.client(server) else {
+            return;
+        };
+        let Some(active) = &mut self.player else {
+            return;
+        };
+        let old = active.session.clone();
+        let session = PlaySession {
+            id: new_session_id(),
+            transcoding: quality.transcodes(),
+        };
+        let url = stream_url(&client, &id, &session, quality);
+        let position = active.view.read(cx).position();
+        let subtitles = active
+            .playback_info
+            .as_ref()
+            .map(|i| i.subtitle_files(client.base(), &id, session.transcoding))
+            .unwrap_or_default();
+        active.view.update(cx, |player, cx| {
+            player.reload(&url, position, subtitles, quality, cx)
+        });
+        active.session = Some(session.clone());
+        eprintln!("[jellyfin] quality {} ({})", quality.label(), session.id);
+        cx.background_executor()
+            .spawn(async move {
+                if let Some(old) = old {
+                    let _ = client.report(PlaybackReport::Stopped, &id, position, false, &old);
+                    if old.transcoding {
+                        let _ = client.stop_transcoding(&old);
+                    }
+                }
+                if let Err(e) =
+                    client.report(PlaybackReport::Started, &id, position, false, &session)
+                {
+                    eprintln!("[jellyfin] report Started: {e:#}");
+                }
+            })
+            .detach();
+    }
+
     fn saved_volume(&self) -> f64 {
         self.db
             .setting(VOLUME_SETTING)
@@ -855,34 +982,39 @@ impl Shell {
             server,
             id: item_id.clone(),
         };
+        let base = client.base().to_string();
         cx.spawn(async move |this, cx| {
-            let (subtitles, segments) = cx
+            let fetch_id = item_id.clone();
+            let (info, segments) = cx
                 .background_executor()
                 .spawn(async move {
                     (
-                        client.external_subtitles(&user_id, &item_id),
-                        client.media_segments(&item_id),
+                        client.playback_info(&user_id, &fetch_id),
+                        client.media_segments(&fetch_id),
                     )
                 })
                 .await;
-            let subtitles = subtitles.unwrap_or_else(|e| {
-                eprintln!("[jellyfin] listing subtitles: {e:#}");
-                Vec::new()
-            });
+            let info = info
+                .map_err(|e| eprintln!("[jellyfin] listing subtitles: {e:#}"))
+                .ok();
             // Older servers have no segments API; that's fine.
             let segments = segments.unwrap_or_default();
-            if !subtitles.is_empty() || !segments.is_empty() {
-                eprintln!(
-                    "[jellyfin] {} external subtitle file(s), {} segment(s)",
-                    subtitles.len(),
-                    segments.len()
-                );
-            }
             this.update(cx, |this, cx| {
                 // Only for the video they were fetched for.
-                if let Some(active) = &this.player
+                if let Some(active) = &mut this.player
                     && active.source.as_ref() == Some(&source)
                 {
+                    let transcoding = active.session.as_ref().is_some_and(|s| s.transcoding);
+                    let subtitles = info
+                        .as_ref()
+                        .map(|i| i.subtitle_files(&base, &item_id, transcoding))
+                        .unwrap_or_default();
+                    eprintln!(
+                        "[jellyfin] {} subtitle file(s), {} segment(s)",
+                        subtitles.len(),
+                        segments.len()
+                    );
+                    active.playback_info = info;
                     active.view.update(cx, |player, _| {
                         player.add_external_subtitles(subtitles);
                         player.add_segments(segments);
@@ -925,6 +1057,8 @@ impl Shell {
             position: start,
             duration: 0.0,
             show: None,
+            session: None,
+            playback_info: None,
             _subscription: subscription,
         });
         cx.notify();
@@ -950,7 +1084,8 @@ impl Shell {
                         }
                     }
                     Some(source @ Source::Jellyfin { .. }) => {
-                        self.report(&source, PlaybackReport::Progress, *position, cx)
+                        let session = active.session.clone();
+                        self.report(&source, PlaybackReport::Progress, *position, session, cx)
                     }
                     None => {}
                 }
@@ -963,6 +1098,7 @@ impl Shell {
                 self.focus.focus(window);
                 cx.notify();
             }
+            PlayerEvent::QualityChosen(quality) => self.change_quality(*quality, cx),
             PlayerEvent::AudioChosen(lang) => {
                 for scope in self.pref_scopes() {
                     if let Err(e) = self.db.save_audio_pref(&scope, lang) {
@@ -1015,7 +1151,13 @@ impl Shell {
                 item.watched |= finished;
                 item.last_played = Some(now());
             }
-            self.report(source, PlaybackReport::Stopped, active.position, cx);
+            self.report(
+                source,
+                PlaybackReport::Stopped,
+                active.position,
+                active.session.clone(),
+                cx,
+            );
         }
         self.reload();
     }
@@ -1469,6 +1611,25 @@ impl Shell {
                                         .child(format!("{} · {}", server.user_name, server.url)),
                                 ),
                         )
+                        .child({
+                            // Click to step through the qualities.
+                            let quality = self.quality_for(id);
+                            let next = QUALITIES[(QUALITIES
+                                .iter()
+                                .position(|q| *q == quality)
+                                .unwrap_or(0)
+                                + 1)
+                                % QUALITIES.len()];
+                            self.button(
+                                SharedString::from(format!("quality-{id}")),
+                                format!("Streaming: {}", quality.label()),
+                                cx,
+                                move |this, _, cx| {
+                                    this.set_quality(id, next);
+                                    cx.notify();
+                                },
+                            )
+                        })
                         .child(self.button(
                             SharedString::from(format!("sign-out-{id}")),
                             "Sign Out",

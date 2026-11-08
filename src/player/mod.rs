@@ -16,6 +16,7 @@ use gpui::{
 use raw_window_handle::{HasWindowHandle, RawWindowHandle};
 use windows::Win32::Foundation::HWND;
 
+use crate::jellyfin::{QUALITIES, Quality};
 use crate::library::{SubtitlePref, TrackPrefs};
 use crate::video::{ExternalSubtitle, Segment, SegmentKind, Track, TrackKind, VideoSurface};
 
@@ -43,6 +44,8 @@ pub enum PlayerEvent {
     AudioChosen(String),
     /// The viewer picked subtitles (or turned them off), to remember.
     SubtitleChosen(SubtitlePref),
+    /// The viewer picked a streaming quality (Jellyfin only).
+    QualityChosen(Quality),
 }
 
 /// An episode of the show being played, for the episode list and "next".
@@ -68,6 +71,8 @@ pub struct Playback {
     pub current: Option<usize>,
     /// Remembered track choices to apply once the tracks are known.
     pub prefs: TrackPrefs,
+    /// Streaming quality, for Jellyfin videos (None hides the setting).
+    pub quality: Option<Quality>,
 }
 
 /// The panel open above the control bar, if any.
@@ -113,6 +118,10 @@ pub struct Player {
     /// When the video has ended and the next episode will start.
     up_next: Option<Instant>,
     prefs: TrackPrefs,
+    quality: Option<Quality>,
+    /// After `reload`, the new source; until mpv reports it, track and
+    /// load state still describe the old one.
+    expected_path: Option<String>,
     /// Set once the remembered choice is applied, or the viewer picks one;
     /// after that, tracks are left alone.
     audio_settled: bool,
@@ -202,6 +211,7 @@ impl Player {
             episodes,
             current,
             prefs,
+            quality,
         } = playback;
         let episode_season = current
             .and_then(|i| episodes.get(i))
@@ -231,6 +241,8 @@ impl Player {
             episode_season,
             up_next: None,
             prefs,
+            quality,
+            expected_path: None,
             audio_settled: false,
             subtitle_settled: false,
             segments: Vec::new(),
@@ -290,6 +302,50 @@ impl Player {
         self.status.volume
     }
 
+    pub fn position(&self) -> f64 {
+        self.status.position
+    }
+
+    /// Switches to another stream of the same video (a different quality),
+    /// at `start`, with the subtitle files that stream needs. Remembered
+    /// track choices are applied again once it loads.
+    pub fn reload(
+        &mut self,
+        url: &str,
+        start: f64,
+        subtitles: Vec<ExternalSubtitle>,
+        quality: Quality,
+        cx: &mut Context<Self>,
+    ) {
+        if let Err(e) = self.video.load(url, start) {
+            self.toast(format!("Couldn't switch quality: {e:#}"));
+            return cx.notify();
+        }
+        self.expected_path = Some(url.to_string());
+        self.tracks.clear();
+        self.pending_subtitles = subtitles;
+        self.audio_settled = false;
+        self.subtitle_settled = false;
+        self.up_next = None;
+        self.quality = Some(quality);
+        self.status.buffering = true;
+        self.toast(format!("Quality: {}", quality.label()));
+        cx.notify();
+    }
+
+    /// Steps the quality up (+1) or down (-1) through the presets.
+    fn step_quality(&mut self, direction: i32, cx: &mut Context<Self>) {
+        let Some(current) = self.quality else {
+            return;
+        };
+        let index = QUALITIES.iter().position(|q| *q == current).unwrap_or(0) as i32;
+        // QUALITIES is best first, so "up" moves toward the start.
+        let next = (index - direction).clamp(0, QUALITIES.len() as i32 - 1) as usize;
+        if QUALITIES[next] != current {
+            cx.emit(PlayerEvent::QualityChosen(QUALITIES[next]));
+        }
+    }
+
     fn tick(&mut self, cx: &mut Context<Self>) {
         if self.exited {
             return;
@@ -313,7 +369,13 @@ impl Player {
             eprintln!("[video] {pipeline}");
             self.pipeline = pipeline;
         }
-        if self.video.loaded() {
+        // After a reload, wait for mpv to switch to the new source.
+        let switched = match &self.expected_path {
+            Some(expected) => self.video.path().as_deref() == Some(expected.as_str()),
+            None => true,
+        };
+        if switched && self.video.loaded() {
+            self.expected_path = None;
             let mut added = false;
             if !self.pending_subtitles.is_empty() {
                 for subtitle in std::mem::take(&mut self.pending_subtitles) {
@@ -577,6 +639,7 @@ impl Player {
             .find(|t| t.id == id)
             .and_then(|t| t.lang.clone())
         {
+            self.prefs.audio = Some(lang.clone());
             cx.emit(PlayerEvent::AudioChosen(lang));
         }
     }
@@ -596,6 +659,7 @@ impl Player {
                 .map(SubtitlePref::Language),
         };
         if let Some(pref) = pref {
+            self.prefs.subtitle = Some(pref.clone());
             cx.emit(PlayerEvent::SubtitleChosen(pref));
         }
     }

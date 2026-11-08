@@ -497,7 +497,7 @@ impl Player {
         label: &'static str,
         value: String,
         cx: &mut Context<Self>,
-        step: impl Fn(&mut Self, i32) + Clone + 'static,
+        step: impl Fn(&mut Self, i32, &mut Context<Self>) + Clone + 'static,
     ) -> AnyElement {
         let down = step.clone();
         let small = |button: gpui::Stateful<gpui::Div>| button.size(px(30.0));
@@ -519,7 +519,7 @@ impl Player {
                         16.0,
                         false,
                         cx,
-                        move |this, _, _| down(this, -1),
+                        move |this, _, cx| down(this, -1, cx),
                     )))
                     .child(
                         div()
@@ -535,7 +535,7 @@ impl Player {
                         16.0,
                         false,
                         cx,
-                        move |this, _, _| step(this, 1),
+                        move |this, _, cx| step(this, 1, cx),
                     ))),
             )
             .into_any_element()
@@ -595,23 +595,33 @@ impl Player {
                 "Speed",
                 format_speed(status.speed),
                 cx,
-                |this, d| this.step_speed(d),
+                |this, d, _| this.step_speed(d),
             ),
             self.stepper(
                 "sub-size",
                 "Subtitle size",
                 format!("{:.0}%", status.subtitle_scale * 100.0),
                 cx,
-                |this, d| this.step_subtitle_scale(d as f64 * 0.1),
+                |this, d, _| this.step_subtitle_scale(d as f64 * 0.1),
             ),
             self.stepper(
                 "sub-delay",
                 "Subtitle delay",
                 format_delay(status.subtitle_delay),
                 cx,
-                |this, d| this.step_subtitle_delay(d as f64 * 0.1),
+                |this, d, _| this.step_subtitle_delay(d as f64 * 0.1),
             ),
         ];
+        let mut options = options;
+        if let Some(quality) = self.quality {
+            options.push(self.stepper(
+                "quality",
+                "Streaming quality",
+                quality.label(),
+                cx,
+                |this, d, cx| this.step_quality(d, cx),
+            ));
+        }
 
         Self::panel_frame("tracks-panel")
             .flex()

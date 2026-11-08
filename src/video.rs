@@ -153,10 +153,22 @@ impl VideoSurface {
             Ok(())
         })
         .map_err(|e| anyhow!("initialising mpv: {e}"))?;
+        let surface = Self { mpv, host, parent };
+        surface.load(source, start)?;
+        Ok(surface)
+    }
+
+    /// Replaces what's playing with `source`, starting at `start` seconds.
+    pub fn load(&self, source: &str, start: f64) -> Result<()> {
         let start = format!("start={start:.3}");
-        mpv.command("loadfile", &[source, "replace", "-1", &start])
-            .map_err(|e| anyhow!("loading {source}: {e}"))?;
-        Ok(Self { mpv, host, parent })
+        self.mpv
+            .command("loadfile", &[source, "replace", "-1", &start])
+            .map_err(|e| anyhow!("loading {source}: {e}"))
+    }
+
+    /// The source being played, as passed to `load`.
+    pub fn path(&self) -> Option<String> {
+        self.mpv.get_property("path").ok()
     }
 
     /// Fits the video to the parent's client area.

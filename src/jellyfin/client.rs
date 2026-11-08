@@ -11,7 +11,7 @@ use super::{
     AuthResult, BaseItem, ImageRef, InfoPage, ItemInfo, ItemsPage, MediaSegments, PlaybackInfo,
     PublicInfo, Server, seconds_to_ticks,
 };
-use crate::video::{ExternalSubtitle, Segment};
+use crate::video::Segment;
 
 const CLIENT_NAME: &str = "VideoPlayer";
 const PAGE_SIZE: usize = 500;
@@ -47,6 +47,14 @@ struct PlaybackReportBody<'a> {
     is_paused: bool,
     can_seek: bool,
     play_method: &'static str,
+    play_session_id: &'a str,
+}
+
+/// One playback of an item: the server ties reports and transcoding to it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PlaySession {
+    pub id: String,
+    pub transcoding: bool,
 }
 
 impl Client {
@@ -245,16 +253,50 @@ impl Client {
     }
 
     /// External subtitle files for an item, ready to hand to mpv.
-    pub fn external_subtitles(
-        &self,
-        user_id: &str,
-        item_id: &str,
-    ) -> Result<Vec<ExternalSubtitle>> {
-        let info: PlaybackInfo = self.get_json(
+    /// The item's media streams, for subtitle files.
+    pub fn playback_info(&self, user_id: &str, item_id: &str) -> Result<PlaybackInfo> {
+        self.get_json(
             &format!("/Items/{item_id}/PlaybackInfo"),
             &[("userId", user_id.to_string())],
-        )?;
-        Ok(info.external_subtitles(&self.base, item_id))
+        )
+    }
+
+    /// An HLS stream transcoded by the server to fit `bitrate` (bits/s).
+    /// The server picks codecs it can produce from the lists, and copies
+    /// the audio when it already fits.
+    pub fn transcode_url(&self, item_id: &str, session: &PlaySession, bitrate: u32) -> String {
+        let audio_bitrate = 192_000.min(bitrate / 4);
+        let query = [
+            ("MediaSourceId", item_id.to_string()),
+            ("DeviceId", self.device_id.clone()),
+            ("PlaySessionId", session.id.clone()),
+            ("VideoCodec", "hevc,h264".into()),
+            ("AudioCodec", "aac,ac3,eac3,opus,flac,mp3".into()),
+            ("MaxStreamingBitrate", bitrate.to_string()),
+            ("VideoBitrate", (bitrate - audio_bitrate).to_string()),
+            ("AudioBitrate", audio_bitrate.to_string()),
+            ("TranscodingMaxAudioChannels", "6".into()),
+            ("SegmentContainer", "ts".into()),
+            ("MinSegments", "1".into()),
+            ("BreakOnNonKeyFrames", "true".into()),
+        ];
+        let query: Vec<String> = query.iter().map(|(k, v)| format!("{k}={v}")).collect();
+        self.url(&format!(
+            "/Videos/{item_id}/master.m3u8?{}",
+            query.join("&")
+        ))
+    }
+
+    /// Ends the server's transcoding for a play session.
+    pub fn stop_transcoding(&self, session: &PlaySession) -> Result<()> {
+        let response = self
+            .agent
+            .delete(&self.url("/Videos/ActiveEncodings"))
+            .query("deviceId", &self.device_id)
+            .query("playSessionId", &session.id)
+            .header("Authorization", &self.authorization())
+            .call()?;
+        Self::check(&response, "Stopping transcoding")
     }
 
     /// Intro and credits markers, if the server has any for the item.
@@ -269,8 +311,13 @@ impl Client {
     }
 
     /// Header that authorises mpv's stream requests, kept out of the URL.
+    /// Current servers only accept the `Authorization` form for transcoded
+    /// (HLS) streams; `X-Emby-Token` works just for direct ones. It carries
+    /// only the token: mpv's header list is comma-separated.
     pub fn stream_header(&self) -> Option<String> {
-        self.token.as_ref().map(|t| format!("X-Emby-Token: {t}"))
+        self.token
+            .as_ref()
+            .map(|t| format!(r#"Authorization: MediaBrowser Token="{t}""#))
     }
 
     pub fn report(
@@ -279,6 +326,7 @@ impl Client {
         item_id: &str,
         position: f64,
         paused: bool,
+        session: &PlaySession,
     ) -> Result<()> {
         let path = match kind {
             PlaybackReport::Started => "/Sessions/Playing",
@@ -294,7 +342,12 @@ impl Client {
                 position_ticks: seconds_to_ticks(position),
                 is_paused: paused,
                 can_seek: true,
-                play_method: "DirectPlay",
+                play_method: if session.transcoding {
+                    "Transcode"
+                } else {
+                    "DirectPlay"
+                },
+                play_session_id: &session.id,
             })?;
         Self::check(&response, path)
     }
