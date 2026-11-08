@@ -733,7 +733,7 @@ impl Shell {
                 );
                 if self.player.is_some() {
                     self.report(&item.source, PlaybackReport::Started, start, cx);
-                    self.load_external_subtitles(client, *server, id.clone(), cx);
+                    self.load_server_extras(client, *server, id.clone(), cx);
                 }
             }
         }
@@ -801,9 +801,10 @@ impl Shell {
             .unwrap_or(100.0)
     }
 
-    /// Asks the server for subtitle files stored beside the video and hands
-    /// them to the player, which adds them once the video has loaded.
-    fn load_external_subtitles(
+    /// Asks the server for what it knows beyond the file itself: subtitle
+    /// files stored beside the video, and intro/credits markers. The player
+    /// takes them once the video has loaded.
+    fn load_server_extras(
         &mut self,
         client: Client,
         server: i64,
@@ -818,26 +819,45 @@ impl Shell {
         else {
             return;
         };
+        let source = Source::Jellyfin {
+            server,
+            id: item_id.clone(),
+        };
         cx.spawn(async move |this, cx| {
-            let found = cx
+            let (subtitles, segments) = cx
                 .background_executor()
-                .spawn(async move { client.external_subtitles(&user_id, &item_id) })
+                .spawn(async move {
+                    (
+                        client.external_subtitles(&user_id, &item_id),
+                        client.media_segments(&item_id),
+                    )
+                })
                 .await;
-            match found {
-                Ok(subtitles) if !subtitles.is_empty() => {
-                    eprintln!("[jellyfin] {} external subtitle file(s)", subtitles.len());
-                    this.update(cx, |this, cx| {
-                        if let Some(active) = &this.player {
-                            active
-                                .view
-                                .update(cx, |player, _| player.add_external_subtitles(subtitles));
-                        }
-                    })
-                    .ok();
-                }
-                Ok(_) => {}
-                Err(e) => eprintln!("[jellyfin] listing subtitles: {e:#}"),
+            let subtitles = subtitles.unwrap_or_else(|e| {
+                eprintln!("[jellyfin] listing subtitles: {e:#}");
+                Vec::new()
+            });
+            // Older servers have no segments API; that's fine.
+            let segments = segments.unwrap_or_default();
+            if !subtitles.is_empty() || !segments.is_empty() {
+                eprintln!(
+                    "[jellyfin] {} external subtitle file(s), {} segment(s)",
+                    subtitles.len(),
+                    segments.len()
+                );
             }
+            this.update(cx, |this, cx| {
+                // Only for the video they were fetched for.
+                if let Some(active) = &this.player
+                    && active.source.as_ref() == Some(&source)
+                {
+                    active.view.update(cx, |player, _| {
+                        player.add_external_subtitles(subtitles);
+                        player.add_segments(segments);
+                    });
+                }
+            })
+            .ok();
         })
         .detach();
     }

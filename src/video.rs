@@ -87,6 +87,22 @@ pub struct Track {
     pub forced: bool,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SegmentKind {
+    Intro,
+    Recap,
+    Preview,
+    Credits,
+}
+
+/// A marked part of a video (from the server, or from chapter names).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Segment {
+    pub kind: SegmentKind,
+    pub start: f64,
+    pub end: f64,
+}
+
 /// A subtitle file to load next to the video (Jellyfin's external subtitles).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ExternalSubtitle {
@@ -253,6 +269,24 @@ impl VideoSurface {
                     external: flag("external"),
                     forced: flag("forced"),
                 })
+            })
+            .collect()
+    }
+
+    /// Chapter titles and start times, in order.
+    pub fn chapters(&self) -> Vec<(String, f64)> {
+        let count: i64 = self.mpv.get_property("chapter-list/count").unwrap_or(0);
+        (0..count)
+            .filter_map(|i| {
+                let time: f64 = self
+                    .mpv
+                    .get_property(&format!("chapter-list/{i}/time"))
+                    .ok()?;
+                let title = self
+                    .mpv
+                    .get_property::<String>(&format!("chapter-list/{i}/title"))
+                    .unwrap_or_default();
+                Some((title, time))
             })
             .collect()
     }

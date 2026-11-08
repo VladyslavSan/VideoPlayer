@@ -882,13 +882,26 @@ impl Player {
                             cx,
                             |this, cx| this.play_next(cx),
                         ))
-                        .child(Self::text_button(
-                            "up-next-back",
-                            "Back to library",
-                            false,
-                            cx,
-                            |this, cx| this.exit(cx),
-                        )),
+                        .child(if self.status.ended {
+                            Self::text_button(
+                                "up-next-back",
+                                "Back to library",
+                                false,
+                                cx,
+                                |this, cx| this.exit(cx),
+                            )
+                        } else {
+                            Self::text_button(
+                                "watch-credits",
+                                "Watch credits",
+                                false,
+                                cx,
+                                |this, cx| {
+                                    this.watch_credits();
+                                    this.poke(cx);
+                                },
+                            )
+                        }),
                 )
                 .into_any_element(),
         )
@@ -912,6 +925,7 @@ impl Player {
             rows.push(("N", "Next episode"));
             rows.push(("E", "Episodes"));
         }
+        rows.push(("Enter", "Skip intro, or play the next episode now"));
         rows.push(("F1 / ?", "This list"));
         rows.push(("Esc", "Close, leave fullscreen, or go back"));
 
@@ -1043,6 +1057,18 @@ impl Render for Player {
         }
         if let Some(card) = self.up_next_card(cx) {
             overlay.push(card);
+        } else if let Some((label, _)) = self.skip_target() {
+            overlay.push(
+                div()
+                    .absolute()
+                    .right(px(24.0))
+                    .bottom(px(BAR_CLEARANCE))
+                    .child(Self::text_button("skip", label, true, cx, |this, cx| {
+                        this.skip_segment();
+                        this.poke(cx);
+                    }))
+                    .into_any_element(),
+            );
         }
         if self.panel == Some(Panel::Shortcuts) {
             overlay.push(self.shortcuts_overlay(cx));

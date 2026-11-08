@@ -13,7 +13,7 @@ use serde::{Deserialize, Serialize};
 pub use client::{Client, PlaybackReport};
 
 use crate::library::{Item, Source};
-use crate::video::ExternalSubtitle;
+use crate::video::{ExternalSubtitle, Segment, SegmentKind};
 
 const TICKS_PER_SECOND: f64 = 10_000_000.0;
 
@@ -166,6 +166,46 @@ impl PlaybackInfo {
                     title: s.title.clone(),
                     lang: s.language.clone().filter(|l| l != "und"),
                 }
+            })
+            .collect()
+    }
+}
+
+/// Intro/credits markers (Jellyfin 10.10+, filled in by plugins such as
+/// Intro Skipper).
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "PascalCase")]
+pub struct MediaSegments {
+    #[serde(default)]
+    pub items: Vec<MediaSegment>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "PascalCase")]
+pub struct MediaSegment {
+    #[serde(rename = "Type")]
+    pub kind: String,
+    pub start_ticks: i64,
+    pub end_ticks: i64,
+}
+
+impl MediaSegments {
+    pub fn to_segments(&self) -> Vec<Segment> {
+        self.items
+            .iter()
+            .filter_map(|s| {
+                let kind = match s.kind.as_str() {
+                    "Intro" => SegmentKind::Intro,
+                    "Recap" => SegmentKind::Recap,
+                    "Preview" => SegmentKind::Preview,
+                    "Outro" => SegmentKind::Credits,
+                    _ => return None,
+                };
+                let (start, end) = (
+                    ticks_to_seconds(s.start_ticks),
+                    ticks_to_seconds(s.end_ticks),
+                );
+                (end > start).then_some(Segment { kind, start, end })
             })
             .collect()
     }
@@ -400,6 +440,33 @@ mod tests {
         assert_eq!(as_items(&loaded), as_items(&items));
         assert_eq!(loaded[0].card_image(), items[0].card_image());
         Ok(())
+    }
+
+    #[test]
+    fn media_segments() {
+        let parsed: MediaSegments = serde_json::from_str(
+            r#"{"Items": [
+                {"Id": "a", "ItemId": "i", "Type": "Intro", "StartTicks": 600000000, "EndTicks": 1500000000},
+                {"Id": "b", "ItemId": "i", "Type": "Commercial", "StartTicks": 0, "EndTicks": 10},
+                {"Id": "c", "ItemId": "i", "Type": "Outro", "StartTicks": 25000000000, "EndTicks": 26000000000}
+            ], "TotalRecordCount": 3, "StartIndex": 0}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            parsed.to_segments(),
+            vec![
+                Segment {
+                    kind: SegmentKind::Intro,
+                    start: 60.0,
+                    end: 150.0
+                },
+                Segment {
+                    kind: SegmentKind::Credits,
+                    start: 2500.0,
+                    end: 2600.0
+                },
+            ]
+        );
     }
 
     #[test]

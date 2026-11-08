@@ -1,5 +1,6 @@
 //! Playback screen: the mpv video layer plus GPUI controls drawn above it.
 
+mod segments;
 mod tracks;
 mod view;
 
@@ -16,7 +17,7 @@ use raw_window_handle::{HasWindowHandle, RawWindowHandle};
 use windows::Win32::Foundation::HWND;
 
 use crate::library::{SubtitlePref, TrackPrefs};
-use crate::video::{ExternalSubtitle, Track, TrackKind, VideoSurface};
+use crate::video::{ExternalSubtitle, Segment, SegmentKind, Track, TrackKind, VideoSurface};
 
 const TICK: Duration = Duration::from_millis(100);
 const CONTROLS_TIMEOUT: Duration = Duration::from_millis(2500);
@@ -92,6 +93,7 @@ struct Status {
     buffered: Option<f64>,
     paused: bool,
     buffering: bool,
+    ended: bool,
     volume: f64,
     muted: bool,
     speed: f64,
@@ -115,6 +117,12 @@ pub struct Player {
     /// after that, tracks are left alone.
     audio_settled: bool,
     subtitle_settled: bool,
+    /// Intros, recaps and credits: from the server, else from chapter names.
+    segments: Vec<Segment>,
+    server_segments: bool,
+    chapters_read: bool,
+    /// "Watch credits" was chosen: no countdown until the video ends.
+    credits_dismissed: bool,
     status: Status,
     tracks: Vec<Track>,
     tracks_read: Instant,
@@ -225,12 +233,17 @@ impl Player {
             prefs,
             audio_settled: false,
             subtitle_settled: false,
+            segments: Vec::new(),
+            server_segments: false,
+            chapters_read: false,
+            credits_dismissed: false,
             status: Status {
                 position: 0.0,
                 duration: 0.0,
                 buffered: None,
                 paused: false,
                 buffering: true,
+                ended: false,
                 volume,
                 muted: false,
                 speed: 1.0,
@@ -260,6 +273,15 @@ impl Player {
 
     /// Subtitle files that live next to the video (for example on a
     /// Jellyfin server). They're added as soon as the video has loaded.
+    /// Intro and credits markers from the server; they replace any found
+    /// from chapter names.
+    pub fn add_segments(&mut self, segments: Vec<Segment>) {
+        if !segments.is_empty() {
+            self.segments = segments;
+            self.server_segments = true;
+        }
+    }
+
     pub fn add_external_subtitles(&mut self, subtitles: Vec<ExternalSubtitle>) {
         self.pending_subtitles.extend(subtitles);
     }
@@ -279,6 +301,7 @@ impl Player {
             buffered: v.buffered_until(),
             paused: v.paused(),
             buffering: v.buffering() || !v.loaded(),
+            ended: v.ended(),
             volume: v.volume(),
             muted: v.muted(),
             speed: v.speed(),
@@ -307,6 +330,16 @@ impl Player {
             {
                 self.read_tracks();
             }
+            if !self.chapters_read && self.status.duration > 0.0 {
+                self.chapters_read = true;
+                if !self.server_segments {
+                    let chapters = self.video.chapters();
+                    self.segments = segments::from_chapters(&chapters, self.status.duration);
+                }
+                if !self.segments.is_empty() {
+                    eprintln!("[player] segments: {:?}", self.segments);
+                }
+            }
             // Once when the file opens, and again when subtitle files arrive.
             if added || !self.audio_settled {
                 self.apply_prefs();
@@ -330,12 +363,66 @@ impl Player {
             cx.notify();
             return;
         }
-        // Seeking back from the end cancels the countdown.
-        self.up_next = None;
+        if self.status.paused
+            && let Some(at) = &mut self.up_next
+        {
+            // The countdown waits while paused.
+            *at += TICK;
+        }
+        let in_credits = self
+            .segment_at(self.status.position)
+            .is_some_and(|s| s.kind == SegmentKind::Credits);
+        let next = self.next_episode().map(|e| e.key.clone());
+        match (in_credits, next, self.up_next) {
+            (true, Some(key), None) if !self.credits_dismissed => {
+                eprintln!("[player] credits; up next: {key} in {UP_NEXT_SECONDS} s");
+                self.up_next = Some(Instant::now() + Duration::from_secs(UP_NEXT_SECONDS));
+            }
+            (true, Some(_), Some(at)) if Instant::now() >= at => return self.play_next(cx),
+            (true, _, _) => {}
+            (false, _, _) => {
+                // Seeking back out of the credits (or the end) cancels it.
+                self.up_next = None;
+                self.credits_dismissed = false;
+            }
+        }
         if self.last_report.elapsed() >= PROGRESS_INTERVAL {
             self.report(cx);
         }
         cx.notify();
+    }
+
+    fn segment_at(&self, position: f64) -> Option<Segment> {
+        self.segments
+            .iter()
+            .find(|s| s.start <= position && position < s.end)
+            .copied()
+    }
+
+    /// The skip button's label and where it jumps to, while one applies.
+    fn skip_target(&self) -> Option<(&'static str, f64)> {
+        let segment = self.segment_at(self.status.position)?;
+        let label = match segment.kind {
+            SegmentKind::Intro => "Skip Intro",
+            SegmentKind::Recap => "Skip Recap",
+            SegmentKind::Preview => "Skip Preview",
+            SegmentKind::Credits => return None,
+        };
+        // Not in the last second, where skipping would barely move.
+        (self.status.position < segment.end - 1.0).then_some((label, segment.end))
+    }
+
+    fn skip_segment(&mut self) {
+        if let Some((_, end)) = self.skip_target() {
+            self.video.seek_to(end);
+            self.status.position = end;
+        }
+    }
+
+    /// Dismisses the credits countdown and keeps watching.
+    fn watch_credits(&mut self) {
+        self.credits_dismissed = true;
+        self.up_next = None;
     }
 
     fn next_episode(&self) -> Option<&Episode> {
@@ -594,6 +681,10 @@ impl Player {
     }
 
     fn play_next(&mut self, cx: &mut Context<Self>) {
+        if self.up_next.is_some() {
+            // Leaving during the credits: this episode counts as watched.
+            self.status.position = self.status.duration;
+        }
         match self.next_episode().map(|e| e.key.clone()) {
             Some(key) => self.play_episode(key, cx),
             None => self.toast("This is the last episode"),
@@ -627,6 +718,7 @@ impl Player {
             "n" if !self.episodes.is_empty() => return self.play_next(cx),
             "e" if !self.episodes.is_empty() => self.toggle_panel(Panel::Episodes),
             "enter" if self.up_next.is_some() => return self.play_next(cx),
+            "enter" if self.skip_target().is_some() => self.skip_segment(),
             "space" | "k" => self.toggle_pause(),
             "left" | "j" => self.skip(-SKIP_SECONDS),
             "right" | "l" => self.skip(SKIP_SECONDS),

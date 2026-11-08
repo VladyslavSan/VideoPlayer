@@ -8,9 +8,10 @@ use serde::de::DeserializeOwned;
 use ureq::{Agent, ResponseExt};
 
 use super::{
-    AuthResult, BaseItem, ImageRef, ItemsPage, PlaybackInfo, PublicInfo, Server, seconds_to_ticks,
+    AuthResult, BaseItem, ImageRef, ItemsPage, MediaSegments, PlaybackInfo, PublicInfo, Server,
+    seconds_to_ticks,
 };
-use crate::video::ExternalSubtitle;
+use crate::video::{ExternalSubtitle, Segment};
 
 const CLIENT_NAME: &str = "VideoPlayer";
 const PAGE_SIZE: usize = 500;
@@ -214,6 +215,12 @@ impl Client {
             &[("userId", user_id.to_string())],
         )?;
         Ok(info.external_subtitles(&self.base, item_id))
+    }
+
+    /// Intro and credits markers, if the server has any for the item.
+    pub fn media_segments(&self, item_id: &str) -> Result<Vec<Segment>> {
+        let segments: MediaSegments = self.get_json(&format!("/MediaSegments/{item_id}"), &[])?;
+        Ok(segments.to_segments())
     }
 
     /// The original file, streamed without transcoding (keeps HDR intact).

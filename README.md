@@ -41,8 +41,17 @@ covers them. The subtitles button opens a panel with audio tracks, subtitle trac
 external subtitle files on a Jellyfin server), playback speed, subtitle size and subtitle delay.
 The volume is remembered between videos.
 
-For TV shows, the bar adds **Next episode** and **Episodes** (a season-by-season list). When an
-episode ends, an "Up next" card counts down and plays the next one, staying in fullscreen.
+For TV shows, the bar adds **Next episode** and **Episodes** (a season-by-season list). When the
+credits start (or the episode ends), an "Up next" card counts down and plays the next one,
+staying in fullscreen; **Watch credits** dismisses it. During an intro or recap a **Skip Intro**
+button appears. Intros and credits come from Jellyfin's media segments (Jellyfin 10.10+ with a
+detection plugin such as Intro Skipper), or else from chapter names like "Opening" or "Credits".
+
+Audio and subtitle choices are remembered per show and as a general preference (including
+"subtitles off"), and applied when the next video starts.
+
+The Jellyfin library is cached on disk, so it shows instantly at start and stays browsable when
+the server is offline.
 Press **F1** (or `?`) in the player to see all shortcuts.
 
 | Key | Action |
@@ -57,6 +66,7 @@ Press **F1** (or `?`) in the player to see all shortcuts.
 | Z / X | Subtitles earlier / later by 0.1 s |
 | F, double-click | Fullscreen |
 | N / E | Next episode / episode list |
+| Enter | Skip intro, or play the next episode now |
 | F1, ? | Keyboard shortcuts |
 | Esc | Close the panel, leave fullscreen, or go back to the library |
 | Backspace | Back to the library |
