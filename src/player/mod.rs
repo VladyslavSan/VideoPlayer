@@ -845,19 +845,27 @@ impl Player {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        // Clicking the video never pauses it (too easy to do by accident):
+        // a click shows or hides the controls, a double-click is fullscreen.
         if self.panel.is_some() {
             // A click outside the panel just closes it.
             self.panel = None;
-        } else if self.up_next.is_some() {
-            // The video has ended; there's nothing to pause.
         } else if event.click_count == 2 {
-            // The first click of a double-click paused; undo that.
-            self.toggle_pause();
             window.toggle_fullscreen();
-        } else {
-            self.toggle_pause();
+        } else if self.controls_visible() {
+            self.hide_controls();
+            return cx.notify();
         }
         self.poke(cx);
+    }
+
+    /// Hides the controls now, as if the mouse had been idle. (They stay up
+    /// while paused or while a panel or countdown is showing.)
+    fn hide_controls(&mut self) {
+        self.bar_hovered = false;
+        self.last_activity = Instant::now()
+            .checked_sub(CONTROLS_TIMEOUT)
+            .unwrap_or_else(Instant::now);
     }
 
     fn on_seek_down(&mut self, event: &MouseDownEvent, _: &mut Window, cx: &mut Context<Self>) {
@@ -901,8 +909,12 @@ impl Player {
     }
 
     fn on_mouse_up(&mut self, _: &MouseUpEvent, _: &mut Window, cx: &mut Context<Self>) {
-        self.finish_drag();
-        self.poke(cx);
+        // Only the end of a slider drag counts as activity; otherwise the
+        // release of a click that hid the controls would bring them back.
+        if self.drag.is_some() {
+            self.finish_drag();
+            self.poke(cx);
+        }
     }
 
     fn finish_drag(&mut self) {

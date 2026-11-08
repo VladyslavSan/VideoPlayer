@@ -60,7 +60,7 @@ Press **F1** (or `?`) in the player to see all shortcuts.
 
 | Key | Action |
 | --- | --- |
-| Space / K | Play or pause (click the video, too) |
+| Space / K | Play or pause |
 | ← → / J L | Back or forward 10 seconds |
 | ↑ ↓ | Volume |
 | M | Mute |
@@ -69,6 +69,7 @@ Press **F1** (or `?`) in the player to see all shortcuts.
 | [ ] | Slower / faster |
 | Z / X | Subtitles earlier / later by 0.1 s |
 | F, double-click | Fullscreen |
+| Click | Show or hide the controls (clicking never pauses) |
 | N / E | Next episode / episode list |
 | Enter | Skip intro, or play the next episode now |
 | F1, ? | Keyboard shortcuts |

@@ -930,6 +930,7 @@ impl Player {
             ("[ ]", "Slower / faster"),
             ("Z X", "Subtitles earlier / later"),
             ("F / double-click", "Fullscreen"),
+            ("Click", "Show or hide the controls"),
         ];
         if !self.episodes.is_empty() {
             rows.push(("N", "Next episode"));
