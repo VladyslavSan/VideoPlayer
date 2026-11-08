@@ -15,7 +15,8 @@ use gpui::{
 
 use crate::jellyfin::{self, Client, ImageRef, PlaybackReport, Server, discovery};
 use crate::library::{Db, Item, Source, WATCHED_FRACTION, scan, thumbs};
-use crate::player::{self, Player, PlayerEvent};
+use crate::player::{self, Episode, Playback, Player, PlayerEvent};
+use crate::secrets;
 use crate::ui::text_input::TextInput;
 
 const BG: u32 = 0x0b0d12;
@@ -26,6 +27,7 @@ const ERROR: u32 = 0xff7a7a;
 const CARD_WIDTH: f32 = 256.0;
 const CARD_HEIGHT: f32 = 144.0;
 const CONTINUE_LIMIT: usize = 12;
+const VOLUME_SETTING: &str = "volume";
 const DISCOVERY_WAIT: Duration = Duration::from_millis(1500);
 const PLACEHOLDER_COLORS: [u32; 6] = [0x2b3a55, 0x3d2b55, 0x2b5547, 0x55402b, 0x552b3a, 0x2b4d55];
 
@@ -34,6 +36,9 @@ const PLACEHOLDER_COLORS: [u32; 6] = [0x2b3a55, 0x3d2b55, 0x2b5547, 0x55402b, 0x
 pub struct Paths {
     pub db: PathBuf,
     pub thumbs: PathBuf,
+    /// Diagnostics of release builds, which have no console.
+    #[cfg_attr(debug_assertions, allow(dead_code))]
+    pub log: PathBuf,
 }
 
 impl Paths {
@@ -48,6 +53,7 @@ impl Paths {
         Ok(Self {
             db: base.join("library.db"),
             thumbs: base.join("thumbs"),
+            log: base.join("app.log"),
         })
     }
 }
@@ -162,7 +168,13 @@ impl Shell {
                 .file_name()
                 .map(|n| n.to_string_lossy().into_owned())
                 .unwrap_or_else(|| source.clone());
-            shell.start_player(source, None, title.into(), 0.0, None, window, cx);
+            let playback = Playback {
+                title: title.into(),
+                subtitle: None,
+                episodes: Vec::new(),
+                current: None,
+            };
+            shell.start_player(source, None, playback, 0.0, None, window, cx);
         }
         Ok(shell)
     }
@@ -176,13 +188,31 @@ impl Shell {
         let loaded =
             (|| Ok::<_, anyhow::Error>((self.db.items()?, self.db.roots()?, self.db.servers()?)))();
         match loaded {
-            Ok((items, roots, servers)) => {
+            Ok((items, roots, mut servers)) => {
                 self.local = items;
                 self.roots = roots;
+                if let Err(e) = self.attach_tokens(&mut servers) {
+                    self.error = Some(format!("Couldn't read saved sign-ins: {e:#}").into());
+                }
                 self.servers = servers;
             }
             Err(e) => self.error = Some(format!("Couldn't read the library: {e}").into()),
         }
+    }
+
+    /// Fills in each server's token from the credential store. A token that
+    /// an older version left in the database is moved there first.
+    fn attach_tokens(&self, servers: &mut [Server]) -> Result<()> {
+        for server in servers {
+            let account = server.token_account(&self.device_id);
+            if server.token.is_empty() {
+                server.token = secrets::load(&account)?.unwrap_or_default();
+            } else {
+                secrets::save(&account, &server.token)?;
+                self.db.clear_token(server.id)?;
+            }
+        }
+        Ok(())
     }
 
     fn refresh(&mut self, cx: &mut Context<Self>) {
@@ -316,6 +346,17 @@ impl Shell {
     /// Fetches every server's library; artwork follows in the background.
     fn refresh_remote(&mut self, cx: &mut Context<Self>) {
         for server in self.servers.clone() {
+            if server.token.is_empty() {
+                // Removed from the credential store outside the app.
+                self.error = Some(
+                    format!(
+                        "{}: signed out; sign in again from the Jellyfin page",
+                        server.name
+                    )
+                    .into(),
+                );
+                continue;
+            }
             if !self.loading_servers.insert(server.id) {
                 continue;
             }
@@ -509,7 +550,7 @@ impl Shell {
                     if auth.server_id != info.id {
                         bail!("the server answered with an unexpected id");
                     }
-                    Ok(Server {
+                    let server = Server {
                         id: 0,
                         url: client.base().to_string(),
                         name: info.server_name,
@@ -517,7 +558,9 @@ impl Shell {
                         user_id: auth.user.id,
                         user_name: auth.user.name,
                         token: auth.access_token,
-                    })
+                    };
+                    secrets::save(&server.token_account(&device_id), &server.token)?;
+                    Ok(server)
                 })
                 .await;
             this.update_in(cx, |this, window, cx| {
@@ -551,8 +594,16 @@ impl Shell {
                 })
                 .detach();
         }
-        if let Err(e) = self.db.remove_server(server_id) {
-            self.error = Some(format!("Couldn't sign out: {e}").into());
+        let account = self
+            .servers
+            .iter()
+            .find(|s| s.id == server_id)
+            .map(|s| s.token_account(&self.device_id));
+        let removed = account
+            .map_or(Ok(()), |account| secrets::delete(&account))
+            .and_then(|()| self.db.remove_server(server_id));
+        if let Err(e) = removed {
+            self.error = Some(format!("Couldn't sign out: {e:#}").into());
         }
         self.remote.retain(
             |i| !matches!(&i.source, Source::Jellyfin { server, .. } if *server == server_id),
@@ -576,7 +627,27 @@ impl Shell {
         let Some(item) = self.items().find(|i| i.key() == key).cloned() else {
             return;
         };
-        let title: SharedString = item.display_title().into();
+        // Episodes: the show on top, the episode beside it; movies: title and year.
+        let (title, subtitle): (SharedString, Option<SharedString>) = match &item.show {
+            Some(show) => (
+                show.clone().into(),
+                Some(match item.episode_label() {
+                    Some(label) => format!("{label} · {}", item.title).into(),
+                    None => item.title.clone().into(),
+                }),
+            ),
+            None => (
+                item.title.clone().into(),
+                item.year.map(|y| y.to_string().into()),
+            ),
+        };
+        let (episodes, current) = self.episodes_around(&item);
+        let playback = Playback {
+            title,
+            subtitle,
+            episodes,
+            current,
+        };
         let start = item.resume_position();
         eprintln!("[play] {} ({key}) from {start:.1}s", item.display_title());
         match &item.source {
@@ -590,7 +661,7 @@ impl Shell {
                 self.start_player(
                     url,
                     None,
-                    title,
+                    playback,
                     start,
                     Some(item.source.clone()),
                     window,
@@ -608,7 +679,7 @@ impl Shell {
                 self.start_player(
                     url,
                     header,
-                    title,
+                    playback,
                     start,
                     Some(item.source.clone()),
                     window,
@@ -616,9 +687,91 @@ impl Shell {
                 );
                 if self.player.is_some() {
                     self.report(&item.source, PlaybackReport::Started, start, cx);
+                    self.load_external_subtitles(client, *server, id.clone(), cx);
                 }
             }
         }
+    }
+
+    /// The show's episodes in watching order (seasons in order, specials
+    /// last) and where `item` sits among them. Empty for movies.
+    fn episodes_around(&self, item: &Item) -> (Vec<Episode>, Option<usize>) {
+        let Some(show) = &item.show else {
+            return (Vec::new(), None);
+        };
+        let mut items: Vec<&Item> = self
+            .items()
+            .filter(|i| i.show.as_ref() == Some(show))
+            .collect();
+        items.sort_by_key(|i| {
+            let season = i.season.unwrap_or(0);
+            (season == 0, season, i.episode, i.title.to_lowercase())
+        });
+        let key = item.key();
+        let current = items.iter().position(|i| i.key() == key);
+        let episodes = items
+            .into_iter()
+            .map(|i| Episode {
+                key: i.key(),
+                season: i.season.unwrap_or(0),
+                number: i.episode,
+                title: i.title.clone(),
+                watched: i.watched,
+                progress: i.progress(),
+                thumb: i.thumb.clone(),
+            })
+            .collect();
+        (episodes, current)
+    }
+
+    fn saved_volume(&self) -> f64 {
+        self.db
+            .setting(VOLUME_SETTING)
+            .ok()
+            .flatten()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(100.0)
+    }
+
+    /// Asks the server for subtitle files stored beside the video and hands
+    /// them to the player, which adds them once the video has loaded.
+    fn load_external_subtitles(
+        &mut self,
+        client: Client,
+        server: i64,
+        item_id: String,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(user_id) = self
+            .servers
+            .iter()
+            .find(|s| s.id == server)
+            .map(|s| s.user_id.clone())
+        else {
+            return;
+        };
+        cx.spawn(async move |this, cx| {
+            let found = cx
+                .background_executor()
+                .spawn(async move { client.external_subtitles(&user_id, &item_id) })
+                .await;
+            match found {
+                Ok(subtitles) if !subtitles.is_empty() => {
+                    eprintln!("[jellyfin] {} external subtitle file(s)", subtitles.len());
+                    this.update(cx, |this, cx| {
+                        if let Some(active) = &this.player {
+                            active
+                                .view
+                                .update(cx, |player, _| player.add_external_subtitles(subtitles));
+                        }
+                    })
+                    .ok();
+                }
+                Ok(_) => {}
+                Err(e) => eprintln!("[jellyfin] listing subtitles: {e:#}"),
+            }
+        })
+        .detach();
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -626,7 +779,7 @@ impl Shell {
         &mut self,
         url: String,
         http_header: Option<String>,
-        title: SharedString,
+        playback: Playback,
         start: f64,
         source: Option<Source>,
         window: &mut Window,
@@ -635,13 +788,14 @@ impl Shell {
         let video = match player::open_video(window, &url, start, http_header.as_deref()) {
             Ok(video) => video,
             Err(e) => {
-                self.error = Some(format!("Couldn't play {title}: {e}").into());
+                self.error = Some(format!("Couldn't play {}: {e}", playback.title).into());
                 cx.notify();
                 return;
             }
         };
         self.error = None;
-        let view = cx.new(|cx| Player::new(video, title, window, cx));
+        let volume = self.saved_volume();
+        let view = cx.new(|cx| Player::new(video, playback, volume, window, cx));
         let subscription = cx.subscribe_in(&view, window, |this, _, event, window, cx| {
             this.on_player_event(event, window, cx)
         });
@@ -684,26 +838,51 @@ impl Shell {
                 if window.is_fullscreen() {
                     window.toggle_fullscreen();
                 }
-                // Dropping the view shuts mpv down and destroys its window.
-                let Some(active) = self.player.take() else {
-                    return;
-                };
-                if let Some(source @ Source::Jellyfin { .. }) = &active.source {
-                    // Update the card now; the refresh after "stopped" confirms it.
-                    let finished = active.duration > 0.0
-                        && active.position >= active.duration * WATCHED_FRACTION;
-                    if let Some(item) = self.remote.iter_mut().find(|i| &i.source == source) {
-                        item.position = if finished { 0.0 } else { active.position };
-                        item.watched |= finished;
-                        item.last_played = Some(now());
-                    }
-                    self.report(source, PlaybackReport::Stopped, active.position, cx);
-                }
-                self.reload();
+                self.finish_playback(cx);
                 self.focus.focus(window);
                 cx.notify();
             }
+            PlayerEvent::Play(key) => {
+                // Straight to the next video; fullscreen stays as it is.
+                self.finish_playback(cx);
+                self.play(key, window, cx);
+                if self.player.is_none() {
+                    if window.is_fullscreen() {
+                        window.toggle_fullscreen();
+                    }
+                    self.focus.focus(window);
+                }
+                cx.notify();
+            }
         }
+    }
+
+    /// Ends the current video: saves the volume, records progress, tells the
+    /// server, and re-reads the library so watched state shows up.
+    fn finish_playback(&mut self, cx: &mut Context<Self>) {
+        // Dropping the view shuts mpv down and destroys its window.
+        let Some(active) = self.player.take() else {
+            return;
+        };
+        // Remember the volume for next time, but never start silent.
+        let volume = active.view.read(cx).volume();
+        if volume >= 1.0
+            && let Err(e) = self.db.set_setting(VOLUME_SETTING, &format!("{volume:.0}"))
+        {
+            eprintln!("[library] saving volume: {e}");
+        }
+        if let Some(source @ Source::Jellyfin { .. }) = &active.source {
+            // Update the card now; the refresh after "stopped" confirms it.
+            let finished =
+                active.duration > 0.0 && active.position >= active.duration * WATCHED_FRACTION;
+            if let Some(item) = self.remote.iter_mut().find(|i| &i.source == source) {
+                item.position = if finished { 0.0 } else { active.position };
+                item.watched |= finished;
+                item.last_played = Some(now());
+            }
+            self.report(source, PlaybackReport::Stopped, active.position, cx);
+        }
+        self.reload();
     }
 
     fn on_key(&mut self, event: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {

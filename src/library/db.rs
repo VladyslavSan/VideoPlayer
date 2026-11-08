@@ -4,7 +4,7 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::Result;
-use rusqlite::{Connection, Row, params};
+use rusqlite::{Connection, OptionalExtension, Row, params};
 
 use super::parse::Parsed;
 use super::{Item, MIN_RESUME_SECONDS, Source, WATCHED_FRACTION};
@@ -39,6 +39,8 @@ CREATE TABLE IF NOT EXISTS servers (
     server_id TEXT NOT NULL,
     user_id TEXT NOT NULL,
     user_name TEXT NOT NULL,
+    -- Always '' now: tokens live in the system credential store. Versions
+    -- before that stored them here; they are moved out on startup.
     token TEXT NOT NULL,
     UNIQUE (server_id, user_id)
 );
@@ -258,21 +260,21 @@ impl Db {
         Ok(rows.collect::<Result<_, _>>()?)
     }
 
-    /// Saves a sign-in; signing in again as the same user replaces the token.
+    /// Saves a sign-in, keyed by server and user. The token is not stored;
+    /// callers put it in the credential store.
     pub fn save_server(&self, server: &Server) -> Result<i64> {
         self.conn.execute(
             "INSERT INTO servers (url, name, server_id, user_id, user_name, token)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+             VALUES (?1, ?2, ?3, ?4, ?5, '')
              ON CONFLICT(server_id, user_id) DO UPDATE SET
                 url = excluded.url, name = excluded.name,
-                user_name = excluded.user_name, token = excluded.token",
+                user_name = excluded.user_name, token = ''",
             params![
                 server.url,
                 server.name,
                 server.server_id,
                 server.user_id,
                 server.user_name,
-                server.token
             ],
         )?;
         Ok(self.conn.query_row(
@@ -285,6 +287,31 @@ impl Db {
     pub fn remove_server(&self, id: i64) -> Result<()> {
         self.conn
             .execute("DELETE FROM servers WHERE id = ?1", [id])?;
+        Ok(())
+    }
+
+    /// Wipes a token left by an older version, once it has been moved out.
+    pub fn clear_token(&self, id: i64) -> Result<()> {
+        self.conn
+            .execute("UPDATE servers SET token = '' WHERE id = ?1", [id])?;
+        Ok(())
+    }
+
+    pub fn setting(&self, key: &str) -> Result<Option<String>> {
+        Ok(self
+            .conn
+            .query_row("SELECT value FROM settings WHERE key = ?1", [key], |r| {
+                r.get(0)
+            })
+            .optional()?)
+    }
+
+    pub fn set_setting(&self, key: &str, value: &str) -> Result<()> {
+        self.conn.execute(
+            "INSERT INTO settings (key, value) VALUES (?1, ?2)
+             ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            [key, value],
+        )?;
         Ok(())
     }
 
@@ -437,16 +464,44 @@ mod tests {
             server_id: "s1".into(),
             user_id: "u1".into(),
             user_name: "me".into(),
-            token: "old".into(),
+            token: "secret".into(),
         };
         let id = db.save_server(&server)?;
-        server.token = "new".into();
+        server.url = "https://nas.example".into();
         assert_eq!(db.save_server(&server)?, id);
         let saved = db.servers()?;
         assert_eq!(saved.len(), 1);
-        assert_eq!((saved[0].id, saved[0].token.as_str()), (id, "new"));
+        assert_eq!(saved[0].id, id);
+        assert_eq!(saved[0].url, "https://nas.example");
+        // Tokens never reach the database.
+        assert_eq!(saved[0].token, "");
         db.remove_server(id)?;
         assert!(db.servers()?.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn legacy_token_is_cleared() -> Result<()> {
+        let db = Db::open_in_memory()?;
+        db.conn.execute(
+            "INSERT INTO servers (url, name, server_id, user_id, user_name, token)
+             VALUES ('http://nas:8096', 'Home', 's1', 'u1', 'me', 'old-token')",
+            [],
+        )?;
+        let saved = db.servers()?;
+        assert_eq!(saved[0].token, "old-token");
+        db.clear_token(saved[0].id)?;
+        assert_eq!(db.servers()?[0].token, "");
+        Ok(())
+    }
+
+    #[test]
+    fn settings_round_trip() -> Result<()> {
+        let db = Db::open_in_memory()?;
+        assert_eq!(db.setting("volume")?, None);
+        db.set_setting("volume", "80")?;
+        db.set_setting("volume", "65")?;
+        assert_eq!(db.setting("volume")?.as_deref(), Some("65"));
         Ok(())
     }
 

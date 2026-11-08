@@ -1,0 +1,655 @@
+//! Playback screen: the mpv video layer plus GPUI controls drawn above it.
+
+mod tracks;
+mod view;
+
+use std::cell::Cell;
+use std::rc::Rc;
+use std::time::{Duration, Instant};
+
+use anyhow::{Result, anyhow};
+use gpui::{
+    Bounds, Context, EventEmitter, FocusHandle, KeyDownEvent, MouseButton, MouseDownEvent,
+    MouseMoveEvent, MouseUpEvent, Pixels, Point, SharedString, Subscription, Task, Window,
+};
+use raw_window_handle::{HasWindowHandle, RawWindowHandle};
+use windows::Win32::Foundation::HWND;
+
+use crate::video::{ExternalSubtitle, Track, TrackKind, VideoSurface};
+
+const TICK: Duration = Duration::from_millis(100);
+const CONTROLS_TIMEOUT: Duration = Duration::from_millis(2500);
+const PROGRESS_INTERVAL: Duration = Duration::from_secs(5);
+const TOAST_DURATION: Duration = Duration::from_millis(1200);
+/// How often the track list is re-read while the track panel is open.
+const TRACKS_REFRESH: Duration = Duration::from_secs(1);
+const SKIP_SECONDS: f64 = 10.0;
+const VOLUME_STEP: f64 = 5.0;
+pub const SPEEDS: [f64; 7] = [0.5, 0.75, 1.0, 1.25, 1.5, 1.75, 2.0];
+
+/// Seconds the "Up next" card counts down before playing the next episode.
+const UP_NEXT_SECONDS: u64 = 8;
+
+pub enum PlayerEvent {
+    /// Periodic and final position report, for resume.
+    Progress { position: f64, duration: f64 },
+    /// The user left the player, or the video ended.
+    Exit,
+    /// Switch to another item (an episode of the same show), by library key.
+    Play(String),
+}
+
+/// An episode of the show being played, for the episode list and "next".
+#[derive(Debug, Clone, PartialEq)]
+pub struct Episode {
+    /// Library key, sent back in `PlayerEvent::Play`.
+    pub key: String,
+    pub season: u16,
+    pub number: Option<u16>,
+    pub title: String,
+    pub watched: bool,
+    pub progress: Option<f32>,
+    pub thumb: Option<std::path::PathBuf>,
+}
+
+/// What is being played, as shown in the player.
+pub struct Playback {
+    pub title: SharedString,
+    pub subtitle: Option<SharedString>,
+    /// The show's episodes in watching order (empty for movies).
+    pub episodes: Vec<Episode>,
+    /// Index of the playing episode in `episodes`.
+    pub current: Option<usize>,
+}
+
+/// The panel open above the control bar, if any.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Panel {
+    Tracks,
+    Episodes,
+    Shortcuts,
+}
+
+/// What a held mouse button is dragging.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Drag {
+    Seek,
+    Volume,
+}
+
+/// Values mpv owns, re-read every tick so the controls never drift from it.
+#[derive(Debug, Clone, Copy)]
+struct Status {
+    position: f64,
+    duration: f64,
+    buffered: Option<f64>,
+    paused: bool,
+    buffering: bool,
+    volume: f64,
+    muted: bool,
+    speed: f64,
+    subtitle_scale: f64,
+    subtitle_delay: f64,
+}
+
+pub struct Player {
+    video: VideoSurface,
+    focus: FocusHandle,
+    title: SharedString,
+    subtitle: Option<SharedString>,
+    episodes: Vec<Episode>,
+    current: Option<usize>,
+    /// Season shown in the episodes panel.
+    episode_season: u16,
+    /// When the video has ended and the next episode will start.
+    up_next: Option<Instant>,
+    status: Status,
+    tracks: Vec<Track>,
+    tracks_read: Instant,
+    pending_subtitles: Vec<ExternalSubtitle>,
+    panel: Option<Panel>,
+    drag: Option<Drag>,
+    /// Where the seek bar is being dragged to, shown instead of the position.
+    scrub: Option<f64>,
+    /// Mouse x over the seek bar, for the time preview.
+    seek_hover: Option<Pixels>,
+    bar_hovered: bool,
+    toast: Option<(SharedString, Instant)>,
+    /// Subtitle position last sent to mpv, in percent of the window height.
+    subtitle_position: f64,
+    exited: bool,
+    last_activity: Instant,
+    last_report: Instant,
+    pipeline: String,
+    // Laid-out bounds of the sliders, written during paint, read by mouse handlers.
+    seek_bounds: Rc<Cell<Bounds<Pixels>>>,
+    volume_bounds: Rc<Cell<Bounds<Pixels>>>,
+    _poll: Task<()>,
+    _subscriptions: Vec<Subscription>,
+}
+
+impl EventEmitter<PlayerEvent> for Player {}
+
+fn native_hwnd(window: &Window) -> Result<HWND> {
+    let handle = HasWindowHandle::window_handle(window).map_err(|e| anyhow!("{e}"))?;
+    match handle.as_raw() {
+        RawWindowHandle::Win32(h) => Ok(HWND(h.hwnd.get() as *mut _)),
+        other => Err(anyhow!("unsupported window handle: {other:?}")),
+    }
+}
+
+/// Creates the native video layer for `window`. Kept separate from
+/// `Player::new` so failures surface before the view exists.
+pub fn open_video(
+    window: &Window,
+    source: &str,
+    start: f64,
+    http_header: Option<&str>,
+) -> Result<VideoSurface> {
+    VideoSurface::new(native_hwnd(window)?, source, start, http_header)
+}
+
+fn format_time(seconds: f64) -> String {
+    let total = seconds.max(0.0) as u64;
+    let (h, m, s) = (total / 3600, total / 60 % 60, total % 60);
+    if h > 0 {
+        format!("{h}:{m:02}:{s:02}")
+    } else {
+        format!("{m}:{s:02}")
+    }
+}
+
+/// Fraction of `bounds`' width at horizontal position `x`, clamped to 0..=1.
+fn fraction_at(bounds: Bounds<Pixels>, x: Pixels) -> f64 {
+    let width = f32::from(bounds.size.width);
+    if width <= 0.0 {
+        return 0.0;
+    }
+    (f32::from(x - bounds.origin.x) / width).clamp(0.0, 1.0) as f64
+}
+
+impl Player {
+    pub fn new(
+        video: VideoSurface,
+        playback: Playback,
+        volume: f64,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        let Playback {
+            title,
+            subtitle,
+            episodes,
+            current,
+        } = playback;
+        let episode_season = current
+            .and_then(|i| episodes.get(i))
+            .map_or(0, |e| e.season);
+        let focus = cx.focus_handle();
+        focus.focus(window);
+        video.sync_size();
+        video.set_volume(volume);
+
+        let bounds = cx.observe_window_bounds(window, |this, _, _| this.video.sync_size());
+        let poll = cx.spawn(async move |this, cx| {
+            loop {
+                cx.background_executor().timer(TICK).await;
+                if this.update(cx, |this, cx| this.tick(cx)).is_err() {
+                    break;
+                }
+            }
+        });
+
+        Self {
+            video,
+            focus,
+            title,
+            subtitle,
+            episodes,
+            current,
+            episode_season,
+            up_next: None,
+            status: Status {
+                position: 0.0,
+                duration: 0.0,
+                buffered: None,
+                paused: false,
+                buffering: true,
+                volume,
+                muted: false,
+                speed: 1.0,
+                subtitle_scale: 1.0,
+                subtitle_delay: 0.0,
+            },
+            tracks: Vec::new(),
+            tracks_read: Instant::now(),
+            pending_subtitles: Vec::new(),
+            panel: None,
+            drag: None,
+            scrub: None,
+            seek_hover: None,
+            bar_hovered: false,
+            toast: None,
+            subtitle_position: 100.0,
+            exited: false,
+            last_activity: Instant::now(),
+            last_report: Instant::now(),
+            pipeline: String::new(),
+            seek_bounds: Rc::default(),
+            volume_bounds: Rc::default(),
+            _poll: poll,
+            _subscriptions: vec![bounds],
+        }
+    }
+
+    /// Subtitle files that live next to the video (for example on a
+    /// Jellyfin server). They're added as soon as the video has loaded.
+    pub fn add_external_subtitles(&mut self, subtitles: Vec<ExternalSubtitle>) {
+        self.pending_subtitles.extend(subtitles);
+    }
+
+    pub fn volume(&self) -> f64 {
+        self.status.volume
+    }
+
+    fn tick(&mut self, cx: &mut Context<Self>) {
+        if self.exited {
+            return;
+        }
+        let v = &self.video;
+        self.status = Status {
+            position: v.position(),
+            duration: v.duration(),
+            buffered: v.buffered_until(),
+            paused: v.paused(),
+            buffering: v.buffering() || !v.loaded(),
+            volume: v.volume(),
+            muted: v.muted(),
+            speed: v.speed(),
+            subtitle_scale: v.subtitle_scale(),
+            subtitle_delay: v.subtitle_delay(),
+        };
+        let pipeline = self.video.pipeline();
+        if pipeline != self.pipeline {
+            eprintln!("[video] {pipeline}");
+            self.pipeline = pipeline;
+        }
+        if self.video.loaded() {
+            if !self.pending_subtitles.is_empty() {
+                for subtitle in std::mem::take(&mut self.pending_subtitles) {
+                    if let Err(e) = self.video.add_subtitle(&subtitle) {
+                        eprintln!("[video] {e:#}");
+                    }
+                }
+                self.read_tracks();
+            }
+            if self.tracks.is_empty()
+                || (self.panel == Some(Panel::Tracks)
+                    && self.tracks_read.elapsed() >= TRACKS_REFRESH)
+            {
+                self.read_tracks();
+            }
+        }
+        if self.video.ended() {
+            // Report the full runtime so the item is marked watched.
+            self.status.position = self.status.duration;
+            match (self.next_episode().map(|e| e.key.clone()), self.up_next) {
+                (Some(key), None) => {
+                    eprintln!("[player] ended; up next: {key} in {UP_NEXT_SECONDS} s");
+                    self.report(cx);
+                    self.up_next = Some(Instant::now() + Duration::from_secs(UP_NEXT_SECONDS));
+                }
+                (Some(key), Some(at)) if Instant::now() >= at => {
+                    return self.play_episode(key, cx);
+                }
+                (Some(_), Some(_)) => {}
+                (None, _) => return self.exit(cx),
+            }
+            cx.notify();
+            return;
+        }
+        // Seeking back from the end cancels the countdown.
+        self.up_next = None;
+        if self.last_report.elapsed() >= PROGRESS_INTERVAL {
+            self.report(cx);
+        }
+        cx.notify();
+    }
+
+    fn next_episode(&self) -> Option<&Episode> {
+        self.episodes.get(self.current? + 1)
+    }
+
+    /// Leaves this video for another episode.
+    fn play_episode(&mut self, key: String, cx: &mut Context<Self>) {
+        if self.exited {
+            return;
+        }
+        self.exited = true;
+        self.report(cx);
+        cx.emit(PlayerEvent::Play(key));
+    }
+
+    /// Seconds left on the "Up next" countdown, while it runs.
+    fn up_next_remaining(&self) -> Option<u64> {
+        let at = self.up_next?;
+        Some(
+            at.saturating_duration_since(Instant::now())
+                .as_secs_f64()
+                .ceil() as u64,
+        )
+    }
+
+    fn seasons(&self) -> Vec<u16> {
+        let mut seasons: Vec<u16> = self.episodes.iter().map(|e| e.season).collect();
+        seasons.dedup();
+        seasons
+    }
+
+    fn read_tracks(&mut self) {
+        self.tracks = self.video.tracks();
+        self.tracks_read = Instant::now();
+    }
+
+    fn tracks_of(&self, kind: TrackKind) -> impl Iterator<Item = &Track> {
+        self.tracks.iter().filter(move |t| t.kind == kind)
+    }
+
+    fn report(&mut self, cx: &mut Context<Self>) {
+        self.last_report = Instant::now();
+        if self.status.duration > 0.0 {
+            cx.emit(PlayerEvent::Progress {
+                position: self.status.position,
+                duration: self.status.duration,
+            });
+        }
+    }
+
+    fn exit(&mut self, cx: &mut Context<Self>) {
+        if self.exited {
+            return;
+        }
+        self.exited = true;
+        self.report(cx);
+        cx.emit(PlayerEvent::Exit);
+    }
+
+    fn poke(&mut self, cx: &mut Context<Self>) {
+        self.last_activity = Instant::now();
+        cx.notify();
+    }
+
+    fn toast(&mut self, message: impl Into<SharedString>) {
+        self.toast = Some((message.into(), Instant::now()));
+    }
+
+    fn controls_visible(&self) -> bool {
+        self.status.paused
+            || self.panel.is_some()
+            || self.up_next.is_some()
+            || self.drag.is_some()
+            || self.bar_hovered
+            || self.last_activity.elapsed() < CONTROLS_TIMEOUT
+    }
+
+    // ---- actions shared by buttons and keys ----
+
+    fn toggle_pause(&mut self) {
+        self.video.toggle_pause();
+        self.status.paused = !self.status.paused;
+    }
+
+    fn skip(&mut self, seconds: f64) {
+        self.video.seek_by(seconds);
+    }
+
+    fn set_volume(&mut self, volume: f64) {
+        let volume = volume.clamp(0.0, 100.0);
+        self.video.set_volume(volume);
+        self.status.volume = volume;
+        if self.status.muted && volume > 0.0 {
+            self.video.set_muted(false);
+            self.status.muted = false;
+        }
+    }
+
+    fn toggle_mute(&mut self) {
+        self.status.muted = !self.status.muted;
+        self.video.set_muted(self.status.muted);
+    }
+
+    fn select_audio(&mut self, id: i64) {
+        self.video.select_audio(id);
+        self.read_tracks();
+    }
+
+    fn select_subtitle(&mut self, id: Option<i64>) {
+        self.video.select_subtitle(id);
+        self.read_tracks();
+    }
+
+    /// Steps to the next track of `kind`; subtitles include "off".
+    fn cycle(&mut self, kind: TrackKind) {
+        self.read_tracks();
+        let ids: Vec<i64> = self.tracks_of(kind).map(|t| t.id).collect();
+        let current = self.tracks_of(kind).find(|t| t.selected).map(|t| t.id);
+        let mut choices: Vec<Option<i64>> = ids.into_iter().map(Some).collect();
+        if kind == TrackKind::Subtitle {
+            choices.push(None);
+        }
+        if choices.is_empty() {
+            self.toast(match kind {
+                TrackKind::Audio => "No audio tracks",
+                TrackKind::Subtitle => "No subtitles",
+            });
+            return;
+        }
+        let next = choices
+            .iter()
+            .position(|c| *c == current)
+            .map_or(0, |i| (i + 1) % choices.len());
+        let choice = choices[next];
+        match kind {
+            TrackKind::Audio => self.select_audio(choice.unwrap_or_default()),
+            TrackKind::Subtitle => self.select_subtitle(choice),
+        }
+        let name = choice
+            .and_then(|id| {
+                let (number, track) = self.tracks_of(kind).enumerate().find(|(_, t)| t.id == id)?;
+                Some(tracks::label(track, number + 1).primary)
+            })
+            .unwrap_or_else(|| "Off".into());
+        self.toast(match kind {
+            TrackKind::Audio => format!("Audio: {name}"),
+            TrackKind::Subtitle => format!("Subtitles: {name}"),
+        });
+    }
+
+    fn step_speed(&mut self, direction: i32) {
+        let current = SPEEDS
+            .iter()
+            .position(|s| (s - self.status.speed).abs() < 0.01)
+            .unwrap_or(2);
+        let next = (current as i32 + direction).clamp(0, SPEEDS.len() as i32 - 1) as usize;
+        self.video.set_speed(SPEEDS[next]);
+        self.status.speed = SPEEDS[next];
+        self.toast(format!("Speed {}", view::format_speed(SPEEDS[next])));
+    }
+
+    fn step_subtitle_scale(&mut self, delta: f64) {
+        let scale = ((self.status.subtitle_scale + delta) * 10.0).round() / 10.0;
+        let scale = scale.clamp(0.5, 2.5);
+        self.video.set_subtitle_scale(scale);
+        self.status.subtitle_scale = scale;
+    }
+
+    fn step_subtitle_delay(&mut self, delta: f64) {
+        let delay = ((self.status.subtitle_delay + delta) * 10.0).round() / 10.0;
+        self.video.set_subtitle_delay(delay);
+        self.status.subtitle_delay = delay;
+        self.toast(format!("Subtitle delay {}", view::format_delay(delay)));
+    }
+
+    /// Opens `panel`, or closes it if it's already open.
+    fn toggle_panel(&mut self, panel: Panel) {
+        self.panel = if self.panel == Some(panel) {
+            None
+        } else {
+            Some(panel)
+        };
+        match self.panel {
+            Some(Panel::Tracks) => self.read_tracks(),
+            Some(Panel::Episodes) => {
+                if let Some(e) = self.current.and_then(|i| self.episodes.get(i)) {
+                    self.episode_season = e.season;
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn play_next(&mut self, cx: &mut Context<Self>) {
+        match self.next_episode().map(|e| e.key.clone()) {
+            Some(key) => self.play_episode(key, cx),
+            None => self.toast("This is the last episode"),
+        }
+    }
+
+    /// Keeps subtitles above the control bar while it's showing.
+    fn place_subtitles(&mut self, window: &Window, raised: bool) {
+        let height = f32::from(window.viewport_size().height);
+        let target = if raised && height > 0.0 {
+            100.0 - (view::BAR_CLEARANCE / height * 100.0) as f64
+        } else {
+            100.0
+        };
+        if (target - self.subtitle_position).abs() >= 1.0 {
+            self.video.set_subtitle_position(target);
+            self.subtitle_position = target;
+        }
+    }
+
+    // ---- input ----
+
+    fn on_key(&mut self, event: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
+        let question_mark = event.keystroke.key_char.as_deref() == Some("?");
+        if question_mark {
+            self.toggle_panel(Panel::Shortcuts);
+            return self.poke(cx);
+        }
+        match event.keystroke.key.as_str() {
+            "f1" => self.toggle_panel(Panel::Shortcuts),
+            "n" if !self.episodes.is_empty() => return self.play_next(cx),
+            "e" if !self.episodes.is_empty() => self.toggle_panel(Panel::Episodes),
+            "enter" if self.up_next.is_some() => return self.play_next(cx),
+            "space" | "k" => self.toggle_pause(),
+            "left" | "j" => self.skip(-SKIP_SECONDS),
+            "right" | "l" => self.skip(SKIP_SECONDS),
+            "up" => {
+                self.set_volume(self.status.volume + VOLUME_STEP);
+                self.toast(format!("Volume {:.0}%", self.status.volume));
+            }
+            "down" => {
+                self.set_volume(self.status.volume - VOLUME_STEP);
+                self.toast(format!("Volume {:.0}%", self.status.volume));
+            }
+            "m" => {
+                self.toggle_mute();
+                self.toast(if self.status.muted {
+                    "Muted"
+                } else {
+                    "Sound on"
+                });
+            }
+            "s" => self.cycle(TrackKind::Subtitle),
+            "a" => self.cycle(TrackKind::Audio),
+            "c" => self.toggle_panel(Panel::Tracks),
+            "[" => self.step_speed(-1),
+            "]" => self.step_speed(1),
+            "z" => self.step_subtitle_delay(-0.1),
+            "x" => self.step_subtitle_delay(0.1),
+            "f" => window.toggle_fullscreen(),
+            "escape" if self.panel.is_some() => self.panel = None,
+            "escape" if window.is_fullscreen() => window.toggle_fullscreen(),
+            "escape" | "backspace" => return self.exit(cx),
+            _ => return,
+        }
+        self.poke(cx);
+    }
+
+    fn on_stage_down(
+        &mut self,
+        event: &MouseDownEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.panel.is_some() {
+            // A click outside the panel just closes it.
+            self.panel = None;
+        } else if self.up_next.is_some() {
+            // The video has ended; there's nothing to pause.
+        } else if event.click_count == 2 {
+            // The first click of a double-click paused; undo that.
+            self.toggle_pause();
+            window.toggle_fullscreen();
+        } else {
+            self.toggle_pause();
+        }
+        self.poke(cx);
+    }
+
+    fn on_seek_down(&mut self, event: &MouseDownEvent, _: &mut Window, cx: &mut Context<Self>) {
+        cx.stop_propagation();
+        self.drag = Some(Drag::Seek);
+        self.scrub_to(event.position);
+        self.poke(cx);
+    }
+
+    fn on_volume_down(&mut self, event: &MouseDownEvent, _: &mut Window, cx: &mut Context<Self>) {
+        cx.stop_propagation();
+        self.drag = Some(Drag::Volume);
+        self.set_volume(fraction_at(self.volume_bounds.get(), event.position.x) * 100.0);
+        self.poke(cx);
+    }
+
+    fn scrub_to(&mut self, position: Point<Pixels>) {
+        if self.status.duration > 0.0 {
+            let time = fraction_at(self.seek_bounds.get(), position.x) * self.status.duration;
+            self.scrub = Some(time);
+            self.video.seek_to_keyframe(time);
+        }
+    }
+
+    fn on_mouse_move(&mut self, event: &MouseMoveEvent, _: &mut Window, cx: &mut Context<Self>) {
+        match self.drag {
+            Some(_) if event.pressed_button != Some(MouseButton::Left) => {
+                // The button was released outside the window.
+                self.finish_drag();
+            }
+            Some(Drag::Seek) => self.scrub_to(event.position),
+            Some(Drag::Volume) => {
+                self.set_volume(fraction_at(self.volume_bounds.get(), event.position.x) * 100.0)
+            }
+            None => {}
+        }
+        let seek = self.seek_bounds.get();
+        self.seek_hover = (seek.contains(&event.position) || self.drag == Some(Drag::Seek))
+            .then_some(event.position.x);
+        self.poke(cx);
+    }
+
+    fn on_mouse_up(&mut self, _: &MouseUpEvent, _: &mut Window, cx: &mut Context<Self>) {
+        self.finish_drag();
+        self.poke(cx);
+    }
+
+    fn finish_drag(&mut self) {
+        if self.drag.take() == Some(Drag::Seek)
+            && let Some(time) = self.scrub.take()
+        {
+            // Land exactly where the bar was released.
+            self.video.seek_to(time);
+            self.status.position = time;
+        }
+    }
+}

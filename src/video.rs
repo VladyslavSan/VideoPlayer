@@ -66,6 +66,35 @@ fn create_host(parent: HWND) -> Result<Host> {
     Ok(Host(hwnd))
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TrackKind {
+    Audio,
+    Subtitle,
+}
+
+/// An audio or subtitle track, as mpv reports it in `track-list`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Track {
+    pub kind: TrackKind,
+    /// mpv's id, used to select the track (`aid` / `sid`).
+    pub id: i64,
+    pub title: Option<String>,
+    pub lang: Option<String>,
+    pub codec: Option<String>,
+    pub channels: Option<i64>,
+    pub selected: bool,
+    pub external: bool,
+    pub forced: bool,
+}
+
+/// A subtitle file to load next to the video (Jellyfin's external subtitles).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExternalSubtitle {
+    pub url: String,
+    pub title: Option<String>,
+    pub lang: Option<String>,
+}
+
 pub struct VideoSurface {
     // Field order matters: mpv must shut down before its window is destroyed.
     mpv: Mpv,
@@ -98,6 +127,12 @@ impl VideoSurface {
             }
             if let Ok(path) = std::env::var("VIDEO_PLAYER_MPV_LOG") {
                 init.set_option("log-file", path.as_str())?;
+            }
+            // Developer override, e.g. `ao=null` to keep test runs silent.
+            if let Ok(options) = std::env::var("VIDEO_PLAYER_MPV_OPTIONS") {
+                for (key, value) in options.split_whitespace().filter_map(|o| o.split_once('=')) {
+                    init.set_option(key, value)?;
+                }
             }
             Ok(())
         })
@@ -153,10 +188,144 @@ impl VideoSurface {
             .command("seek", &[&format!("{seconds:.3}"), "absolute"]);
     }
 
+    /// Fast, approximate seek (nearest keyframe), for live scrubbing.
+    pub fn seek_to_keyframe(&self, seconds: f64) {
+        let _ = self
+            .mpv
+            .command("seek", &[&format!("{seconds:.3}"), "absolute+keyframes"]);
+    }
+
+    /// Timestamp up to which the stream is buffered, if known.
+    pub fn buffered_until(&self) -> Option<f64> {
+        self.mpv.get_property("demuxer-cache-time").ok()
+    }
+
     pub fn seek_by(&self, seconds: f64) {
         let _ = self
             .mpv
             .command("seek", &[&format!("{seconds:.3}"), "relative"]);
+    }
+
+    /// True once the file is open and its tracks are known.
+    pub fn loaded(&self) -> bool {
+        self.mpv
+            .get_property::<i64>("track-list/count")
+            .unwrap_or(0)
+            > 0
+    }
+
+    /// Stalled waiting for the network.
+    pub fn buffering(&self) -> bool {
+        self.mpv.get_property("paused-for-cache").unwrap_or(false)
+    }
+
+    pub fn tracks(&self) -> Vec<Track> {
+        let count: i64 = self.mpv.get_property("track-list/count").unwrap_or(0);
+        (0..count)
+            .filter_map(|i| {
+                let text = |field: &str| {
+                    self.mpv
+                        .get_property::<String>(&format!("track-list/{i}/{field}"))
+                        .ok()
+                        .filter(|s| !s.is_empty())
+                };
+                let flag = |field: &str| {
+                    self.mpv
+                        .get_property::<bool>(&format!("track-list/{i}/{field}"))
+                        .unwrap_or(false)
+                };
+                let kind = match text("type")?.as_str() {
+                    "audio" => TrackKind::Audio,
+                    "sub" => TrackKind::Subtitle,
+                    _ => return None,
+                };
+                Some(Track {
+                    kind,
+                    id: self.mpv.get_property(&format!("track-list/{i}/id")).ok()?,
+                    title: text("title"),
+                    lang: text("lang"),
+                    codec: text("codec"),
+                    channels: self
+                        .mpv
+                        .get_property(&format!("track-list/{i}/demux-channel-count"))
+                        .ok(),
+                    selected: flag("selected"),
+                    external: flag("external"),
+                    forced: flag("forced"),
+                })
+            })
+            .collect()
+    }
+
+    pub fn select_audio(&self, id: i64) {
+        let _ = self.mpv.set_property("aid", id);
+    }
+
+    /// `None` turns subtitles off.
+    pub fn select_subtitle(&self, id: Option<i64>) {
+        let _ = match id {
+            Some(id) => self.mpv.set_property("sid", id),
+            None => self.mpv.set_property("sid", "no"),
+        };
+    }
+
+    /// Adds a subtitle file without selecting it. Must be called once the
+    /// file has loaded; HTTP requests carry the same header as the video.
+    pub fn add_subtitle(&self, subtitle: &ExternalSubtitle) -> Result<()> {
+        let title = subtitle.title.as_deref().unwrap_or("");
+        let lang = subtitle.lang.as_deref().unwrap_or("");
+        self.mpv
+            .command("sub-add", &[&subtitle.url, "auto", title, lang])
+            .map_err(|e| anyhow!("adding subtitle {}: {e}", subtitle.url))
+    }
+
+    pub fn volume(&self) -> f64 {
+        self.mpv.get_property("volume").unwrap_or(100.0)
+    }
+
+    pub fn set_volume(&self, volume: f64) {
+        let _ = self.mpv.set_property("volume", volume.clamp(0.0, 100.0));
+    }
+
+    pub fn muted(&self) -> bool {
+        self.mpv.get_property("mute").unwrap_or(false)
+    }
+
+    pub fn set_muted(&self, muted: bool) {
+        let _ = self.mpv.set_property("mute", muted);
+    }
+
+    pub fn speed(&self) -> f64 {
+        self.mpv.get_property("speed").unwrap_or(1.0)
+    }
+
+    pub fn set_speed(&self, speed: f64) {
+        let _ = self.mpv.set_property("speed", speed);
+    }
+
+    /// Subtitle size as a multiplier (1.0 = default).
+    pub fn subtitle_scale(&self) -> f64 {
+        self.mpv.get_property("sub-scale").unwrap_or(1.0)
+    }
+
+    pub fn set_subtitle_scale(&self, scale: f64) {
+        let _ = self.mpv.set_property("sub-scale", scale);
+    }
+
+    /// Seconds; positive shows subtitles later.
+    pub fn subtitle_delay(&self) -> f64 {
+        self.mpv.get_property("sub-delay").unwrap_or(0.0)
+    }
+
+    pub fn set_subtitle_delay(&self, seconds: f64) {
+        let _ = self.mpv.set_property("sub-delay", seconds);
+    }
+
+    /// Vertical subtitle position in percent of the window (100 = bottom).
+    pub fn set_subtitle_position(&self, percent: f64) {
+        let _ = self
+            .mpv
+            .set_property("sub-pos", percent.round().clamp(0.0, 100.0) as i64);
     }
 
     /// One-line summary of the active video pipeline, for diagnostics.

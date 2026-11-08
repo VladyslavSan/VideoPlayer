@@ -1,0 +1,26 @@
+// Windows resources: the app icon (GPUI loads icon id 1 for its windows)
+// and the version details Explorer shows in the file's properties.
+1 ICON "app.ico"
+
+1 VERSIONINFO
+FILEVERSION 0,1,0,0
+PRODUCTVERSION 0,1,0,0
+FILEOS 0x40004
+FILETYPE 0x1
+BEGIN
+    BLOCK "StringFileInfo"
+    BEGIN
+        BLOCK "040904B0"
+        BEGIN
+            VALUE "FileDescription", "Video Player"
+            VALUE "ProductName", "Video Player"
+            VALUE "FileVersion", "0.1.0"
+            VALUE "ProductVersion", "0.1.0"
+            VALUE "OriginalFilename", "video-player.exe"
+        END
+    END
+    BLOCK "VarFileInfo"
+    BEGIN
+        VALUE "Translation", 0x409, 1200
+    END
+END

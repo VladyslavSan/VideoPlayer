@@ -11,6 +11,13 @@ fn main() {
     );
     println!("cargo:rustc-link-search=native={}", mpv.display());
 
+    // App icon and version info (assets/app.ico is drawn by scripts/make_icon.py).
+    println!("cargo:rerun-if-changed=assets/app.rc");
+    println!("cargo:rerun-if-changed=assets/app.ico");
+    embed_resource::compile("assets/app.rc", embed_resource::NONE)
+        .manifest_optional()
+        .expect("compiling Windows resources");
+
     // OUT_DIR is target/<profile>/build/<crate>/out.
     let out = PathBuf::from(env::var("OUT_DIR").unwrap());
     let profile_dir = out.ancestors().nth(3).unwrap();

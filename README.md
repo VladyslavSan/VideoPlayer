@@ -17,9 +17,14 @@ mpv keeps its own swapchain, so hardware decoding and HDR output are preserved.
 
 ## Jellyfin
 
-Click **Jellyfin** and sign in to your server. Servers on your network are found
-automatically; otherwise type the address (`192.168.1.10:8096`, or a full `https://` URL).
-Only the access token is stored, never your password.
+Click **Jellyfin** and sign in to your server. Servers that answer Jellyfin's network
+discovery are listed automatically; otherwise type the address (`192.168.1.10:8096`, a full
+`https://` URL, or a link copied from Jellyfin's web app).
+
+Your password is never stored. The access token Jellyfin issues goes into the system
+credential store (Windows Credential Manager, macOS Keychain, Secret Service on Linux), which
+encrypts it for your user account; `library.db` keeps only the server address and user name.
+**Sign Out** revokes the token on the server and deletes it locally.
 
 - Movies and episodes appear in the same library as local folders, with the server's artwork.
 - Files are direct-played (no transcoding), so HDR and hardware decoding work as they do for local files.
@@ -27,6 +32,34 @@ Only the access token is stored, never your password.
   state stay in sync with other Jellyfin apps.
 
 `cargo test -- --ignored` runs a round trip against Jellyfin's public demo server.
+
+## Player
+
+A floating control bar appears when you move the mouse and hides after a few seconds of
+playback (the pointer hides with it). While it's showing, subtitles move up so the bar never
+covers them. The subtitles button opens a panel with audio tracks, subtitle tracks (including
+external subtitle files on a Jellyfin server), playback speed, subtitle size and subtitle delay.
+The volume is remembered between videos.
+
+For TV shows, the bar adds **Next episode** and **Episodes** (a season-by-season list). When an
+episode ends, an "Up next" card counts down and plays the next one, staying in fullscreen.
+Press **F1** (or `?`) in the player to see all shortcuts.
+
+| Key | Action |
+| --- | --- |
+| Space / K | Play or pause (click the video, too) |
+| ← → / J L | Back or forward 10 seconds |
+| ↑ ↓ | Volume |
+| M | Mute |
+| S / A | Next subtitle track (including off) / next audio track |
+| C | Audio and subtitles panel |
+| [ ] | Slower / faster |
+| Z / X | Subtitles earlier / later by 0.1 s |
+| F, double-click | Fullscreen |
+| N / E | Next episode / episode list |
+| F1, ? | Keyboard shortcuts |
+| Esc | Close the panel, leave fullscreen, or go back to the library |
+| Backspace | Back to the library |
 
 ## Library
 
@@ -43,7 +76,23 @@ folder).
 - `cargo test`: parser, database and scanner tests
 - `VIDEO_PLAYER_DATA_DIR=<dir>`: use a separate library, for example while testing
 - `VIDEO_PLAYER_MPV_LOG=<path>`: write mpv's verbose log
+- `VIDEO_PLAYER_MPV_OPTIONS="ao=null ..."`: extra mpv options (space-separated `key=value`)
 - `cargo run -- <file>`: play a file directly, without the library
+- `python scripts/make_icon.py`: redraw `assets/app.ico` (embedded in the exe via `assets/app.rc`)
+
+Release builds have no console window; their diagnostics go to
+`%LOCALAPPDATA%\VideoPlayer\app.log` (the previous run's log is kept as `app.previous.log`).
+
+## Install
+
+```powershell
+powershell -ExecutionPolicy Bypass -File scripts\install.ps1
+```
+
+Builds a release, installs it to `%LOCALAPPDATA%\Programs\VideoPlayer` and adds a **Video Player**
+Start Menu shortcut. Run it again to update; this works while the app is open, and the new
+version starts next time. `scripts\install.ps1 -Uninstall` removes the app (your library and
+settings stay).
 
 ## Licensing
 

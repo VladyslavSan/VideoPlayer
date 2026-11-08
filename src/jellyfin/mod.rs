@@ -12,6 +12,7 @@ use serde::Deserialize;
 pub use client::{Client, PlaybackReport};
 
 use crate::library::{Item, Source};
+use crate::video::ExternalSubtitle;
 
 const TICKS_PER_SECOND: f64 = 10_000_000.0;
 
@@ -23,7 +24,8 @@ pub fn seconds_to_ticks(seconds: f64) -> i64 {
     (seconds * TICKS_PER_SECOND) as i64
 }
 
-/// A signed-in Jellyfin account, as stored in the library database.
+/// A signed-in Jellyfin account. The library database stores everything but
+/// the token, which lives in the system credential store (see `secrets`).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Server {
     pub id: i64,
@@ -32,7 +34,16 @@ pub struct Server {
     pub server_id: String,
     pub user_id: String,
     pub user_name: String,
+    /// Empty if the credential store has no token for this account.
     pub token: String,
+}
+
+impl Server {
+    /// The credential store entry for this account's token. The device id
+    /// keeps installations with separate data folders from sharing entries.
+    pub fn token_account(&self, device_id: &str) -> String {
+        format!("jellyfin:{device_id}:{}:{}", self.server_id, self.user_id)
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -94,6 +105,69 @@ pub struct UserData {
     #[serde(default)]
     pub played: bool,
     pub last_played_date: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "PascalCase")]
+pub struct PlaybackInfo {
+    #[serde(default)]
+    pub media_sources: Vec<MediaSource>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "PascalCase")]
+pub struct MediaSource {
+    pub id: String,
+    #[serde(default)]
+    pub media_streams: Vec<MediaStream>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "PascalCase")]
+pub struct MediaStream {
+    #[serde(rename = "Type")]
+    pub kind: String,
+    pub index: i64,
+    pub codec: Option<String>,
+    pub language: Option<String>,
+    pub title: Option<String>,
+    #[serde(default)]
+    pub is_external: bool,
+}
+
+impl PlaybackInfo {
+    /// Subtitle files stored next to the video on the server. Subtitles
+    /// inside the video file aren't listed: mpv finds those itself.
+    /// `base` is the server address; URLs need the auth header to download.
+    pub fn external_subtitles(&self, base: &str, item_id: &str) -> Vec<ExternalSubtitle> {
+        let Some(source) = self.media_sources.first() else {
+            return Vec::new();
+        };
+        source
+            .media_streams
+            .iter()
+            .filter(|s| s.kind == "Subtitle" && s.is_external)
+            .map(|s| {
+                let codec = s.codec.as_deref().unwrap_or("srt").to_ascii_lowercase();
+                // Jellyfin converts text formats on request; others are sent as-is.
+                let format = match codec.as_str() {
+                    "subrip" | "srt" => "srt",
+                    "webvtt" | "vtt" => "vtt",
+                    "ass" | "ssa" => codec.as_str(),
+                    "pgssub" => "sup",
+                    other => other,
+                };
+                ExternalSubtitle {
+                    url: format!(
+                        "{base}/Videos/{item_id}/{}/Subtitles/{}/Stream.{format}",
+                        source.id, s.index
+                    ),
+                    title: s.title.clone(),
+                    lang: s.language.clone().filter(|l| l != "und"),
+                }
+            })
+            .collect()
+    }
 }
 
 /// A piece of server artwork to download for an item's card.
@@ -191,9 +265,17 @@ pub fn parse_timestamp(s: &str) -> Option<i64> {
     Some(days * 86_400 + h * 3_600 + mi * 60 + sec)
 }
 
-/// Accepts what people type: `jellyfin.local:8096`, `https://host/jf/`, ...
+/// Accepts what people type or paste: `jellyfin.local:8096`, `https://host/jf/`,
+/// or a web-app link such as `http://host:8096/web/#/video`.
 pub fn normalize_url(input: &str) -> String {
-    let trimmed = input.trim().trim_end_matches('/');
+    let without_fragment = input.trim().split(['#', '?']).next().unwrap_or_default();
+    let mut trimmed = without_fragment.trim_end_matches('/');
+    for suffix in ["/web/index.html", "/web"] {
+        if let Some(base) = trimmed.strip_suffix(suffix) {
+            trimmed = base.trim_end_matches('/');
+            break;
+        }
+    }
     if trimmed.contains("://") {
         trimmed.to_string()
     } else {
@@ -261,6 +343,34 @@ mod tests {
     }
 
     #[test]
+    fn external_subtitles_get_download_urls() {
+        let info: PlaybackInfo = serde_json::from_str(
+            r#"{"MediaSources": [{"Id": "src1", "MediaStreams": [
+                {"Type": "Video", "Index": 0, "Codec": "hevc"},
+                {"Type": "Subtitle", "Index": 2, "Codec": "subrip", "Language": "eng", "IsExternal": false},
+                {"Type": "Subtitle", "Index": 3, "Codec": "subrip", "Language": "ukr", "Title": "Full", "IsExternal": true},
+                {"Type": "Subtitle", "Index": 4, "Codec": "ass", "Language": "und", "IsExternal": true}
+            ]}]}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            info.external_subtitles("http://nas:8096", "item1"),
+            vec![
+                ExternalSubtitle {
+                    url: "http://nas:8096/Videos/item1/src1/Subtitles/3/Stream.srt".into(),
+                    title: Some("Full".into()),
+                    lang: Some("ukr".into()),
+                },
+                ExternalSubtitle {
+                    url: "http://nas:8096/Videos/item1/src1/Subtitles/4/Stream.ass".into(),
+                    title: None,
+                    lang: None,
+                },
+            ]
+        );
+    }
+
+    #[test]
     fn timestamps() {
         assert_eq!(parse_timestamp("1970-01-01T00:00:00Z"), Some(0));
         assert_eq!(parse_timestamp("2000-03-01T00:00:00.5Z"), Some(951_868_800));
@@ -275,6 +385,14 @@ mod tests {
         );
         assert_eq!(
             normalize_url("https://example.com/jf/"),
+            "https://example.com/jf"
+        );
+        assert_eq!(
+            normalize_url("http://moto-moto-srv.local:8096/web/#/video"),
+            "http://moto-moto-srv.local:8096"
+        );
+        assert_eq!(
+            normalize_url("https://example.com/jf/web/index.html#/home.html"),
             "https://example.com/jf"
         );
     }

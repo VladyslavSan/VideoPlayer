@@ -7,7 +7,10 @@ use serde::Serialize;
 use serde::de::DeserializeOwned;
 use ureq::{Agent, ResponseExt};
 
-use super::{AuthResult, BaseItem, ImageRef, ItemsPage, PublicInfo, Server, seconds_to_ticks};
+use super::{
+    AuthResult, BaseItem, ImageRef, ItemsPage, PlaybackInfo, PublicInfo, Server, seconds_to_ticks,
+};
+use crate::video::ExternalSubtitle;
 
 const CLIENT_NAME: &str = "VideoPlayer";
 const PAGE_SIZE: usize = 500;
@@ -37,7 +40,7 @@ struct Login<'a> {
 
 #[derive(Serialize)]
 #[serde(rename_all = "PascalCase")]
-struct PlaybackInfo<'a> {
+struct PlaybackReportBody<'a> {
     item_id: &'a str,
     position_ticks: i64,
     is_paused: bool,
@@ -200,6 +203,19 @@ impl Client {
         Ok(())
     }
 
+    /// External subtitle files for an item, ready to hand to mpv.
+    pub fn external_subtitles(
+        &self,
+        user_id: &str,
+        item_id: &str,
+    ) -> Result<Vec<ExternalSubtitle>> {
+        let info: PlaybackInfo = self.get_json(
+            &format!("/Items/{item_id}/PlaybackInfo"),
+            &[("userId", user_id.to_string())],
+        )?;
+        Ok(info.external_subtitles(&self.base, item_id))
+    }
+
     /// The original file, streamed without transcoding (keeps HDR intact).
     pub fn stream_url(&self, item_id: &str) -> String {
         self.url(&format!("/Videos/{item_id}/stream?static=true"))
@@ -226,7 +242,7 @@ impl Client {
             .agent
             .post(&self.url(path))
             .header("Authorization", &self.authorization())
-            .send_json(PlaybackInfo {
+            .send_json(PlaybackReportBody {
                 item_id,
                 position_ticks: seconds_to_ticks(position),
                 is_paused: paused,
