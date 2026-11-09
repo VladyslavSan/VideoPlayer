@@ -1,16 +1,18 @@
 //! App shell: the library screens (local folders and Jellyfin), the Jellyfin
 //! sign-in screen, and switching to and from the player.
 
+use std::cell::Cell;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::rc::Rc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context as _, Result, bail};
 use gpui::{
-    AnyElement, ClickEvent, Context, ElementId, Entity, FocusHandle, Focusable, FontWeight,
-    KeyDownEvent, MouseDownEvent, ObjectFit, PathPromptOptions, SharedString, Subscription, Window,
-    div, img, prelude::*, px, rgb, rgba,
+    AnyElement, Bounds, ClickEvent, Context, ElementId, Entity, FocusHandle, Focusable,
+    FontWeight, KeyDownEvent, MouseDownEvent, ObjectFit, PathPromptOptions, Pixels, ScrollHandle,
+    SharedString, Subscription, Window, canvas, div, img, point, prelude::*, px, rgb, rgba,
 };
 
 use crate::jellyfin::{
@@ -125,7 +127,23 @@ struct Card {
     subtitle: Option<String>,
     progress: Option<f32>,
     watched: bool,
+    /// Ringed: the episode a show page was opened at.
+    highlight: bool,
 }
+
+/// How long a show page opened at an episode keeps it in place while the
+/// page above it settles.
+const FOCUS_SCROLL_SETTLE: Duration = Duration::from_millis(1500);
+
+struct FocusScroll {
+    until: Instant,
+    /// The offset last set; a different one means the viewer scrolled.
+    applied: Option<Pixels>,
+}
+
+/// What clicking a card's text (below the picture) does, if it differs
+/// from clicking the picture.
+type TextClick = Box<dyn Fn(&mut Shell, &mut Window, &mut Context<Shell>)>;
 
 struct ActivePlayer {
     view: Entity<Player>,
@@ -189,6 +207,17 @@ pub struct Shell {
     starting: Option<String>,
     /// When the Jellyfin libraries were last fetched.
     remote_refreshed: Option<Instant>,
+    /// The scrolling page (everything but the virtualized grids).
+    content_scroll: ScrollHandle,
+    /// The screen the page was last drawn for; a new one starts at the top.
+    scrolled_screen: Option<Screen>,
+    /// On a show page: the episode it was opened at (by item key), ringed.
+    focus_episode: Option<String>,
+    /// Where the focused episode's card was last drawn, and whether the
+    /// page should still scroll to it.
+    focus_bounds: Rc<Cell<Option<Bounds<Pixels>>>>,
+    /// Scrolling to that card, while the page settles.
+    focus_scroll: Option<FocusScroll>,
 }
 
 impl Shell {
@@ -233,6 +262,11 @@ impl Shell {
             reports: reports::Reports::default(),
             starting: None,
             remote_refreshed: None,
+            content_scroll: ScrollHandle::new(),
+            scrolled_screen: None,
+            focus_episode: None,
+            focus_bounds: Rc::default(),
+            focus_scroll: None,
             player: None,
             scanning: false,
             loading_servers: HashSet::new(),
@@ -1417,9 +1451,13 @@ impl Shell {
             .into_any_element()
     }
 
+    /// A poster card. Clicking it calls `on_click`; with `on_text_click`,
+    /// the title and subtitle below the picture act on their own (like a
+    /// link to the show under an episode).
     fn card(
         &self,
         card: Card,
+        on_text_click: Option<TextClick>,
         cx: &mut Context<Self>,
         on_click: impl Fn(&mut Self, &mut Window, &mut Context<Self>) + 'static,
     ) -> AnyElement {
@@ -1430,7 +1468,9 @@ impl Shell {
             subtitle,
             progress,
             watched,
+            highlight,
         } = card;
+        let text_id = ElementId::NamedChild(Box::new(id.clone()), "text".into());
         let color = PLACEHOLDER_COLORS
             [title.bytes().map(usize::from).sum::<usize>() % PLACEHOLDER_COLORS.len()];
         let initial: String = title.chars().next().map(String::from).unwrap_or_default();
@@ -1473,7 +1513,17 @@ impl Shell {
                     .rounded_lg()
                     .overflow_hidden()
                     .bg(rgb(color))
+                    .when(highlight, |d| d.border_2().border_color(rgb(ACCENT)))
                     .child(art)
+                    .children(highlight.then(|| {
+                        // Records where the card is, so the page can scroll to it.
+                        let bounds = self.focus_bounds.clone();
+                        canvas(move |b, _, _| bounds.set(Some(b)), |_, _, _, _| {})
+                            .absolute()
+                            .top_0()
+                            .left_0()
+                            .size_full()
+                    }))
                     .children(progress.map(|p| {
                         div()
                             .absolute()
@@ -1498,18 +1548,33 @@ impl Shell {
             )
             .child(
                 div()
-                    .text_sm()
-                    .font_weight(FontWeight::MEDIUM)
-                    .truncate()
-                    .child(title),
-            )
-            .child(
-                div()
-                    .h(px(16.0))
-                    .text_xs()
-                    .text_color(rgb(MUTED))
-                    .truncate()
-                    .child(subtitle.unwrap_or_default()),
+                    .id(text_id)
+                    .flex()
+                    .flex_col()
+                    .gap_2()
+                    .child(
+                        div()
+                            .text_sm()
+                            .font_weight(FontWeight::MEDIUM)
+                            .truncate()
+                            .child(title),
+                    )
+                    .child(
+                        div()
+                            .h(px(16.0))
+                            .text_xs()
+                            .text_color(rgb(MUTED))
+                            .truncate()
+                            .child(subtitle.unwrap_or_default()),
+                    )
+                    .when_some(on_text_click, |d, on_text_click| {
+                        d.hover(|s| s.underline())
+                            .on_click(cx.listener(move |this, _: &ClickEvent, window, cx| {
+                                // Instead of the card's own action.
+                                cx.stop_propagation();
+                                on_text_click(this, window, cx)
+                            }))
+                    }),
             )
             .on_click(
                 cx.listener(move |this, _: &ClickEvent, window, cx| on_click(this, window, cx)),
@@ -1542,9 +1607,18 @@ impl Shell {
             subtitle,
             progress: item.progress(),
             watched: item.watched,
+            highlight: !show_context && self.focus_episode.as_ref() == Some(&key),
         };
+        // An episode shown with its show's name (Continue Watching, search):
+        // the name leads to the show, at this episode.
+        let text_click: Option<TextClick> = (show_context && item.is_episode()).then(|| {
+            let key = key.clone();
+            Box::new(move |this: &mut Self, _: &mut Window, cx: &mut Context<Self>| {
+                this.open_show_at(&key, cx)
+            }) as TextClick
+        });
         let open_details = !item.is_episode() && prefix != "continue";
-        self.card(card, cx, move |this, window, cx| {
+        self.card(card, text_click, cx, move |this, window, cx| {
             if open_details {
                 this.open_details(key.clone(), cx)
             } else {
@@ -1614,6 +1688,57 @@ impl Shell {
                     })),
             )
             .into_any_element()
+    }
+
+    /// The show page of an episode's show, scrolled to that episode, which
+    /// is ringed.
+    fn open_show_at(&mut self, key: &str, cx: &mut Context<Self>) {
+        let Some(show) = self.items().find(|i| i.key() == key).and_then(|i| i.show.clone())
+        else {
+            return;
+        };
+        self.open_show(show, cx);
+        self.focus_episode = Some(key.to_string());
+        self.focus_bounds.set(None);
+        self.focus_scroll = Some(FocusScroll {
+            until: Instant::now() + FOCUS_SCROLL_SETTLE,
+            applied: None,
+        });
+    }
+
+    /// Scrolling for the page about to be drawn: a new screen starts at the
+    /// top; a show page opened at an episode scrolls to it. The card's
+    /// position is only known once it's been drawn, and the page above it
+    /// can still grow (the show's details arrive), so the scroll is redone
+    /// each frame for a moment, unless the viewer scrolls first.
+    fn update_scroll(&mut self, window: &mut Window) {
+        if self.scrolled_screen.as_ref() != Some(&self.screen) {
+            self.scrolled_screen = Some(self.screen.clone());
+            self.content_scroll.set_offset(point(px(0.0), px(0.0)));
+        }
+        let Some(focus) = &mut self.focus_scroll else {
+            return;
+        };
+        let handle = &self.content_scroll;
+        let offset = handle.offset();
+        let scrolled_away = focus.applied.is_some_and(|y| y != offset.y);
+        if Instant::now() >= focus.until || scrolled_away {
+            self.focus_scroll = None;
+            return;
+        }
+        window.request_animation_frame();
+        let Some(card) = self.focus_bounds.get() else {
+            return; // not drawn yet
+        };
+        let (viewport, max) = (handle.bounds(), handle.max_offset());
+        // Room above the card for its season's heading.
+        const ABOVE: f32 = 64.0;
+        let in_content = card.top() - offset.y;
+        let y = (viewport.top() + px(ABOVE) - in_content).clamp(-max.height, px(0.0));
+        if y != offset.y {
+            handle.set_offset(point(offset.x, y));
+        }
+        focus.applied = Some(y);
     }
 
     fn show_page(&self, show: &str, cx: &mut Context<Self>) -> Vec<AnyElement> {
@@ -1825,6 +1950,7 @@ impl Render for Shell {
                 .child(player.view.clone())
                 .into_any_element();
         }
+        self.update_scroll(window);
         let query = self.search_query(cx);
         let on_tab = matches!(self.screen, Screen::Home | Screen::Movies | Screen::Shows);
         let body: Result<Vec<AnyElement>, AnyElement> = match self.screen.clone() {
@@ -1843,6 +1969,7 @@ impl Render for Shell {
                 .flex_1()
                 .min_h(px(0.0))
                 .overflow_y_scroll()
+                .track_scroll(&self.content_scroll)
                 .px_8()
                 .pb_10()
                 .children(sections)

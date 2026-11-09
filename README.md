@@ -83,7 +83,9 @@ Press **F1** (or `?`) in the player to see all shortcuts.
 ## Library
 
 The library has three tabs. **Home** shows Continue Watching (including the next episode of
-shows you're watching), recently added movies and recently updated shows. **Movies** and
+shows you're watching), recently added movies and recently updated shows. Clicking an episode's
+picture plays it; clicking the text under it opens its show at that season, with the episode
+highlighted. **Movies** and
 **TV Shows** are full grids with sorting (title, recently added, recently watched, year); they
 only draw the rows on screen, so large libraries stay fast. **Search** (Ctrl+F) matches
 movies, shows and episode titles; Esc clears it.

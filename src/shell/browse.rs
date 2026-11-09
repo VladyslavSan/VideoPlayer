@@ -155,7 +155,8 @@ impl Shell {
         self.search.read(cx).text().trim().to_string()
     }
 
-    fn open_show(&mut self, name: String, cx: &mut Context<Self>) {
+    pub(super) fn open_show(&mut self, name: String, cx: &mut Context<Self>) {
+        self.focus_episode = None;
         // The show's overview and backdrop come from the server, via any of
         // its episodes there.
         let episode = self
@@ -186,8 +187,9 @@ impl Shell {
             subtitle: Some(show.subtitle()),
             progress: None,
             watched: show.unwatched == 0,
+            highlight: false,
         };
-        self.card(card, cx, move |this, _, cx| {
+        self.card(card, None, cx, move |this, _, cx| {
             this.open_show(name.clone(), cx)
         })
     }
