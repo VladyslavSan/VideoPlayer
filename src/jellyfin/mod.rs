@@ -99,7 +99,11 @@ pub struct BaseItem {
     pub date_created: Option<String>,
     /// The library it was listed in. Not a server field: set when the
     /// library is fetched, and kept in the cache.
-    #[serde(default, rename = "VideoPlayerLibrary", skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        rename = "VideoPlayerLibrary",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub library: Option<Library>,
 }
 
@@ -788,8 +792,8 @@ mod tests {
             "https://example.com/jf"
         );
         assert_eq!(
-            normalize_url("http://moto-moto-srv.local:8096/web/#/video"),
-            "http://moto-moto-srv.local:8096"
+            normalize_url("http://jellyfin.local:8096/web/#/video"),
+            "http://jellyfin.local:8096"
         );
         assert_eq!(
             normalize_url("https://example.com/jf/web/index.html#/home.html"),

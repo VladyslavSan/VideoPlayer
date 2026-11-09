@@ -45,8 +45,15 @@ impl View {
     fn browsable(&self) -> bool {
         match self.collection_type.as_deref() {
             None => true,
-            Some(kind) => ["movies", "tvshows", "mixed", "homevideos", "musicvideos", "folders"]
-                .contains(&kind),
+            Some(kind) => [
+                "movies",
+                "tvshows",
+                "mixed",
+                "homevideos",
+                "musicvideos",
+                "folders",
+            ]
+            .contains(&kind),
         }
     }
 }
@@ -106,7 +113,7 @@ impl Client {
     }
 
     fn authorization(&self) -> String {
-        let device = std::env::var("COMPUTERNAME").unwrap_or_else(|_| "Windows".into());
+        let device = device_name();
         let mut value = format!(
             r#"MediaBrowser Client="{CLIENT_NAME}", Device="{device}", DeviceId="{}", Version="{}""#,
             self.device_id,
@@ -528,6 +535,31 @@ impl Client {
             })?;
         Self::check(&response, path)
     }
+}
+
+/// This computer's name, shown in Jellyfin's device list.
+fn device_name() -> &'static str {
+    static NAME: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    NAME.get_or_init(|| {
+        #[cfg(target_os = "macos")]
+        let name = std::process::Command::new("scutil")
+            .args(["--get", "ComputerName"])
+            .output()
+            .ok()
+            .and_then(|out| String::from_utf8(out.stdout).ok())
+            .map(|name| name.trim().replace('"', ""))
+            .filter(|name| !name.is_empty());
+        #[cfg(not(target_os = "macos"))]
+        let name = std::env::var("COMPUTERNAME").ok();
+        name.unwrap_or_else(|| {
+            if cfg!(target_os = "macos") {
+                "Mac"
+            } else {
+                "Windows"
+            }
+            .into()
+        })
+    })
 }
 
 /// `https://host/jf/System/Info/Public` -> `https://host/jf`.

@@ -193,9 +193,7 @@ impl Shell {
         let (mut local_movies, mut local_shows) = (false, false);
         for item in self.items() {
             match &item.library {
-                Some(l) if !libraries.iter().any(|known| known.name == l.name) => {
-                    libraries.push(l)
-                }
+                Some(l) if !libraries.iter().any(|known| known.name == l.name) => libraries.push(l),
                 Some(_) => {}
                 None if item.is_episode() => local_shows = true,
                 None => local_movies = true,
@@ -604,7 +602,13 @@ impl Shell {
             .gap_1()
             .child(tab("tab-home".into(), "Home".into(), Screen::Home, cx))
             .children(libraries)
-            .child(div().w(px(260.0)).flex_none().ml_4().child(self.search.clone()))
+            .child(
+                div()
+                    .w(px(260.0))
+                    .flex_none()
+                    .ml_4()
+                    .child(self.search.clone()),
+            )
             .into_any_element()
     }
 }

@@ -1,70 +1,19 @@
-//! Native video layer: a child window owned by the GPUI window, with mpv
-//! rendering into it. GPUI's DirectComposition tree is topmost, so the UI is
-//! drawn above this window without a second top-level window.
+//! Native video layer: mpv drawing below the GPUI window's contents. How it
+//! gets there is platform-specific (see `win` and `mac`); the rest is mpv.
 
-use std::sync::Once;
+#[cfg(target_os = "macos")]
+mod mac;
+#[cfg(windows)]
+mod win;
 
-use anyhow::{Context as _, Result, anyhow};
+use anyhow::{Result, anyhow};
+use gpui::Window;
 use libmpv2::Mpv;
-use windows::Win32::Foundation::{HINSTANCE, HWND, LPARAM, LRESULT, RECT, WPARAM};
-use windows::Win32::Graphics::Gdi::{BLACK_BRUSH, GetStockObject, HBRUSH};
-use windows::Win32::System::LibraryLoader::GetModuleHandleW;
-use windows::Win32::UI::WindowsAndMessaging::{
-    CreateWindowExW, DefWindowProcW, DestroyWindow, GetClientRect, RegisterClassW, SWP_NOACTIVATE,
-    SWP_NOZORDER, SetWindowPos, WINDOW_EX_STYLE, WNDCLASSW, WS_CHILD, WS_CLIPCHILDREN, WS_DISABLED,
-    WS_VISIBLE,
-};
-use windows::core::w;
 
-/// Child window that hosts mpv. It stays disabled so that mouse input falls
-/// through to the GPUI window instead of being swallowed by the video.
-struct Host(HWND);
-
-impl Drop for Host {
-    fn drop(&mut self) {
-        unsafe {
-            let _ = DestroyWindow(self.0);
-        }
-    }
-}
-
-unsafe extern "system" fn host_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRESULT {
-    unsafe { DefWindowProcW(hwnd, msg, wp, lp) }
-}
-
-fn create_host(parent: HWND) -> Result<Host> {
-    static REGISTER: Once = Once::new();
-    let instance: HINSTANCE = unsafe { GetModuleHandleW(None)? }.into();
-    REGISTER.call_once(|| unsafe {
-        RegisterClassW(&WNDCLASSW {
-            lpfnWndProc: Some(host_proc),
-            hInstance: instance,
-            hbrBackground: HBRUSH(GetStockObject(BLACK_BRUSH).0),
-            lpszClassName: w!("VideoPlayerHost"),
-            ..Default::default()
-        });
-    });
-
-    let mut client = RECT::default();
-    unsafe { GetClientRect(parent, &mut client)? };
-    let hwnd = unsafe {
-        CreateWindowExW(
-            WINDOW_EX_STYLE(0),
-            w!("VideoPlayerHost"),
-            w!(""),
-            WS_CHILD | WS_VISIBLE | WS_DISABLED | WS_CLIPCHILDREN,
-            0,
-            0,
-            client.right,
-            client.bottom,
-            Some(parent),
-            None,
-            Some(instance),
-            None,
-        )?
-    };
-    Ok(Host(hwnd))
-}
+#[cfg(target_os = "macos")]
+use mac::Host;
+#[cfg(windows)]
+use win::Host;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TrackKind {
@@ -112,29 +61,34 @@ pub struct ExternalSubtitle {
 }
 
 pub struct VideoSurface {
-    // Field order matters: mpv must shut down before its window is destroyed.
-    mpv: Mpv,
+    // Field order matters. On macOS the host owns mpv's render context,
+    // which must be freed before mpv; on Windows mpv must shut down before
+    // its window is destroyed.
+    #[cfg(target_os = "macos")]
     host: Host,
-    parent: HWND,
+    mpv: Mpv,
+    #[cfg(windows)]
+    host: Host,
 }
 
 impl VideoSurface {
-    /// Starts playing `source` at `start` seconds. `http_header` (for example
-    /// a server token) is sent with every HTTP request mpv makes.
-    pub fn new(parent: HWND, source: &str, start: f64, http_header: Option<&str>) -> Result<Self> {
-        let host = create_host(parent).context("creating the video host window")?;
-        let wid = host.0.0 as i64;
+    /// Starts playing `source` at `start` seconds, below `window`'s
+    /// contents. `http_header` (for example a server token) is sent with
+    /// every HTTP request mpv makes.
+    pub fn new(
+        window: &Window,
+        source: &str,
+        start: f64,
+        http_header: Option<&str>,
+    ) -> Result<Self> {
+        #[cfg(windows)]
+        let host = Host::new(window)?;
         let mpv = Mpv::with_initializer(|init| {
-            init.set_option("wid", wid)?;
-            init.set_option("vo", "gpu-next")?;
-            init.set_option("gpu-api", "d3d11")?;
+            #[cfg(windows)]
+            host.configure(&init)?;
+            #[cfg(target_os = "macos")]
+            Host::configure(&init)?;
             init.set_option("hwdec", "auto-safe")?;
-            init.set_option("target-colorspace-hint", "yes")?;
-            // HDR video goes out as HDR, SDR video as SDR. With the display
-            // in HDR mode, the default sends everything as PQ, and subtitles
-            // blended in PQ lose their antialiasing (a half-covered edge
-            // pixel ends up near black), so their edges look jagged.
-            init.set_option("target-colorspace-hint-mode", "source")?;
             init.set_option("keep-open", "yes")?;
             // Arrow-key skips land exactly, not on the next keyframe.
             init.set_option("hr-seek", "yes")?;
@@ -158,7 +112,9 @@ impl VideoSurface {
             Ok(())
         })
         .map_err(|e| anyhow!("initialising mpv: {e}"))?;
-        let surface = Self { mpv, host, parent };
+        #[cfg(target_os = "macos")]
+        let host = Host::new(window, &mpv)?;
+        let surface = Self { host, mpv };
         surface.load(source, start)?;
         Ok(surface)
     }
@@ -176,22 +132,9 @@ impl VideoSurface {
         self.mpv.get_property("path").ok()
     }
 
-    /// Fits the video to the parent's client area.
+    /// Fits the video to the window, after it was resized.
     pub fn sync_size(&self) {
-        let mut client = RECT::default();
-        unsafe {
-            if GetClientRect(self.parent, &mut client).is_ok() {
-                let _ = SetWindowPos(
-                    self.host.0,
-                    None,
-                    0,
-                    0,
-                    client.right,
-                    client.bottom,
-                    SWP_NOZORDER | SWP_NOACTIVATE,
-                );
-            }
-        }
+        self.host.sync_size();
     }
 
     pub fn position(&self) -> f64 {

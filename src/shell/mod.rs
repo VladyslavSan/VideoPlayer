@@ -10,17 +10,17 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context as _, Result, bail};
 use gpui::{
-    AnyElement, Bounds, ClickEvent, Context, ElementId, Entity, FocusHandle, Focusable,
-    FontWeight, KeyDownEvent, MouseDownEvent, ObjectFit, PathPromptOptions, Pixels, ScrollHandle,
-    SharedString, Subscription, Window, canvas, div, img, point, prelude::*, px, rgb, rgba,
+    AnyElement, Bounds, ClickEvent, Context, ElementId, Entity, FocusHandle, Focusable, FontWeight,
+    KeyDownEvent, MouseDownEvent, ObjectFit, PathPromptOptions, Pixels, ScrollHandle, SharedString,
+    Subscription, Window, canvas, div, img, point, prelude::*, px, rgb, rgba,
 };
 
+use crate::introdb;
 use crate::jellyfin::{
     self, Client, ImageRef, PlaySession, PlaybackInfo, PlaybackReport, QUALITIES, Quality, Server,
     discovery,
 };
 use crate::library::{Db, Item, Source, TrackPrefs, scan, thumbs};
-use crate::introdb;
 use crate::player::{self, Episode, Playback, Player, PlayerEvent, SegmentSource};
 use crate::secrets;
 use crate::ui::menu;
@@ -1356,7 +1356,7 @@ impl Shell {
                 cx.notify();
             }
             (Screen::Home | Screen::Movies(_) | Screen::Shows(_), "f")
-                if event.keystroke.modifiers.control =>
+                if event.keystroke.modifiers.secondary() =>
             {
                 window.focus(&self.search.focus_handle(cx));
                 cx.notify();
@@ -1585,12 +1585,13 @@ impl Shell {
                             .child(subtitle.unwrap_or_default()),
                     )
                     .when_some(on_text_click, |d, on_text_click| {
-                        d.hover(|s| s.underline())
-                            .on_click(cx.listener(move |this, _: &ClickEvent, window, cx| {
+                        d.hover(|s| s.underline()).on_click(cx.listener(
+                            move |this, _: &ClickEvent, window, cx| {
                                 // Instead of the card's own action.
                                 cx.stop_propagation();
                                 on_text_click(this, window, cx)
-                            }))
+                            },
+                        ))
                     }),
             )
             .on_click(
@@ -1630,9 +1631,11 @@ impl Shell {
         // the name leads to the show, at this episode.
         let text_click: Option<TextClick> = (show_context && item.is_episode()).then(|| {
             let key = key.clone();
-            Box::new(move |this: &mut Self, _: &mut Window, cx: &mut Context<Self>| {
-                this.open_show_at(&key, cx)
-            }) as TextClick
+            Box::new(
+                move |this: &mut Self, _: &mut Window, cx: &mut Context<Self>| {
+                    this.open_show_at(&key, cx)
+                },
+            ) as TextClick
         });
         let open_details = !item.is_episode() && prefix != "continue";
         self.card(card, text_click, cx, move |this, window, cx| {
@@ -1710,7 +1713,10 @@ impl Shell {
     /// The show page of an episode's show, scrolled to that episode, which
     /// is ringed.
     fn open_show_at(&mut self, key: &str, cx: &mut Context<Self>) {
-        let Some(show) = self.items().find(|i| i.key() == key).and_then(|i| i.show.clone())
+        let Some(show) = self
+            .items()
+            .find(|i| i.key() == key)
+            .and_then(|i| i.show.clone())
         else {
             return;
         };
@@ -1977,7 +1983,10 @@ impl Render for Shell {
         }
         self.update_scroll(window);
         let query = self.search_query(cx);
-        let on_tab = matches!(self.screen, Screen::Home | Screen::Movies(_) | Screen::Shows(_));
+        let on_tab = matches!(
+            self.screen,
+            Screen::Home | Screen::Movies(_) | Screen::Shows(_)
+        );
         let body: Result<Vec<AnyElement>, AnyElement> = match self.screen.clone() {
             _ if on_tab && !query.is_empty() => Ok(self.search_results(&query, cx)),
             Screen::Home => Ok(self.home(cx)),

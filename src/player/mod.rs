@@ -8,13 +8,11 @@ use std::cell::Cell;
 use std::rc::Rc;
 use std::time::{Duration, Instant};
 
-use anyhow::{Result, anyhow};
+use anyhow::Result;
 use gpui::{
     Bounds, Context, EventEmitter, FocusHandle, KeyDownEvent, MouseButton, MouseDownEvent,
     MouseMoveEvent, MouseUpEvent, Pixels, Point, SharedString, Subscription, Task, Window,
 };
-use raw_window_handle::{HasWindowHandle, RawWindowHandle};
-use windows::Win32::Foundation::HWND;
 
 use crate::jellyfin::Quality;
 use crate::library::{SubtitlePref, TrackPrefs, WATCHED_FRACTION};
@@ -193,14 +191,6 @@ pub struct Player {
 
 impl EventEmitter<PlayerEvent> for Player {}
 
-fn native_hwnd(window: &Window) -> Result<HWND> {
-    let handle = HasWindowHandle::window_handle(window).map_err(|e| anyhow!("{e}"))?;
-    match handle.as_raw() {
-        RawWindowHandle::Win32(h) => Ok(HWND(h.hwnd.get() as *mut _)),
-        other => Err(anyhow!("unsupported window handle: {other:?}")),
-    }
-}
-
 /// Creates the native video layer for `window`. Kept separate from
 /// `Player::new` so failures surface before the view exists.
 pub fn open_video(
@@ -209,7 +199,7 @@ pub fn open_video(
     start: f64,
     http_header: Option<&str>,
 ) -> Result<VideoSurface> {
-    VideoSurface::new(native_hwnd(window)?, source, start, http_header)
+    VideoSurface::new(window, source, start, http_header)
 }
 
 fn format_time(seconds: f64) -> String {

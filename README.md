@@ -1,19 +1,44 @@
 # Video Player
 
-An Infuse-style video player for Windows, built with Rust, [GPUI](https://gpui.rs) and libmpv.
+An Infuse-style video player for Windows and macOS, built with Rust, [GPUI](https://gpui.rs) and libmpv.
+
+## Download
+
+[Releases](../../releases) has a zip for each platform:
+
+- **Windows** (x64): unzip anywhere and run `video-player.exe` (keep `libmpv-2.dll` next to it).
+- **macOS** (Apple Silicon and Intel, macOS 11+): unzip and move **Video Player** to
+  Applications. The app isn't notarized by Apple, so the first time, right-click it and choose
+  **Open** (or run `xattr -dr com.apple.quarantine "/Applications/Video Player.app"`).
 
 ## Setup
 
+Windows (Git Bash, with Visual Studio's C++ tools):
+
 ```sh
-bash scripts/fetch-libmpv.sh   # downloads libmpv into third_party/mpv (Git Bash)
+bash scripts/fetch-libmpv.sh   # downloads libmpv into third_party/mpv
 cargo run -- "D:\path\to\movie.mkv"
+```
+
+macOS (Xcode):
+
+```sh
+bash scripts/fetch-libmpv-macos.sh   # downloads libmpv into third_party/mpv
+cargo run -- ~/Movies/movie.mkv
 ```
 
 ## Architecture
 
-The app uses a single window. mpv renders into a disabled child window, and GPUI's
-DirectComposition layer, which Windows composites above child windows, draws the UI on top.
-mpv keeps its own swapchain, so hardware decoding and HDR output are preserved.
+The app uses a single window, with the video below GPUI's UI.
+
+- **Windows:** mpv renders into a disabled child window, and GPUI's DirectComposition layer,
+  which Windows composites above child windows, draws the UI on top. mpv keeps its own swapchain,
+  so hardware decoding and HDR output are preserved.
+- **macOS:** mpv's `--wid` embedding isn't available there, so mpv draws through its render API
+  into an OpenGL layer in a view below GPUI's Metal view, which is transparent wherever the UI
+  doesn't draw. Decoding still uses VideoToolbox. libmpv comes from
+  [media-kit's builds](https://github.com/media-kit/libmpv-darwin-build) (universal, with all its
+  libraries in the app).
 
 ## Jellyfin
 
@@ -22,7 +47,7 @@ discovery are listed automatically; otherwise type the address (`192.168.1.10:80
 `https://` URL, or a link copied from Jellyfin's web app).
 
 Your password is never stored. The access token Jellyfin issues goes into the system
-credential store (Windows Credential Manager, macOS Keychain, Secret Service on Linux), which
+credential store (Windows Credential Manager or the macOS Keychain), which
 encrypts it for your user account; `library.db` keeps only the server address and user name.
 **Sign Out** revokes the token on the server and deletes it locally.
 
@@ -87,7 +112,7 @@ latest additions to each library. Clicking an episode's picture plays it; clicki
 it opens its show at that season, with the episode highlighted. Each Jellyfin library (Movies,
 Shows, Anime Series, ...) gets its own tab, in the server's order; local folders get **Movies** and
 **TV Shows** tabs. The tabs are full grids with sorting (title, recently added, recently watched,
-year); they only draw the rows on screen, so large libraries stay fast. **Search** (Ctrl+F) matches
+year); they only draw the rows on screen, so large libraries stay fast. **Search** (Ctrl+F, ⌘F on a Mac) matches
 movies, shows and episode titles; Esc clears it.
 
 Selecting a movie opens its details: backdrop, year, runtime, rating, genres, overview, the
@@ -100,7 +125,8 @@ episode names are parsed from file and folder names (`Title (Year)`, `Show.S01E0
 `Show - 1x02`, `Show/Season 1/...`). Thumbnails are taken from a frame of each video.
 Watch progress is saved every 5 seconds, so playback resumes where you left off.
 
-Library data lives in `%LOCALAPPDATA%\VideoPlayer` (the `library.db` file and the `thumbs`
+Library data lives in `%LOCALAPPDATA%\VideoPlayer` on Windows and
+`~/Library/Application Support/VideoPlayer` on macOS (the `library.db` file and the `thumbs`
 folder).
 
 ## Development
@@ -112,10 +138,23 @@ folder).
 - `cargo run -- <file>`: play a file directly, without the library
 - `python scripts/make_icon.py`: redraw `assets/app.ico` (embedded in the exe via `assets/app.rc`)
 
-Release builds have no console window; their diagnostics go to
-`%LOCALAPPDATA%\VideoPlayer\app.log` (the previous run's log is kept as `app.previous.log`).
+Release builds have no console window; their diagnostics go to `app.log` in the data folder
+(the previous run's log is kept as `app.previous.log`).
 
-## Install
+## Releases
+
+Pushing a version tag builds both apps on GitHub Actions, runs the tests on each, and publishes
+a release with the two zips (`.github/workflows/release.yml`):
+
+```sh
+git tag v0.2.0 && git push origin v0.2.0
+```
+
+The tag sets the version; Cargo.toml's is replaced during the build. Running the workflow by
+hand (Actions > Release > Run workflow) builds and tests without publishing.
+`scripts/bundle-macos.sh` builds the macOS app locally.
+
+## Install from source (Windows)
 
 ```powershell
 powershell -ExecutionPolicy Bypass -File scripts\install.ps1
@@ -128,4 +167,5 @@ settings stay).
 
 ## Licensing
 
-The prebuilt libmpv in `scripts/fetch-libmpv.sh` is a GPL build.
+The prebuilt libmpv in `scripts/fetch-libmpv.sh` (Windows) is a GPL build; the macOS one from
+media-kit is LGPL.

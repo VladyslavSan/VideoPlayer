@@ -6306,6 +6306,8 @@ dependencies = [
  "gpui",
  "keyring",
  "libmpv2",
+ "libmpv2-sys",
+ "objc",
  "raw-window-handle",
  "regex",
  "rusqlite",
