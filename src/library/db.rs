@@ -402,6 +402,7 @@ impl Db {
 fn item_from_row(r: &Row) -> rusqlite::Result<Item> {
     let thumb: Option<String> = r.get(11)?;
     Ok(Item {
+        library: None,
         source: Source::Local {
             id: r.get(0)?,
             path: PathBuf::from(r.get::<_, String>(1)?),

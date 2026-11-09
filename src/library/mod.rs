@@ -8,6 +8,7 @@ pub mod thumbs;
 
 use std::collections::BTreeMap;
 use std::path::PathBuf;
+use std::sync::Arc;
 
 pub use db::Db;
 
@@ -50,8 +51,22 @@ pub enum Source {
     Jellyfin { server: i64, id: String },
 }
 
+/// A library on a Jellyfin server ("Movies", "Anime Series", ...), which
+/// gets its own tab.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+pub struct Library {
+    pub name: String,
+    /// Where the server lists it among the user's libraries.
+    pub order: u16,
+    /// Browsed by show (a TV library) rather than by title.
+    pub shows: bool,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct Item {
+    /// The Jellyfin library it's in; None for local files (and for items
+    /// cached before libraries were tracked).
+    pub library: Option<Arc<Library>>,
     pub source: Source,
     /// Movie title, or episode title.
     pub title: String,
@@ -166,6 +181,7 @@ mod tests {
 
     fn episode(show: &str, season: u16, number: u16) -> Item {
         Item {
+            library: None,
             source: Source::Jellyfin {
                 server: 1,
                 id: format!("{show}-{season}-{number}"),

@@ -12,7 +12,7 @@ use gpui::{
 };
 
 use super::{CARD_WIDTH, Card, MUTED, Screen, Shell, TEXT};
-use crate::library::{self, Item};
+use crate::library::{self, Item, Library};
 
 /// Horizontal padding of the content area and the gap between cards.
 const PAGE_PADDING: f32 = 32.0;
@@ -132,23 +132,98 @@ fn columns(window: &Window) -> usize {
     (((width + CARD_GAP) / (CARD_WIDTH + CARD_GAP)).floor() as usize).max(1)
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Grid {
-    Movies,
-    Shows,
+/// A grid tab: the movies, or the shows, of one library. `library` is a
+/// Jellyfin library's name; None means items in no library (local folders).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Grid {
+    pub shows: bool,
+    pub library: Option<String>,
+}
+
+impl Grid {
+    pub fn of(screen: &Screen) -> Option<Grid> {
+        match screen {
+            Screen::Movies(library) => Some(Grid {
+                shows: false,
+                library: library.clone(),
+            }),
+            Screen::Shows(library) => Some(Grid {
+                shows: true,
+                library: library.clone(),
+            }),
+            _ => None,
+        }
+    }
+
+    fn contains(&self, item: &Item) -> bool {
+        item.is_episode() == self.shows
+            && item.library.as_ref().map(|l| l.name.as_str()) == self.library.as_deref()
+    }
+
+    fn id(&self) -> SharedString {
+        format!(
+            "{}-grid-{}",
+            if self.shows { "shows" } else { "movies" },
+            self.library.as_deref().unwrap_or("")
+        )
+        .into()
+    }
 }
 
 impl Shell {
-    pub(super) fn movies(&self) -> Vec<&Item> {
-        let mut movies: Vec<&Item> = self.items().filter(|i| !i.is_episode()).collect();
+    /// Movies in `grid`, in the chosen order.
+    pub(super) fn movies(&self, grid: &Grid) -> Vec<&Item> {
+        let mut movies: Vec<&Item> = self.items().filter(|i| grid.contains(i)).collect();
         sort_movies(&mut movies, self.movie_sort);
         movies
     }
 
-    pub(super) fn shows(&self) -> Vec<ShowSummary> {
-        let mut shows = show_summaries(self.items());
+    /// Shows in `grid`, in the chosen order.
+    pub(super) fn shows(&self, grid: &Grid) -> Vec<ShowSummary> {
+        let mut shows = show_summaries(self.items().filter(|i| grid.contains(i)));
         sort_shows(&mut shows, self.show_sort);
         shows
+    }
+
+    /// The library tabs after Home: one per Jellyfin library, in the
+    /// server's order, then Movies / TV Shows for local folders. With no
+    /// libraries at all, plain Movies and TV Shows.
+    pub(super) fn library_tabs(&self) -> Vec<(String, Screen)> {
+        let mut libraries: Vec<&Library> = Vec::new();
+        let (mut local_movies, mut local_shows) = (false, false);
+        for item in self.items() {
+            match &item.library {
+                Some(l) if !libraries.iter().any(|known| known.name == l.name) => {
+                    libraries.push(l)
+                }
+                Some(_) => {}
+                None if item.is_episode() => local_shows = true,
+                None => local_movies = true,
+            }
+        }
+        libraries.sort_by_key(|l| l.order);
+        let named = !libraries.is_empty();
+        let mut tabs: Vec<(String, Screen)> = libraries
+            .into_iter()
+            .map(|l| {
+                let library = Some(l.name.clone());
+                let screen = if l.shows {
+                    Screen::Shows(library)
+                } else {
+                    Screen::Movies(library)
+                };
+                (l.name.clone(), screen)
+            })
+            .collect();
+        if local_movies || !named {
+            let label = if named { "Local Movies" } else { "Movies" };
+            tabs.push((label.into(), Screen::Movies(None)));
+        }
+        if local_shows || !named {
+            let label = if named { "Local Shows" } else { "TV Shows" };
+            tabs.push((label.into(), Screen::Shows(None)));
+        }
+        tabs
     }
 
     pub(super) fn search_query(&self, cx: &Context<Self>) -> String {
@@ -197,12 +272,13 @@ impl Shell {
     /// A titled, sideways-scrolling row, optionally with "See all".
     fn row(
         &self,
-        id: &'static str,
+        id: impl Into<SharedString>,
         title: &str,
         cards: Vec<AnyElement>,
         see_all: Option<Screen>,
         cx: &mut Context<Self>,
     ) -> AnyElement {
+        let id: SharedString = id.into();
         div()
             .flex()
             .flex_col()
@@ -274,46 +350,47 @@ impl Shell {
             rows.push(self.row("continue-row", "Continue Watching", cards, None, cx));
         }
 
-        let mut movies: Vec<&Item> = self.items().filter(|i| !i.is_episode()).collect();
-        if !movies.is_empty() {
-            sort_movies(&mut movies, Sort::RecentlyAdded);
-            let cards = movies
-                .into_iter()
-                .take(ROW_LIMIT)
-                .map(|i| self.item_card("recent-movie", i, true, cx))
-                .collect();
-            rows.push(self.row(
-                "recent-movies",
-                "Recently Added Movies",
-                cards,
-                Some(Screen::Movies),
-                cx,
-            ));
-        }
-
-        let mut shows = show_summaries(self.items());
-        if !shows.is_empty() {
-            sort_shows(&mut shows, Sort::RecentlyAdded);
-            let cards = shows
-                .iter()
-                .take(ROW_LIMIT)
-                .map(|s| self.show_card("recent", s, cx))
-                .collect();
-            rows.push(self.row(
-                "recent-shows",
-                "Recently Updated Shows",
-                cards,
-                Some(Screen::Shows),
-                cx,
-            ));
+        // The newest in each library, like Jellyfin's "Latest ..." rows.
+        for (label, screen) in self.library_tabs() {
+            let Some(grid) = Grid::of(&screen) else {
+                continue;
+            };
+            let title = match (&grid.library, grid.shows) {
+                (Some(_), _) => format!("Latest {label}"),
+                (None, false) => format!("Recently Added {label}"),
+                (None, true) => format!("Recently Updated {label}"),
+            };
+            let id = grid.id();
+            let cards: Vec<AnyElement> = if grid.shows {
+                let mut shows = show_summaries(self.items().filter(|i| grid.contains(i)));
+                sort_shows(&mut shows, Sort::RecentlyAdded);
+                shows
+                    .iter()
+                    .take(ROW_LIMIT)
+                    .map(|s| self.show_card(&format!("recent-{id}"), s, cx))
+                    .collect()
+            } else {
+                let mut movies: Vec<&Item> = self.items().filter(|i| grid.contains(i)).collect();
+                sort_movies(&mut movies, Sort::RecentlyAdded);
+                movies
+                    .into_iter()
+                    .take(ROW_LIMIT)
+                    .map(|i| self.item_card(&format!("recent-{id}"), i, true, cx))
+                    .collect()
+            };
+            if !cards.is_empty() {
+                rows.push(self.row(id, &title, cards, Some(screen), cx));
+            }
         }
         rows
     }
 
-    fn sort_bar(&self, grid: Grid, count: usize, cx: &mut Context<Self>) -> AnyElement {
-        let (current, options, noun) = match grid {
-            Grid::Movies => (self.movie_sort, &MOVIE_SORTS[..], "movies"),
-            Grid::Shows => (self.show_sort, &SHOW_SORTS[..], "shows"),
+    fn sort_bar(&self, grid: &Grid, count: usize, cx: &mut Context<Self>) -> AnyElement {
+        let shows = grid.shows;
+        let (current, options, noun) = if shows {
+            (self.show_sort, &SHOW_SORTS[..], "shows")
+        } else {
+            (self.movie_sort, &MOVIE_SORTS[..], "movies")
         };
         div()
             .flex()
@@ -342,9 +419,10 @@ impl Shell {
                     .hover(|d| d.bg(rgba(0xffffff1f)))
                     .child(sort.label())
                     .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
-                        match grid {
-                            Grid::Movies => this.movie_sort = sort,
-                            Grid::Shows => this.show_sort = sort,
+                        if shows {
+                            this.show_sort = sort;
+                        } else {
+                            this.movie_sort = sort;
                         }
                         cx.notify();
                     }))
@@ -353,22 +431,24 @@ impl Shell {
             .into_any_element()
     }
 
-    /// The Movies or TV Shows tab: a sort bar over a grid that only builds
-    /// the rows on screen.
+    /// A library tab: a sort bar over a grid that only builds the rows on
+    /// screen.
     pub(super) fn library_grid(
         &self,
         grid: Grid,
         window: &Window,
         cx: &mut Context<Self>,
     ) -> AnyElement {
-        let count = match grid {
-            Grid::Movies => self.items().filter(|i| !i.is_episode()).count(),
-            Grid::Shows => show_summaries(self.items()).len(),
+        let count = if grid.shows {
+            show_summaries(self.items().filter(|i| grid.contains(i))).len()
+        } else {
+            self.items().filter(|i| grid.contains(i)).count()
         };
         if count == 0 {
-            let message = match grid {
-                Grid::Movies => "No movies yet.",
-                Grid::Shows => "No TV shows yet.",
+            let message = if grid.shows {
+                "No TV shows yet."
+            } else {
+                "No movies yet."
             };
             return div()
                 .flex_1()
@@ -381,32 +461,25 @@ impl Shell {
         }
         let columns = columns(window);
         let rows = count.div_ceil(columns);
+        let bar = self.sort_bar(&grid, count, cx);
         let list = uniform_list(
-            match grid {
-                Grid::Movies => "movies-grid",
-                Grid::Shows => "shows-grid",
-            },
+            grid.id(),
             rows,
             cx.processor(move |this, range: Range<usize>, _window, cx| {
                 // Sorted once per visible batch; cards only for these rows.
-                let movies;
-                let shows;
                 let (start, end) = (range.start * columns, (range.end * columns).min(count));
-                let cards: Vec<AnyElement> = match grid {
-                    Grid::Movies => {
-                        movies = this.movies();
-                        movies[start.min(movies.len())..end.min(movies.len())]
-                            .iter()
-                            .map(|m| this.item_card("movie", m, true, cx))
-                            .collect()
-                    }
-                    Grid::Shows => {
-                        shows = this.shows();
-                        shows[start.min(shows.len())..end.min(shows.len())]
-                            .iter()
-                            .map(|s| this.show_card("all", s, cx))
-                            .collect()
-                    }
+                let cards: Vec<AnyElement> = if grid.shows {
+                    let shows = this.shows(&grid);
+                    shows[start.min(shows.len())..end.min(shows.len())]
+                        .iter()
+                        .map(|s| this.show_card("all", s, cx))
+                        .collect()
+                } else {
+                    let movies = this.movies(&grid);
+                    movies[start.min(movies.len())..end.min(movies.len())]
+                        .iter()
+                        .map(|m| this.item_card("movie", m, true, cx))
+                        .collect()
                 };
                 let mut cards = cards.into_iter();
                 range
@@ -429,24 +502,27 @@ impl Shell {
             .min_h(px(0.0))
             .flex()
             .flex_col()
-            .child(self.sort_bar(grid, count, cx))
+            .child(bar)
             .child(list)
             .into_any_element()
     }
 
     pub(super) fn search_results(&self, query: &str, cx: &mut Context<Self>) -> Vec<AnyElement> {
-        let movies: Vec<&Item> = self
-            .movies()
-            .into_iter()
+        // Across every library.
+        let mut movies: Vec<&Item> = self
+            .items()
             .filter(|m| {
-                matches(&m.title, query) || m.year.is_some_and(|y| query.trim() == y.to_string())
+                !m.is_episode()
+                    && (matches(&m.title, query)
+                        || m.year.is_some_and(|y| query.trim() == y.to_string()))
             })
             .collect();
-        let shows: Vec<ShowSummary> = self
-            .shows()
+        sort_movies(&mut movies, self.movie_sort);
+        let mut shows: Vec<ShowSummary> = show_summaries(self.items())
             .into_iter()
             .filter(|s| matches(&s.name, query))
             .collect();
+        sort_shows(&mut shows, self.show_sort);
         let mut episodes: Vec<&Item> = self
             .items()
             .filter(|i| i.is_episode() && matches(&i.title, query))
@@ -488,13 +564,15 @@ impl Shell {
         sections
     }
 
-    /// Home / Movies / TV Shows, and the search field.
+    /// Home, a tab per library, and the search field.
     pub(super) fn tabs(&self, cx: &mut Context<Self>) -> AnyElement {
         let tab =
-            |id: &'static str, label: &'static str, screen: Screen, cx: &mut Context<Self>| {
+            |id: SharedString, label: SharedString, screen: Screen, cx: &mut Context<Self>| {
                 let active = self.screen == screen;
                 div()
                     .id(id)
+                    .flex_none()
+                    .whitespace_nowrap()
                     .px_4()
                     .py_1p5()
                     .rounded_full()
@@ -509,14 +587,24 @@ impl Shell {
                     }))
                     .into_any_element()
             };
+        let libraries: Vec<AnyElement> = self
+            .library_tabs()
+            .into_iter()
+            .map(|(label, screen)| {
+                let id = match Grid::of(&screen) {
+                    Some(grid) => format!("tab-{}", grid.id()),
+                    None => format!("tab-{label}"),
+                };
+                tab(id.into(), label.into(), screen, cx)
+            })
+            .collect();
         div()
             .flex()
             .items_center()
             .gap_1()
-            .child(tab("tab-home", "Home", Screen::Home, cx))
-            .child(tab("tab-movies", "Movies", Screen::Movies, cx))
-            .child(tab("tab-shows", "TV Shows", Screen::Shows, cx))
-            .child(div().w(px(260.0)).ml_4().child(self.search.clone()))
+            .child(tab("tab-home".into(), "Home".into(), Screen::Home, cx))
+            .children(libraries)
+            .child(div().w(px(260.0)).flex_none().ml_4().child(self.search.clone()))
             .into_any_element()
     }
 }
@@ -528,6 +616,7 @@ mod tests {
 
     fn item(title: &str, show: Option<&str>) -> Item {
         Item {
+            library: None,
             source: Source::Jellyfin {
                 server: 1,
                 id: title.into(),
@@ -544,6 +633,33 @@ mod tests {
             thumb: None,
             added: None,
         }
+    }
+
+    #[test]
+    fn grids_hold_one_library() {
+        let library = |name: &str, shows| {
+            Some(std::sync::Arc::new(Library {
+                name: name.into(),
+                order: 0,
+                shows,
+            }))
+        };
+        let mut movie = item("Movie", None);
+        movie.library = library("Movies", false);
+        let mut anime = item("Anime", None);
+        anime.library = library("Anime Movies", false);
+        let mut episode = item("Ep", Some("Show"));
+        episode.library = library("Shows", true);
+        let local = item("Home Video", None);
+
+        let grid = Grid::of(&Screen::Movies(Some("Movies".into()))).unwrap();
+        assert!(grid.contains(&movie));
+        assert!(!grid.contains(&anime) && !grid.contains(&episode) && !grid.contains(&local));
+        let local_grid = Grid::of(&Screen::Movies(None)).unwrap();
+        assert!(local_grid.contains(&local) && !local_grid.contains(&movie));
+        let shows = Grid::of(&Screen::Shows(Some("Shows".into()))).unwrap();
+        assert!(shows.contains(&episode) && !shows.contains(&movie));
+        assert_eq!(Grid::of(&Screen::Home), None);
     }
 
     #[test]

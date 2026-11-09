@@ -111,8 +111,10 @@ fn now() -> i64 {
 #[derive(Clone, PartialEq)]
 enum Screen {
     Home,
-    Movies,
-    Shows,
+    /// A library tab of movies, or of shows: a Jellyfin library by name,
+    /// or None for local folders.
+    Movies(Option<String>),
+    Shows(Option<String>),
     Show(String),
     /// A movie's details page, by item key.
     Details(String),
@@ -1347,13 +1349,13 @@ impl Shell {
                 window.focus(&self.focus);
                 cx.notify();
             }
-            (Screen::Home | Screen::Movies | Screen::Shows, "escape") => {
+            (Screen::Home | Screen::Movies(_) | Screen::Shows(_), "escape") => {
                 // Clear the search and leave the field.
                 self.search.update(cx, |input, cx| input.set_text("", cx));
                 window.focus(&self.focus);
                 cx.notify();
             }
-            (Screen::Home | Screen::Movies | Screen::Shows, "f")
+            (Screen::Home | Screen::Movies(_) | Screen::Shows(_), "f")
                 if event.keystroke.modifiers.control =>
             {
                 window.focus(&self.search.focus_handle(cx));
@@ -1398,7 +1400,7 @@ impl Shell {
             })
         };
         let title: AnyElement = match &self.screen {
-            Screen::Home | Screen::Movies | Screen::Shows => self.tabs(cx),
+            Screen::Home | Screen::Movies(_) | Screen::Shows(_) => self.tabs(cx),
             Screen::Show(_) | Screen::Details(_) => back(self, cx),
             Screen::Connect => div()
                 .flex()
@@ -1428,18 +1430,33 @@ impl Shell {
             .gap_4()
             .px_8()
             .py_5()
-            .child(title)
+            .child(div().flex_none().child(title))
             .child(
+                // Status and error text give way (truncated) before the
+                // tabs or buttons do.
                 div()
                     .flex()
+                    .flex_1()
+                    .min_w(px(0.0))
+                    .justify_end()
                     .items_center()
                     .gap_3()
-                    .children(status.map(|s| div().text_sm().text_color(rgb(MUTED)).child(s)))
-                    .children(
-                        self.error
-                            .clone()
-                            .map(|e| div().text_sm().text_color(rgb(ERROR)).truncate().child(e)),
-                    )
+                    .children(status.map(|s| {
+                        div()
+                            .min_w(px(0.0))
+                            .text_sm()
+                            .text_color(rgb(MUTED))
+                            .truncate()
+                            .child(s)
+                    }))
+                    .children(self.error.clone().map(|e| {
+                        div()
+                            .min_w(px(0.0))
+                            .text_sm()
+                            .text_color(rgb(ERROR))
+                            .truncate()
+                            .child(e)
+                    }))
                     .children(can_refresh.then(|| {
                         self.button("refresh", "Refresh", cx, |this, _, cx| this.refresh(cx))
                     }))
@@ -1950,14 +1967,24 @@ impl Render for Shell {
                 .child(player.view.clone())
                 .into_any_element();
         }
+        // A library tab that's gone (the server's libraries changed, or the
+        // cache from before they were tracked was replaced) falls back to Home.
+        if Grid::of(&self.screen).is_some()
+            && !self.library_tabs().iter().any(|(_, s)| *s == self.screen)
+        {
+            self.screen = Screen::Home;
+            self.tab = Screen::Home;
+        }
         self.update_scroll(window);
         let query = self.search_query(cx);
-        let on_tab = matches!(self.screen, Screen::Home | Screen::Movies | Screen::Shows);
+        let on_tab = matches!(self.screen, Screen::Home | Screen::Movies(_) | Screen::Shows(_));
         let body: Result<Vec<AnyElement>, AnyElement> = match self.screen.clone() {
             _ if on_tab && !query.is_empty() => Ok(self.search_results(&query, cx)),
             Screen::Home => Ok(self.home(cx)),
-            Screen::Movies => Err(self.library_grid(Grid::Movies, window, cx)),
-            Screen::Shows => Err(self.library_grid(Grid::Shows, window, cx)),
+            ref screen @ (Screen::Movies(_) | Screen::Shows(_)) => {
+                let grid = Grid::of(screen).expect("a library tab");
+                Err(self.library_grid(grid, window, cx))
+            }
             Screen::Show(name) => Ok(self.show_page(&name, cx)),
             Screen::Details(key) => Ok(self.details_page(&key, cx)),
             Screen::Connect => Ok(self.connect_page(window, cx)),

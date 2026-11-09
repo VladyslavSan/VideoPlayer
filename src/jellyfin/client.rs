@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::Path;
 use std::time::Duration;
@@ -13,6 +13,7 @@ use super::{
     PublicInfo, Server, UserData, seconds_to_ticks, ticks_to_seconds,
 };
 use crate::introdb;
+use crate::library::Library;
 use crate::video::Segment;
 
 const CLIENT_NAME: &str = "VideoPlayer";
@@ -26,6 +27,28 @@ pub enum PlaybackReport {
     Started,
     Progress,
     Stopped,
+}
+
+/// One of the user's libraries, as `/UserViews` lists it.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "PascalCase")]
+struct View {
+    id: String,
+    name: String,
+    collection_type: Option<String>,
+}
+
+impl View {
+    /// Holds movies or episodes. Collections (box sets) and playlists
+    /// would repeat what's in the others; music, books, photos and live TV
+    /// aren't for this player.
+    fn browsable(&self) -> bool {
+        match self.collection_type.as_deref() {
+            None => true,
+            Some(kind) => ["movies", "tvshows", "mixed", "homevideos", "musicvideos", "folders"]
+                .contains(&kind),
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -171,11 +194,62 @@ impl Client {
         Self::check(&response, "Sign out")
     }
 
-    /// Every movie and episode the user can see, with their watch state.
+    /// Every movie and episode the user can see, with their watch state,
+    /// each tagged with the library ("Movies", "Anime Series", ...) it's in.
     pub fn library(&self, user_id: &str) -> Result<Vec<BaseItem>> {
+        let views = match self.views(user_id) {
+            Ok(views) => views,
+            Err(e) => {
+                // Still show everything, just not split by library.
+                eprintln!("[jellyfin] listing libraries: {e:#}");
+                return self.items_in(user_id, None);
+            }
+        };
+        let mut seen = HashSet::new();
+        let mut items = Vec::new();
+        let mut order = 0;
+        for view in views.iter().filter(|v| v.browsable()) {
+            let mut found = self.items_in(user_id, Some(&view.id))?;
+            found.retain(|i| seen.insert(i.id.clone()));
+            if found.is_empty() {
+                continue;
+            }
+            let episodes = found.iter().filter(|i| i.kind == "Episode").count();
+            let library = Library {
+                name: view.name.clone(),
+                order,
+                shows: match view.collection_type.as_deref() {
+                    Some("tvshows") => true,
+                    Some("movies") => false,
+                    // Mixed folders: by what's mostly in them.
+                    _ => episodes * 2 > found.len(),
+                },
+            };
+            order += 1;
+            for item in &mut found {
+                item.library = Some(library.clone());
+            }
+            items.extend(found);
+        }
+        Ok(items)
+    }
+
+    /// The user's libraries, in the order the server lists them.
+    fn views(&self, user_id: &str) -> Result<Vec<View>> {
+        #[derive(Deserialize)]
+        #[serde(rename_all = "PascalCase")]
+        struct Page {
+            items: Vec<View>,
+        }
+        let page: Page = self.get_json("/UserViews", &[("userId", user_id.to_string())])?;
+        Ok(page.items)
+    }
+
+    /// Movies and episodes in one library (`parent`), or in all of them.
+    fn items_in(&self, user_id: &str, parent: Option<&str>) -> Result<Vec<BaseItem>> {
         let mut items = Vec::new();
         loop {
-            let query = [
+            let mut query = vec![
                 ("userId", user_id.to_string()),
                 ("Recursive", "true".into()),
                 ("IncludeItemTypes", "Movie,Episode".into()),
@@ -185,6 +259,9 @@ impl Client {
                 ("StartIndex", items.len().to_string()),
                 ("Limit", PAGE_SIZE.to_string()),
             ];
+            if let Some(parent) = parent {
+                query.push(("ParentId", parent.to_string()));
+            }
             let page: ItemsPage = self.get_json("/Items", &query)?;
             let received = page.items.len();
             items.extend(page.items);

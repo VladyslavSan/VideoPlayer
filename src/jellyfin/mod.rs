@@ -12,7 +12,7 @@ use serde::{Deserialize, Serialize};
 
 pub use client::{Client, PlaySession, PlaybackReport};
 
-use crate::library::{Item, Source};
+use crate::library::{Item, Library, Source};
 use crate::video::{ExternalSubtitle, Segment, SegmentKind};
 
 const TICKS_PER_SECOND: f64 = 10_000_000.0;
@@ -97,6 +97,10 @@ pub struct BaseItem {
     pub parent_backdrop_item_id: Option<String>,
     pub user_data: Option<UserData>,
     pub date_created: Option<String>,
+    /// The library it was listed in. Not a server field: set when the
+    /// library is fetched, and kept in the cache.
+    #[serde(default, rename = "VideoPlayerLibrary", skip_serializing_if = "Option::is_none")]
+    pub library: Option<Library>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
@@ -416,6 +420,7 @@ impl BaseItem {
         let user = self.user_data.clone().unwrap_or_default();
         let is_episode = self.kind == "Episode";
         Item {
+            library: self.library.clone().map(std::sync::Arc::new),
             source: Source::Jellyfin {
                 server,
                 id: self.id.clone(),
