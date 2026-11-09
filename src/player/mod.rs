@@ -20,6 +20,19 @@ use crate::jellyfin::Quality;
 use crate::library::{SubtitlePref, TrackPrefs, WATCHED_FRACTION};
 use crate::video::{ExternalSubtitle, Segment, SegmentKind, Track, TrackKind, VideoSurface};
 
+pub use segments::merge as merge_segments;
+
+/// Where intro/credits markers came from, best first.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SegmentSource {
+    /// The Jellyfin server's media segments.
+    Server,
+    /// TheIntroDB / IntroDB.
+    Online,
+    /// Chapter names in the file.
+    Chapters,
+}
+
 const TICK: Duration = Duration::from_millis(100);
 const CONTROLS_TIMEOUT: Duration = Duration::from_millis(2500);
 /// While the controls are hidden, the mouse has to travel this far within
@@ -143,9 +156,10 @@ pub struct Player {
     /// after that, tracks are left alone.
     audio_settled: bool,
     subtitle_settled: bool,
-    /// Intros, recaps and credits: from the server, else from chapter names.
+    /// Intros, recaps and credits, combined from `segment_sources`.
     segments: Vec<Segment>,
-    server_segments: bool,
+    /// What each `SegmentSource` found, best first.
+    segment_sources: [Vec<Segment>; 3],
     chapters_read: bool,
     /// "Watch credits" was chosen: no countdown until the video ends.
     credits_dismissed: bool,
@@ -267,7 +281,7 @@ impl Player {
             audio_settled: false,
             subtitle_settled: false,
             segments: Vec::new(),
-            server_segments: false,
+            segment_sources: Default::default(),
             chapters_read: false,
             credits_dismissed: false,
             status: Status {
@@ -309,12 +323,15 @@ impl Player {
 
     /// Subtitle files that live next to the video (for example on a
     /// Jellyfin server). They're added as soon as the video has loaded.
-    /// Intro and credits markers from the server; they replace any found
-    /// from chapter names.
-    pub fn add_segments(&mut self, segments: Vec<Segment>) {
-        if !segments.is_empty() {
-            self.segments = segments;
-            self.server_segments = true;
+    /// Intro, recap and credits markers from `source`. For each kind, the
+    /// best source that has it is used.
+    pub fn add_segments(&mut self, source: SegmentSource, segments: Vec<Segment>) {
+        self.segment_sources[source as usize] = segments;
+        let sources: Vec<&[Segment]> = self.segment_sources.iter().map(Vec::as_slice).collect();
+        let merged = segments::merge(&sources);
+        if merged != self.segments {
+            eprintln!("[player] segments: {merged:?}");
+            self.segments = merged;
         }
     }
 
@@ -442,13 +459,9 @@ impl Player {
             }
             if !self.chapters_read && self.status.duration > 0.0 {
                 self.chapters_read = true;
-                if !self.server_segments {
-                    let chapters = self.video.chapters();
-                    self.segments = segments::from_chapters(&chapters, self.status.duration);
-                }
-                if !self.segments.is_empty() {
-                    eprintln!("[player] segments: {:?}", self.segments);
-                }
+                let chapters = self.video.chapters();
+                let found = segments::from_chapters(&chapters, self.status.duration);
+                self.add_segments(SegmentSource::Chapters, found);
             }
             // Once when the file opens, and again when subtitle files arrive.
             if added || !self.audio_settled {

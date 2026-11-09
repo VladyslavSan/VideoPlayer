@@ -49,8 +49,11 @@ The volume is remembered between videos.
 For TV shows, the bar adds **Next episode** and **Episodes** (a season-by-season list). When the
 credits start (or the episode ends), an "Up next" card counts down and plays the next one,
 staying in fullscreen; **Watch credits** dismisses it. During an intro or recap a **Skip Intro**
-button appears. Intros and credits come from Jellyfin's media segments (Jellyfin 10.10+ with a
-detection plugin such as Intro Skipper), or else from chapter names like "Opening" or "Credits".
+button appears. Intros, recaps and credits come from Jellyfin's media segments (Jellyfin 10.10+
+with a detection plugin such as Intro Skipper); for anything the server has no markers for, from the
+community databases [TheIntroDB](https://theintrodb.org) and [IntroDB](https://introdb.app),
+looked up by the show's TVDB/TMDB/IMDb ids (only those ids, the season and episode number and the
+runtime are sent); or else from chapter names like "Opening" or "Credits".
 
 Audio and subtitle choices are remembered per show and as a general preference (including
 "subtitles off"), and applied when the next video starts.

@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::fs;
 use std::path::Path;
 use std::time::Duration;
@@ -9,8 +10,9 @@ use ureq::{Agent, ResponseExt};
 
 use super::{
     AuthResult, BaseItem, ImageRef, InfoPage, ItemInfo, ItemsPage, MediaSegments, PlaybackInfo,
-    PublicInfo, Server, UserData, seconds_to_ticks,
+    PublicInfo, Server, UserData, seconds_to_ticks, ticks_to_seconds,
 };
+use crate::introdb;
 use crate::video::Segment;
 
 const CLIENT_NAME: &str = "VideoPlayer";
@@ -339,6 +341,68 @@ impl Client {
     pub fn media_segments(&self, item_id: &str) -> Result<Vec<Segment>> {
         let segments: MediaSegments = self.get_json(&format!("/MediaSegments/{item_id}"), &[])?;
         Ok(segments.to_segments())
+    }
+
+    /// What the intro databases need to find an item: for a movie its own
+    /// TVDB/TMDB/IMDb ids, for an episode the show's, with its season and
+    /// episode number.
+    pub fn intro_lookup(&self, user_id: &str, item_id: &str) -> Result<introdb::Lookup> {
+        #[derive(Deserialize)]
+        #[serde(rename_all = "PascalCase")]
+        struct Page {
+            items: Vec<Entry>,
+        }
+        #[derive(Deserialize)]
+        #[serde(rename_all = "PascalCase")]
+        struct Entry {
+            #[serde(rename = "Type")]
+            kind: String,
+            series_id: Option<String>,
+            parent_index_number: Option<u16>,
+            index_number: Option<u16>,
+            run_time_ticks: Option<i64>,
+            #[serde(default)]
+            provider_ids: HashMap<String, String>,
+        }
+        let fetch = |id: &str| -> Result<Entry> {
+            let page: Page = self.get_json(
+                "/Items",
+                &[
+                    ("ids", id.to_string()),
+                    ("userId", user_id.to_string()),
+                    ("Fields", "ProviderIds".into()),
+                ],
+            )?;
+            page.items
+                .into_iter()
+                .next()
+                .with_context(|| format!("no item {id}"))
+        };
+        let item = fetch(item_id)?;
+        let duration = item.run_time_ticks.map(ticks_to_seconds);
+        let (ids, episode) = match (item.kind.as_str(), &item.series_id) {
+            ("Episode", Some(series)) => {
+                let (Some(season), Some(number)) = (item.parent_index_number, item.index_number)
+                else {
+                    bail!("episode {item_id} has no season/episode number");
+                };
+                (fetch(series)?.provider_ids, Some((season, number)))
+            }
+            _ => (item.provider_ids, None),
+        };
+        // Jellyfin's keys vary in case between versions ("Tmdb", "Imdb").
+        let id = |name: &str| {
+            ids.iter()
+                .find(|(k, v)| k.eq_ignore_ascii_case(name) && !v.is_empty())
+                .map(|(_, v)| v.clone())
+        };
+        Ok(introdb::Lookup {
+            episode,
+            duration,
+            tvdb: id("Tvdb"),
+            tmdb: id("Tmdb"),
+            imdb: id("Imdb"),
+        })
     }
 
     /// The original file, streamed without transcoding (keeps HDR intact).

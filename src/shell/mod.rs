@@ -18,7 +18,8 @@ use crate::jellyfin::{
     discovery,
 };
 use crate::library::{Db, Item, Source, TrackPrefs, scan, thumbs};
-use crate::player::{self, Episode, Playback, Player, PlayerEvent};
+use crate::introdb;
+use crate::player::{self, Episode, Playback, Player, PlayerEvent, SegmentSource};
 use crate::secrets;
 use crate::ui::menu;
 use crate::ui::text_input::TextInput;
@@ -1041,6 +1042,8 @@ impl Shell {
             id: item_id.clone(),
         };
         let base = client.base().to_string();
+        let (client_for_lookup, user_id_for_lookup, source_for_lookup) =
+            (client.clone(), user_id.clone(), source.clone());
         cx.spawn(async move |this, cx| {
             let fetch_id = item_id.clone();
             let (info, segments) = cx
@@ -1075,7 +1078,50 @@ impl Shell {
                     active.playback_info = info;
                     active.view.update(cx, |player, _| {
                         player.add_external_subtitles(subtitles);
-                        player.add_segments(segments);
+                        player.add_segments(SegmentSource::Server, segments);
+                    });
+                }
+            })
+            .ok();
+        })
+        .detach();
+        self.load_online_segments(client_for_lookup, user_id_for_lookup, source_for_lookup, cx);
+    }
+
+    /// Intro, recap and credits times from TheIntroDB and IntroDB, by the
+    /// show's (or movie's) ids on the server. They fill in whatever kinds
+    /// the server itself has no markers for.
+    fn load_online_segments(
+        &mut self,
+        client: Client,
+        user_id: String,
+        source: Source,
+        cx: &mut Context<Self>,
+    ) {
+        let Source::Jellyfin { id, .. } = &source else {
+            return;
+        };
+        let id = id.clone();
+        cx.spawn(async move |this, cx| {
+            let segments = cx
+                .background_executor()
+                .spawn(async move {
+                    let lookup = client.intro_lookup(&user_id, &id)?;
+                    let segments = introdb::fetch(&lookup);
+                    eprintln!("[segments] {} from the intro databases", segments.len());
+                    anyhow::Ok(segments)
+                })
+                .await;
+            let segments = match segments {
+                Ok(s) => s,
+                Err(e) => return eprintln!("[segments] looking up ids: {e:#}"),
+            };
+            this.update(cx, |this, cx| {
+                if let Some(active) = &mut this.player
+                    && active.source.as_ref() == Some(&source)
+                {
+                    active.view.update(cx, |player, _| {
+                        player.add_segments(SegmentSource::Online, segments);
                     });
                 }
             })

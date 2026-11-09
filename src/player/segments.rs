@@ -1,5 +1,6 @@
 //! Intros, recaps and credits found from chapter names, for files the
-//! server hasn't analysed (or local files).
+//! server hasn't analysed (or local files), and combining them with
+//! markers from elsewhere.
 
 use crate::video::{Segment, SegmentKind};
 
@@ -45,9 +46,41 @@ pub fn from_chapters(chapters: &[(String, f64)], duration: f64) -> Vec<Segment> 
         .collect()
 }
 
+/// Combines segments from several sources, best first: each kind (intro,
+/// credits, ...) comes from the first source that has it. Sorted by start.
+pub fn merge(sources: &[&[Segment]]) -> Vec<Segment> {
+    let mut merged: Vec<Segment> = Vec::new();
+    for source in sources {
+        let have: Vec<SegmentKind> = merged.iter().map(|s| s.kind).collect();
+        merged.extend(source.iter().filter(|s| !have.contains(&s.kind)));
+    }
+    merged.sort_by(|a, b| a.start.total_cmp(&b.start));
+    merged
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn merging_prefers_earlier_sources_per_kind() {
+        let seg = |kind, start, end| Segment { kind, start, end };
+        let server = [seg(SegmentKind::Intro, 60.0, 120.0)];
+        let online = [
+            seg(SegmentKind::Credits, 3000.0, 3100.0),
+            seg(SegmentKind::Intro, 61.0, 121.0),
+            seg(SegmentKind::Recap, 0.0, 55.0),
+        ];
+        let chapters = [seg(SegmentKind::Credits, 2990.0, 3100.0)];
+        assert_eq!(
+            merge(&[&server, &online, &chapters]),
+            vec![
+                seg(SegmentKind::Recap, 0.0, 55.0),
+                seg(SegmentKind::Intro, 60.0, 120.0),
+                seg(SegmentKind::Credits, 3000.0, 3100.0),
+            ]
+        );
+    }
 
     #[test]
     fn chapter_names() {
