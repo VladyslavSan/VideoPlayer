@@ -130,6 +130,11 @@ impl VideoSurface {
             init.set_option("gpu-api", "d3d11")?;
             init.set_option("hwdec", "auto-safe")?;
             init.set_option("target-colorspace-hint", "yes")?;
+            // HDR video goes out as HDR, SDR video as SDR. With the display
+            // in HDR mode, the default sends everything as PQ, and subtitles
+            // blended in PQ lose their antialiasing (a half-covered edge
+            // pixel ends up near black), so their edges look jagged.
+            init.set_option("target-colorspace-hint-mode", "source")?;
             init.set_option("keep-open", "yes")?;
             // Arrow-key skips land exactly, not on the next keyframe.
             init.set_option("hr-seek", "yes")?;
