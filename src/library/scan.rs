@@ -142,7 +142,7 @@ mod tests {
     #[test]
     fn missing_root_keeps_items() -> Result<()> {
         let db = Db::open_in_memory()?;
-        let missing = Path::new(r"Z:\definitely\not\here");
+        let missing = Path::new("Z:/definitely/not/here");
         assert!(scan_root(&db, missing).is_err());
         Ok(())
     }

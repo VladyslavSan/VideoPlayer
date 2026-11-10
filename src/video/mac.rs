@@ -5,6 +5,9 @@
 //!
 //! mpv's `--wid` isn't supported on macOS, hence the render API.
 
+// objc 0.2's macros check a `cargo-clippy` feature that newer Rust flags.
+#![allow(unexpected_cfgs)]
+
 use std::ffi::{c_char, c_int, c_void};
 use std::ptr;
 use std::sync::atomic::{AtomicBool, Ordering};

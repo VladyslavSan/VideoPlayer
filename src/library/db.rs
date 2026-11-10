@@ -438,14 +438,14 @@ mod tests {
     #[test]
     fn upsert_keeps_progress_and_resets_thumb_on_change() -> Result<()> {
         let db = Db::open_in_memory()?;
-        let root = Path::new(r"D:\Movies");
-        db.upsert_file(root, &file(r"D:\Movies\Heat (1995).mkv", 100, 1))?;
+        let root = Path::new("D:/Movies");
+        db.upsert_file(root, &file("D:/Movies/Heat (1995).mkv", 100, 1))?;
         let id = db.items()?[0].local_id().unwrap();
         db.save_progress(id, 600.0, 6000.0)?;
-        db.set_thumb(id, Some(Path::new(r"C:\thumbs\1.jpg")))?;
+        db.set_thumb(id, Some(Path::new("C:/thumbs/1.jpg")))?;
 
         // Rescan with the same file: progress and thumbnail survive.
-        db.upsert_file(root, &file(r"D:\Movies\Heat (1995).mkv", 100, 1))?;
+        db.upsert_file(root, &file("D:/Movies/Heat (1995).mkv", 100, 1))?;
         let item = db.item(id)?.unwrap();
         assert_eq!(item.title, "Heat");
         assert_eq!(item.year, Some(1995));
@@ -453,7 +453,7 @@ mod tests {
         assert!(item.thumb.is_some());
 
         // File replaced on disk: thumbnail is regenerated, progress kept.
-        db.upsert_file(root, &file(r"D:\Movies\Heat (1995).mkv", 200, 2))?;
+        db.upsert_file(root, &file("D:/Movies/Heat (1995).mkv", 200, 2))?;
         let item = db.item(id)?.unwrap();
         assert_eq!(item.position, 600.0);
         let Source::Local { path, .. } = item.source else {
@@ -466,7 +466,7 @@ mod tests {
     #[test]
     fn progress_rules() -> Result<()> {
         let db = Db::open_in_memory()?;
-        db.upsert_file(Path::new("D:"), &file(r"D:\a.mkv", 1, 1))?;
+        db.upsert_file(Path::new("D:"), &file("D:/a.mkv", 1, 1))?;
         let id = db.items()?[0].local_id().unwrap();
 
         db.save_progress(id, 5.0, 1000.0)?;
@@ -488,13 +488,13 @@ mod tests {
     #[test]
     fn remove_missing_only_touches_its_root() -> Result<()> {
         let db = Db::open_in_memory()?;
-        let a = Path::new(r"D:\A");
-        let b = Path::new(r"D:\B");
-        db.upsert_file(a, &file(r"D:\A\one.mkv", 1, 1))?;
-        db.upsert_file(a, &file(r"D:\A\two.mkv", 1, 1))?;
-        db.upsert_file(b, &file(r"D:\B\three.mkv", 1, 1))?;
+        let a = Path::new("D:/A");
+        let b = Path::new("D:/B");
+        db.upsert_file(a, &file("D:/A/one.mkv", 1, 1))?;
+        db.upsert_file(a, &file("D:/A/two.mkv", 1, 1))?;
+        db.upsert_file(b, &file("D:/B/three.mkv", 1, 1))?;
 
-        let present = HashSet::from([r"D:\A\one.mkv".to_string()]);
+        let present = HashSet::from(["D:/A/one.mkv".to_string()]);
         assert_eq!(db.remove_missing(a, &present)?, 1);
         let titles: Vec<_> = db.items()?.into_iter().map(|i| i.title).collect();
         assert_eq!(titles, ["one", "three"]);
@@ -504,7 +504,7 @@ mod tests {
     #[test]
     fn failed_thumb_is_not_retried() -> Result<()> {
         let db = Db::open_in_memory()?;
-        db.upsert_file(Path::new("D:"), &file(r"D:\a.mkv", 1, 1))?;
+        db.upsert_file(Path::new("D:"), &file("D:/a.mkv", 1, 1))?;
         let id = db.items()?[0].local_id().unwrap();
         db.set_thumb(id, None)?;
         assert!(db.pending_thumbs()?.is_empty());
@@ -586,8 +586,8 @@ mod tests {
     #[test]
     fn marking_watched() -> Result<()> {
         let db = Db::open_in_memory()?;
-        let root = Path::new(r"D:\Movies");
-        db.upsert_file(root, &file(r"D:\Movies\Film (2001).mkv", 1, 1))?;
+        let root = Path::new("D:/Movies");
+        db.upsert_file(root, &file("D:/Movies/Film (2001).mkv", 1, 1))?;
         let id = db.items()?[0].local_id().unwrap();
         db.save_progress(id, 300.0, 1000.0)?;
         db.set_watched(id, true)?;
@@ -620,9 +620,9 @@ mod tests {
     #[test]
     fn roots_are_unique() -> Result<()> {
         let db = Db::open_in_memory()?;
-        assert!(db.add_root(Path::new(r"D:\Movies"))?);
-        assert!(!db.add_root(Path::new(r"D:\Movies"))?);
-        assert_eq!(db.roots()?, vec![PathBuf::from(r"D:\Movies")]);
+        assert!(db.add_root(Path::new("D:/Movies"))?);
+        assert!(!db.add_root(Path::new("D:/Movies"))?);
+        assert_eq!(db.roots()?, vec![PathBuf::from("D:/Movies")]);
         Ok(())
     }
 }

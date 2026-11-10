@@ -147,7 +147,7 @@ mod tests {
     #[test]
     fn scene_movie() {
         assert_eq!(
-            parse(r"D:\Movies\The.Matrix.1999.1080p.BluRay.x264.mkv"),
+            parse("D:/Movies/The.Matrix.1999.1080p.BluRay.x264.mkv"),
             movie("The Matrix", Some(1999))
         );
     }
@@ -212,11 +212,11 @@ mod tests {
     #[test]
     fn show_from_folder_structure() {
         assert_eq!(
-            parse(r"D:\TV\Severance\Season 1\S01E04.mkv"),
+            parse("D:/TV/Severance/Season 1/S01E04.mkv"),
             episode("Severance", 1, 4, None)
         );
         assert_eq!(
-            parse(r"D:\TV\Severance (2022)\S01E04.mkv"),
+            parse("D:/TV/Severance (2022)/S01E04.mkv"),
             episode("Severance", 1, 4, None)
         );
     }
