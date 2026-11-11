@@ -106,6 +106,7 @@ Press **F1** (or `?`) in the player to see all shortcuts.
 | Click | Show or hide the controls (clicking never pauses) |
 | N / E | Next episode / episode list |
 | Enter | Skip intro, or play the next episode now |
+| → / L during "Up next" | Play the next episode now |
 | F1, ? | Keyboard shortcuts |
 | Esc | Close the panel, leave fullscreen, or go back to the library |
 | Backspace | Back to the library |

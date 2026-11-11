@@ -911,7 +911,8 @@ impl Player {
             "f1" => self.toggle_panel(Panel::Shortcuts),
             "n" if !self.episodes.is_empty() => return self.play_next(cx),
             "e" if !self.episodes.is_empty() => self.toggle_panel(Panel::Episodes),
-            "enter" if self.up_next.is_some() => return self.play_next(cx),
+            // While "Up next" counts down, forward means the next episode.
+            "enter" | "right" | "l" if self.up_next.is_some() => return self.play_next(cx),
             "enter" if self.skip_target().is_some() => self.skip_segment(),
             "space" | "k" => self.toggle_pause(),
             "left" | "j" => self.skip(-SKIP_SECONDS),

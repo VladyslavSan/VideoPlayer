@@ -990,6 +990,7 @@ impl Player {
         if !self.episodes.is_empty() {
             rows.push(("N", "Next episode"));
             rows.push(("E", "Episodes"));
+            rows.push(("→ / L in Up next", "Play the next episode now"));
         }
         rows.push(("Enter", "Skip intro, or play the next episode now"));
         rows.push(("F1 / ?", "This list"));
