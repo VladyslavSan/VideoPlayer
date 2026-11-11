@@ -16,6 +16,7 @@ use gpui::{
 
 use crate::jellyfin::Quality;
 use crate::library::{SubtitlePref, TrackPrefs, WATCHED_FRACTION};
+use crate::media_session::{self, MediaCommand, MediaSession, NowPlaying};
 use crate::video::{ExternalSubtitle, Segment, SegmentKind, Track, TrackKind, VideoSurface};
 
 pub use segments::merge as merge_segments;
@@ -93,6 +94,8 @@ pub struct Playback {
     pub prefs: TrackPrefs,
     /// Streaming quality, for Jellyfin videos (None hides the setting).
     pub quality: Option<Quality>,
+    /// Artwork for the system's now-playing panel.
+    pub thumb: Option<std::path::PathBuf>,
 }
 
 /// The panel open above the control bar, if any.
@@ -185,6 +188,10 @@ pub struct Player {
     // Laid-out bounds of the sliders, written during paint, read by mouse handlers.
     seek_bounds: Rc<Cell<Bounds<Pixels>>>,
     volume_bounds: Rc<Cell<Bounds<Pixels>>>,
+    /// The system's media controls (headphone buttons, media keys).
+    media: Option<Rc<MediaSession>>,
+    /// What was last reported to them: playing, position, and when.
+    media_report: Option<(bool, f64, Instant)>,
     _poll: Task<()>,
     _subscriptions: Vec<Subscription>,
 }
@@ -226,6 +233,7 @@ impl Player {
         video: VideoSurface,
         playback: Playback,
         volume: f64,
+        media: Option<Rc<MediaSession>>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
@@ -236,7 +244,17 @@ impl Player {
             current,
             prefs,
             quality,
+            thumb,
         } = playback;
+        if let Some(media) = &media {
+            media.show(NowPlaying {
+                title: &title,
+                subtitle: subtitle.as_ref().map(|s| s.as_ref()),
+                thumb: thumb.as_deref(),
+                has_previous: current.is_some_and(|i| i > 0),
+                has_next: current.is_some_and(|i| i + 1 < episodes.len()),
+            });
+        }
         let episode_season = current
             .and_then(|i| episodes.get(i))
             .map_or(0, |e| e.season);
@@ -306,6 +324,8 @@ impl Player {
             pipeline: String::new(),
             seek_bounds: Rc::default(),
             volume_bounds: Rc::default(),
+            media,
+            media_report: None,
             _poll: poll,
             _subscriptions: vec![bounds],
         }
@@ -412,6 +432,10 @@ impl Player {
             subtitle_scale: v.subtitle_scale(),
             subtitle_delay: v.subtitle_delay(),
         };
+        if self.handle_media_commands(cx) {
+            return;
+        }
+        self.report_media();
         let pipeline = self.video.pipeline();
         if pipeline != self.pipeline {
             eprintln!("[video] {pipeline}");
@@ -505,6 +529,57 @@ impl Player {
         cx.notify();
     }
 
+    /// Carries out what the system's media controls asked for. True if
+    /// the player is leaving (for another episode).
+    fn handle_media_commands(&mut self, cx: &mut Context<Self>) -> bool {
+        let Some(media) = self.media.clone() else {
+            return false;
+        };
+        for command in media.commands() {
+            eprintln!("[media] {command:?}");
+            match command {
+                MediaCommand::Play if self.status.paused => self.toggle_pause(),
+                MediaCommand::Pause if !self.status.paused => self.toggle_pause(),
+                MediaCommand::Play | MediaCommand::Pause => {}
+                MediaCommand::Toggle => self.toggle_pause(),
+                MediaCommand::SeekBy(seconds) => self.skip(seconds),
+                MediaCommand::SeekTo(seconds) => {
+                    self.video.seek_to(seconds);
+                    self.status.position = seconds;
+                }
+                MediaCommand::Next => {
+                    if self.next_episode().is_some() {
+                        self.play_next(cx);
+                        return true;
+                    }
+                }
+                MediaCommand::Previous => {
+                    if let Some(key) = self.previous_episode().map(|e| e.key.clone()) {
+                        self.play_episode(key, cx);
+                        return true;
+                    }
+                }
+            }
+            self.poke(cx);
+        }
+        false
+    }
+
+    /// Keeps the system's now-playing panel in step with the player.
+    fn report_media(&mut self) {
+        let Some(media) = &self.media else {
+            return;
+        };
+        let playing = !self.status.paused && !self.status.ended;
+        let last = self
+            .media_report
+            .map(|(was_playing, at, when)| (was_playing, at, when.elapsed().as_secs_f64()));
+        if media_session::needs_report(last, playing, self.status.position, self.status.speed) {
+            media.update(playing, self.status.position, self.status.duration);
+            self.media_report = Some((playing, self.status.position, Instant::now()));
+        }
+    }
+
     fn segment_at(&self, position: f64) -> Option<Segment> {
         self.segments
             .iter()
@@ -540,6 +615,10 @@ impl Player {
 
     fn next_episode(&self) -> Option<&Episode> {
         self.episodes.get(self.current? + 1)
+    }
+
+    fn previous_episode(&self) -> Option<&Episode> {
+        self.episodes.get(self.current?.checked_sub(1)?)
     }
 
     /// Leaves this video for another episode.

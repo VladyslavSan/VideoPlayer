@@ -83,6 +83,11 @@ runtime are sent); or else from chapter names like "Opening" or "Credits".
 Audio and subtitle choices are remembered per show and as a general preference (including
 "subtitles off"), and applied when the next video starts.
 
+The player shows up in the system's media controls (the Windows media flyout, the macOS Now
+Playing menu) with the title and artwork. Headphone buttons and keyboard media keys play and
+pause, even while another window is in front; next and previous switch episodes, and the
+flyout's timeline seeks.
+
 The Jellyfin library is cached on disk, so it shows instantly at start and stays browsable when
 the server is offline.
 Press **F1** (or `?`) in the player to see all shortcuts.

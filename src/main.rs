@@ -4,6 +4,7 @@
 mod introdb;
 mod jellyfin;
 mod library;
+mod media_session;
 mod player;
 mod secrets;
 mod shell;

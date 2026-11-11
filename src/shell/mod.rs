@@ -21,6 +21,7 @@ use crate::jellyfin::{
     discovery,
 };
 use crate::library::{Db, Item, Source, TrackPrefs, scan, thumbs};
+use crate::media_session::MediaSession;
 use crate::player::{self, Episode, Playback, Player, PlayerEvent, SegmentSource};
 use crate::secrets;
 use crate::ui::menu;
@@ -220,6 +221,8 @@ pub struct Shell {
     focus_bounds: Rc<Cell<Option<Bounds<Pixels>>>>,
     /// Scrolling to that card, while the page settles.
     focus_scroll: Option<FocusScroll>,
+    /// The system's media controls, set up with the first video.
+    media: Option<Rc<MediaSession>>,
 }
 
 impl Shell {
@@ -269,6 +272,7 @@ impl Shell {
             focus_episode: None,
             focus_bounds: Rc::default(),
             focus_scroll: None,
+            media: None,
             player: None,
             scanning: false,
             loading_servers: HashSet::new(),
@@ -313,6 +317,7 @@ impl Shell {
                 current: None,
                 prefs: shell.track_prefs(None),
                 quality: None,
+                thumb: None,
             };
             shell.start_player(source, None, playback, 0.0, None, window, cx);
         }
@@ -869,6 +874,7 @@ impl Shell {
             current,
             prefs: self.track_prefs(item.show.as_deref()),
             quality: None,
+            thumb: item.thumb.clone(),
         };
         let start = if restart { 0.0 } else { item.resume_position() };
         eprintln!("[play] {} ({key}) from {start:.1}s", item.display_title());
@@ -1187,7 +1193,14 @@ impl Shell {
         };
         self.error = None;
         let volume = self.saved_volume();
-        let view = cx.new(|cx| Player::new(video, playback, volume, window, cx));
+        if self.media.is_none() {
+            match MediaSession::new(window) {
+                Ok(media) => self.media = Some(Rc::new(media)),
+                Err(e) => eprintln!("[media] system media controls unavailable: {e:#}"),
+            }
+        }
+        let media = self.media.clone();
+        let view = cx.new(|cx| Player::new(video, playback, volume, media, window, cx));
         let subscription = cx.subscribe_in(&view, window, |this, _, event, window, cx| {
             this.on_player_event(event, window, cx)
         });
@@ -1275,6 +1288,9 @@ impl Shell {
         let Some(active) = self.player.take() else {
             return;
         };
+        if let Some(media) = &self.media {
+            media.hide();
+        }
         // Remember the volume for next time, but never start silent.
         let volume = active.view.read(cx).volume();
         if volume >= 1.0
