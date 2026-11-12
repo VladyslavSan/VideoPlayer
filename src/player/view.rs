@@ -7,7 +7,7 @@ use gpui::{
     rgb, rgba,
 };
 
-use super::{Panel, Player, TOAST_DURATION, tracks};
+use super::{Panel, Player, TOAST_DURATION, segments, tracks};
 use crate::jellyfin::{QUALITIES, Quality};
 use crate::ui::icons::{Icon, icon};
 use crate::ui::menu;
@@ -18,6 +18,12 @@ const MUTED: u32 = 0x9aa3b2;
 const ACCENT: u32 = 0x4c8dff;
 const SURFACE: u32 = 0x15171de8;
 const BORDER: u32 = 0xffffff1a;
+/// Intros, recaps and credits on the seek bar.
+const SEGMENT: u32 = 0xffcf5c99;
+/// The gaps that split the seek bar into chapters.
+const CHAPTER_GAP: u32 = 0x000000b3;
+/// More chapters than this are usually fixed-interval markers: no ticks.
+const MAX_CHAPTER_TICKS: usize = 40;
 
 const BAR_HEIGHT: f32 = 52.0;
 const BAR_BOTTOM: f32 = 24.0;
@@ -171,24 +177,47 @@ impl Player {
         let hovered = self.seek_hover.is_some();
         let track_height = if hovered { 6.0 } else { 4.0 };
         let bounds = self.seek_bounds.clone();
+        let bands: Vec<(f32, f32)> = self
+            .segments
+            .iter()
+            .map(|s| (fraction(s.start), fraction(s.end)))
+            .filter(|(start, end)| end > start)
+            .collect();
+        let ticks: Vec<f32> = if (2..=MAX_CHAPTER_TICKS).contains(&self.chapters.len()) {
+            self.chapters
+                .iter()
+                .map(|(_, start)| fraction(*start))
+                .filter(|f| *f > 0.002 && *f < 0.998)
+                .collect()
+        } else {
+            Vec::new()
+        };
 
         let preview = self.seek_hover.filter(|_| duration > 0.0).map(|x| {
             let area = self.seek_bounds.get();
             let time = super::fraction_at(area, x) * duration;
             let offset = f32::from(x - area.origin.x).clamp(0.0, f32::from(area.size.width));
+            let chapter = segments::chapter_at(&self.chapters, time)
+                .and_then(|(title, _)| segments::chapter_label(title));
+            let label = match chapter {
+                Some(chapter) => format!("{} · {chapter}", super::format_time(time)),
+                None => super::format_time(time),
+            };
             div()
                 .absolute()
                 .bottom(px(SLIDER_HEIGHT + 6.0))
-                .left(px(offset - 32.0))
-                .w(px(64.0))
+                .left(px(offset - 160.0))
+                .w(px(320.0))
                 .flex()
                 .justify_center()
                 .child(
                     chip()
+                        .max_w(px(320.0))
                         .px_2()
                         .py_0p5()
                         .text_xs()
-                        .child(super::format_time(time)),
+                        .truncate()
+                        .child(label),
                 )
         });
 
@@ -233,7 +262,26 @@ impl Player {
                             .w(relative(progress))
                             .rounded_full()
                             .bg(rgb(ACCENT)),
-                    ),
+                    )
+                    .children(bands.into_iter().map(|(start, end)| {
+                        div()
+                            .absolute()
+                            .top_0()
+                            .h_full()
+                            .left(relative(start))
+                            .w(relative(end - start))
+                            .bg(rgba(SEGMENT))
+                    }))
+                    .children(ticks.into_iter().map(|at| {
+                        div()
+                            .absolute()
+                            .top_0()
+                            .h_full()
+                            .left(relative(at))
+                            .ml(px(-1.0))
+                            .w(px(2.0))
+                            .bg(rgba(CHAPTER_GAP))
+                    })),
             )
             .child(
                 div()

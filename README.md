@@ -69,7 +69,8 @@ playback (the pointer hides with it). Once hidden, it only comes back for a deli
 (about 40 px within half a second), not a nudge. While it's showing, subtitles move up so the bar never
 covers them. The subtitles button opens a panel with audio tracks, subtitle tracks (including
 external subtitle files on a Jellyfin server), playback speed, subtitle size and subtitle delay.
-The volume is remembered between videos.
+The volume is remembered between videos. The timeline is split at chapter starts, with intros, recaps and credits highlighted;
+hovering it shows the time and the chapter's name.
 
 For TV shows, the bar adds **Next episode** and **Episodes** (a season-by-season list). When the
 credits start (or the episode ends), an "Up next" card counts down and plays the next one,

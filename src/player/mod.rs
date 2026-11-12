@@ -162,6 +162,8 @@ pub struct Player {
     /// What each `SegmentSource` found, best first.
     segment_sources: [Vec<Segment>; 3],
     chapters_read: bool,
+    /// Chapter titles and start times, for the seek bar.
+    chapters: Vec<(String, f64)>,
     /// "Watch credits" was chosen: no countdown until the video ends.
     credits_dismissed: bool,
     status: Status,
@@ -291,6 +293,7 @@ impl Player {
             segments: Vec::new(),
             segment_sources: Default::default(),
             chapters_read: false,
+            chapters: Vec::new(),
             credits_dismissed: false,
             status: Status {
                 position: 0.0,
@@ -473,8 +476,8 @@ impl Player {
             }
             if !self.chapters_read && self.status.duration > 0.0 {
                 self.chapters_read = true;
-                let chapters = self.video.chapters();
-                let found = segments::from_chapters(&chapters, self.status.duration);
+                self.chapters = self.video.chapters();
+                let found = segments::from_chapters(&self.chapters, self.status.duration);
                 self.add_segments(SegmentSource::Chapters, found);
             }
             // Once when the file opens, and again when subtitle files arrive.
