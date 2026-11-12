@@ -112,7 +112,7 @@ impl Client {
         client
     }
 
-    fn authorization(&self) -> String {
+    pub(super) fn authorization(&self) -> String {
         let device = device_name();
         let mut value = format!(
             r#"MediaBrowser Client="{CLIENT_NAME}", Device="{device}", DeviceId="{}", Version="{}""#,

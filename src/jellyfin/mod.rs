@@ -3,6 +3,7 @@
 
 mod client;
 pub mod discovery;
+pub mod live;
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};

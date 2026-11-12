@@ -31,6 +31,7 @@ use crate::ui::text_input::TextInput;
 mod browse;
 mod details;
 mod keynav;
+mod live;
 mod reports;
 mod settings;
 use browse::{Grid, Sort};
@@ -236,6 +237,10 @@ pub struct Shell {
     starting: Option<String>,
     /// When the Jellyfin libraries were last fetched.
     remote_refreshed: Option<Instant>,
+    /// Each signed-in server's change notifications, with the token used.
+    live: HashMap<i64, (String, crate::jellyfin::live::Watcher)>,
+    /// A fetch because of server changes is waiting to run.
+    live_refresh_pending: bool,
     /// The scrolling page (everything but the virtualized grids).
     content_scroll: ScrollHandle,
     /// The screen the page was last drawn for; a new one starts at the top.
@@ -308,6 +313,8 @@ impl Shell {
             reports: reports::Reports::default(),
             starting: None,
             remote_refreshed: None,
+            live: HashMap::new(),
+            live_refresh_pending: false,
             content_scroll: ScrollHandle::new(),
             scrolled_screen: None,
             focus_episode: None,
@@ -574,6 +581,7 @@ impl Shell {
     /// Fetches every server's library; artwork follows in the background.
     fn refresh_remote(&mut self, cx: &mut Context<Self>) {
         self.remote_refreshed = Some(Instant::now());
+        self.sync_live(cx);
         for server in self.servers.clone() {
             if server.token.is_empty() {
                 // Removed from the credential store outside the app.
@@ -847,6 +855,7 @@ impl Shell {
             |i| !matches!(&i.source, Source::Jellyfin { server, .. } if *server == server_id),
         );
         self.reload();
+        self.sync_live(cx);
         cx.notify();
     }
 

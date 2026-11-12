@@ -59,6 +59,9 @@ encrypts it for your user account; `library.db` keeps only the server address an
   subtitles are fetched as separate files (picture-based ones like PGS aren't available then).
 - Playback start, progress and stop are reported to the server, so resume positions and watched
   state stay in sync with other Jellyfin apps.
+- The library stays current while the app is open: the server announces changes (a new season
+  imported, an episode watched on another device) and the app fetches the library a few seconds
+  later. It reconnects by itself after the server restarts.
 
 `cargo test -- --ignored` runs a round trip against Jellyfin's public demo server.
 
