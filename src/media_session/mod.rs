@@ -8,6 +8,7 @@ mod mac;
 #[cfg(windows)]
 mod win;
 
+use std::cell::Cell;
 use std::path::Path;
 use std::sync::mpsc::{Receiver, Sender, channel};
 
@@ -48,6 +49,10 @@ pub struct NowPlaying<'a> {
 pub struct MediaSession {
     controls: Controls,
     commands: Receiver<MediaCommand>,
+    /// Whether next/previous are offered (a setting).
+    skip_buttons: Cell<bool>,
+    /// Previous and next episode exist, while something is shown.
+    shown: Cell<Option<(bool, bool)>>,
 }
 
 type CommandSender = Sender<MediaCommand>;
@@ -58,13 +63,33 @@ impl MediaSession {
         Ok(Self {
             controls: Controls::new(window, sender)?,
             commands,
+            skip_buttons: Cell::new(true),
+            shown: Cell::new(None),
         })
+    }
+
+    /// Turns the next/previous buttons (headphones, media keys, the panel)
+    /// on or off; play and pause always work.
+    pub fn set_skip_buttons(&self, on: bool) {
+        self.skip_buttons.set(on);
+        if let Some((previous, next)) = self.shown.get()
+            && let Err(e) = self.controls.set_skip(previous && on, next && on)
+        {
+            eprintln!("[media] updating skip buttons: {e:#}");
+        }
     }
 
     /// Shows `now` in the panel and starts taking commands. Commands that
     /// arrived while nothing was playing are dropped.
     pub fn show(&self, now: NowPlaying) {
         while self.commands.try_recv().is_ok() {}
+        self.shown.set(Some((now.has_previous, now.has_next)));
+        let skip = self.skip_buttons.get();
+        let now = NowPlaying {
+            has_previous: now.has_previous && skip,
+            has_next: now.has_next && skip,
+            ..now
+        };
         if let Err(e) = self.controls.show(now) {
             eprintln!("[media] showing now playing: {e:#}");
         }
@@ -83,6 +108,7 @@ impl MediaSession {
 
     /// Removes the app from the panel; media keys go to other apps again.
     pub fn hide(&self) {
+        self.shown.set(None);
         if let Err(e) = self.controls.hide() {
             eprintln!("[media] hiding: {e:#}");
         }
@@ -90,7 +116,11 @@ impl MediaSession {
 
     /// Commands received since the last call, oldest first.
     pub fn commands(&self) -> Vec<MediaCommand> {
-        self.commands.try_iter().collect()
+        let skip = self.skip_buttons.get();
+        self.commands
+            .try_iter()
+            .filter(|c| skip || !matches!(c, MediaCommand::Next | MediaCommand::Previous))
+            .collect()
     }
 }
 

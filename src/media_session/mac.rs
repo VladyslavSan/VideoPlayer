@@ -108,6 +108,11 @@ impl Controls {
         self.send_metadata()
     }
 
+    /// souvlaki can't turn single commands off; the session drops them.
+    pub fn set_skip(&self, _previous: bool, _next: bool) -> Result<()> {
+        Ok(())
+    }
+
     pub fn update(&self, playing: bool, position: f64, duration: f64) -> Result<()> {
         if (duration - self.duration.get()).abs() > 0.5 {
             self.duration.set(duration);

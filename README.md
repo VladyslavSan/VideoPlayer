@@ -90,7 +90,8 @@ Audio and subtitle choices are remembered per show and as a general preference (
 The player shows up in the system's media controls (the Windows media flyout, the macOS Now
 Playing menu) with the title and artwork. Headphone buttons and keyboard media keys play and
 pause, even while another window is in front; next and previous switch episodes, and the
-flyout's timeline seeks.
+flyout's timeline seeks. To keep headphone skip buttons from changing episodes, turn off
+**Settings → Next and previous switch episodes**; play and pause keep working.
 
 The Jellyfin library is cached on disk, so it shows instantly at start and stays browsable when
 the server is offline.

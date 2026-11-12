@@ -32,6 +32,7 @@ mod browse;
 mod details;
 mod keynav;
 mod reports;
+mod settings;
 use browse::{Grid, Sort};
 use details::Details;
 
@@ -127,6 +128,7 @@ enum Screen {
     /// A movie's details page, by item key.
     Details(String),
     Connect,
+    Settings,
 }
 
 /// What a poster card shows.
@@ -1276,7 +1278,10 @@ impl Shell {
         let volume = self.saved_volume();
         if self.media.is_none() && crate::test_window::media_controls() {
             match MediaSession::new(window) {
-                Ok(media) => self.media = Some(Rc::new(media)),
+                Ok(media) => {
+                    media.set_skip_buttons(self.media_skip_buttons());
+                    self.media = Some(Rc::new(media));
+                }
                 Err(e) => eprintln!("[media] system media controls unavailable: {e:#}"),
             }
         }
@@ -1482,7 +1487,7 @@ impl Shell {
             }
             (Screen::Connect, "enter") => self.connect(window, cx),
             (Screen::Connect, "tab") => self.focus_next_field(window, cx),
-            (Screen::Connect, "escape")
+            (Screen::Connect | Screen::Settings, "escape")
             | (Screen::Show(_) | Screen::Details(_), "escape" | "backspace") => {
                 self.screen = self.tab.clone();
                 window.focus(&self.focus);
@@ -1541,12 +1546,19 @@ impl Shell {
         let title: AnyElement = match &self.screen {
             Screen::Home | Screen::Movies(_) | Screen::Shows(_) => self.tabs(cx),
             Screen::Show(_) | Screen::Details(_) => back(self, cx),
-            Screen::Connect => div()
+            Screen::Connect | Screen::Settings => div()
                 .flex()
                 .items_center()
                 .gap_3()
                 .child(back(self, cx))
-                .child(heading("Jellyfin".into()))
+                .child(heading(
+                    if self.screen == Screen::Settings {
+                        "Settings"
+                    } else {
+                        "Jellyfin"
+                    }
+                    .into(),
+                ))
                 .into_any_element(),
         };
         let status = if self.scanning {
@@ -1602,7 +1614,12 @@ impl Shell {
                     .child(self.button("jellyfin", "Jellyfin", cx, |this, window, cx| {
                         this.open_connect(window, cx)
                     }))
-                    .child(self.button("add", "Add Folder", cx, |this, _, cx| this.add_folder(cx))),
+                    .child(self.button("add", "Add Folder", cx, |this, _, cx| this.add_folder(cx)))
+                    .child(self.button("settings", "Settings", cx, |this, window, cx| {
+                        this.screen = Screen::Settings;
+                        window.focus(&this.focus);
+                        cx.notify();
+                    })),
             )
             .into_any_element()
     }
@@ -2363,6 +2380,7 @@ impl Render for Shell {
             Screen::Show(name) => Ok(self.show_page(&name, cx)),
             Screen::Details(key) => Ok(self.details_page(&key, cx)),
             Screen::Connect => Ok(self.connect_page(window, cx)),
+            Screen::Settings => Ok(self.settings_page(cx)),
         };
         // Sections scroll as one page; the grids scroll (and virtualize) themselves.
         let content = match body {

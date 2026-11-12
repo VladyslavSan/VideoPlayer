@@ -133,6 +133,12 @@ impl Controls {
         Ok(())
     }
 
+    pub fn set_skip(&self, previous: bool, next: bool) -> Result<()> {
+        self.smtc.SetIsPreviousEnabled(previous)?;
+        self.smtc.SetIsNextEnabled(next)?;
+        Ok(())
+    }
+
     pub fn update(&self, playing: bool, position: f64, duration: f64) -> Result<()> {
         self.smtc.SetPlaybackStatus(if playing {
             MediaPlaybackStatus::Playing

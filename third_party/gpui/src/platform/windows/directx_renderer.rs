@@ -375,7 +375,10 @@ impl DirectXRenderer {
             context.Unmap(&staging, 0);
         }
         let image = image::RgbaImage::from_raw(width, height, pixels).context("frame size")?;
-        image.save(path)?;
+        // Renamed into place, so a reader never sees half a file.
+        let partial = path.with_extension("partial.png");
+        image.save(&partial)?;
+        std::fs::rename(&partial, path)?;
         Ok(())
     }
 
