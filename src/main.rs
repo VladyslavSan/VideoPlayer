@@ -8,6 +8,7 @@ mod media_session;
 mod player;
 mod secrets;
 mod shell;
+mod test_window;
 mod ui;
 mod video;
 
@@ -47,22 +48,37 @@ fn main() {
                 .detach();
             }
             let bounds = Bounds::centered(None, size(px(1280.0), px(800.0)), cx);
+            let testing = test_window::enabled();
             let options = WindowOptions {
                 window_bounds: Some(WindowBounds::Windowed(bounds)),
                 titlebar: Some(TitlebarOptions {
                     title: Some("Video Player".into()),
                     ..Default::default()
                 }),
+                // A test window is shown by `test_window::show` instead.
+                focus: !testing,
+                show: !testing,
                 ..Default::default()
             };
-            cx.open_window(options, |window, cx| {
-                cx.new(|cx| {
-                    Shell::new(paths.clone(), source.clone(), window, cx)
-                        .expect("failed to open the library")
+            let handle = cx
+                .open_window(options, |window, cx| {
+                    cx.new(|cx| {
+                        Shell::new(paths.clone(), source.clone(), window, cx)
+                            .expect("failed to open the library")
+                    })
                 })
-            })
-            .expect("failed to open the window");
-            cx.activate(true);
+                .expect("failed to open the window");
+            if testing {
+                // Outside any update of the app, so that GPUI takes in the
+                // size the window is given.
+                if let Ok(Some(hwnd)) =
+                    handle.update(cx, |_, window, _| test_window::handle(window))
+                {
+                    cx.spawn(async move |_| test_window::show(hwnd)).detach();
+                }
+            } else {
+                cx.activate(true);
+            }
         });
 }
 

@@ -312,7 +312,71 @@ impl DirectXRenderer {
                     scene.polychrome_sprites.len(),
                     scene.surfaces.len(),))?;
         }
+        if let Some(path) = crate::frame_capture::take_request() {
+            self.save_frame(&path)
+                .with_context(|| format!("saving the frame to {}", path.display()))
+                .log_err();
+        }
         self.present()
+    }
+
+    /// Copies the frame just drawn to `path` as a PNG (straight alpha).
+    fn save_frame(&self, path: &std::path::Path) -> Result<()> {
+        let (width, height) = (self.resources.width, self.resources.height);
+        let desc = D3D11_TEXTURE2D_DESC {
+            Width: width,
+            Height: height,
+            MipLevels: 1,
+            ArraySize: 1,
+            Format: RENDER_TARGET_FORMAT,
+            SampleDesc: DXGI_SAMPLE_DESC {
+                Count: 1,
+                Quality: 0,
+            },
+            Usage: D3D11_USAGE_STAGING,
+            BindFlags: 0,
+            CPUAccessFlags: D3D11_CPU_ACCESS_READ.0 as u32,
+            MiscFlags: 0,
+        };
+        let device = &self.devices.device;
+        let context = &self.devices.device_context;
+        let mut staging = None;
+        unsafe { device.CreateTexture2D(&desc, None, Some(&mut staging))? };
+        let staging = staging.context("no staging texture")?;
+        let mut pixels = vec![0u8; (width * height * 4) as usize];
+        unsafe {
+            // The buffer drawn into this frame (flip-model buffers rotate).
+            let back_buffer: ID3D11Texture2D = self.resources.swap_chain.GetBuffer(0)?;
+            context.CopyResource(&staging, &back_buffer);
+            let mut mapped = D3D11_MAPPED_SUBRESOURCE::default();
+            context.Map(&staging, 0, D3D11_MAP_READ, 0, Some(&mut mapped))?;
+            for y in 0..height as usize {
+                let row = std::slice::from_raw_parts(
+                    (mapped.pData as *const u8).add(y * mapped.RowPitch as usize),
+                    width as usize * 4,
+                );
+                for (x, bgra) in row.chunks_exact(4).enumerate() {
+                    let alpha = bgra[3];
+                    // Premultiplied BGRA to straight RGBA.
+                    let straight = |c: u8| {
+                        if alpha == 0 {
+                            0
+                        } else {
+                            ((c as u32 * 255 + alpha as u32 / 2) / alpha as u32).min(255) as u8
+                        }
+                    };
+                    let out = (y * width as usize + x) * 4;
+                    pixels[out] = straight(bgra[2]);
+                    pixels[out + 1] = straight(bgra[1]);
+                    pixels[out + 2] = straight(bgra[0]);
+                    pixels[out + 3] = alpha;
+                }
+            }
+            context.Unmap(&staging, 0);
+        }
+        let image = image::RgbaImage::from_raw(width, height, pixels).context("frame size")?;
+        image.save(path)?;
+        Ok(())
     }
 
     pub(crate) fn resize(&mut self, new_size: Size<DevicePixels>) -> Result<()> {

@@ -1,5 +1,6 @@
 //! Playback screen: the mpv video layer plus GPUI controls drawn above it.
 
+mod previews;
 mod segments;
 mod tracks;
 mod view;
@@ -19,6 +20,7 @@ use crate::library::{SubtitlePref, TrackPrefs, WATCHED_FRACTION};
 use crate::media_session::{self, MediaCommand, MediaSession, NowPlaying};
 use crate::video::{ExternalSubtitle, Segment, SegmentKind, Track, TrackKind, VideoSurface};
 
+pub use previews::Previews;
 pub use segments::merge as merge_segments;
 
 /// Where intro/credits markers came from, best first.
@@ -187,6 +189,8 @@ pub struct Player {
     last_activity: Instant,
     last_report: Instant,
     pipeline: String,
+    /// Pictures for the seek bar's hover preview, when available.
+    previews: Option<Previews>,
     // Laid-out bounds of the sliders, written during paint, read by mouse handlers.
     seek_bounds: Rc<Cell<Bounds<Pixels>>>,
     volume_bounds: Rc<Cell<Bounds<Pixels>>>,
@@ -325,6 +329,7 @@ impl Player {
             last_activity: Instant::now(),
             last_report: Instant::now(),
             pipeline: String::new(),
+            previews: None,
             seek_bounds: Rc::default(),
             volume_bounds: Rc::default(),
             media,
@@ -382,6 +387,18 @@ impl Player {
     /// Switches to another stream of the same video (a different quality),
     /// at `start`, with the subtitle files that stream needs. Remembered
     /// track choices are applied again once it loads.
+    /// Saves the video as shown to `path` (tests).
+    pub fn screenshot(&self, path: &std::path::Path) {
+        if let Err(e) = self.video.screenshot(path) {
+            eprintln!("[test] {e:#}");
+        }
+    }
+
+    /// Shows pictures from `previews` when hovering the seek bar.
+    pub fn set_previews(&mut self, previews: Previews) {
+        self.previews = Some(previews);
+    }
+
     pub fn reload(
         &mut self,
         url: &str,
@@ -403,6 +420,10 @@ impl Player {
         self.subtitle_settled = false;
         self.up_next = None;
         self.quality = Some(quality);
+        if quality.transcodes() {
+            // Previews read the original file; not over a slow connection.
+            self.previews = None;
+        }
         self.status.buffering = true;
         self.toast(format!("Quality: {}", quality.label()));
         cx.notify();

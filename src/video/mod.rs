@@ -328,6 +328,14 @@ impl VideoSurface {
             .set_property("sub-pos", percent.round().clamp(0.0, 100.0) as i64);
     }
 
+    /// Saves what's on screen (the video as scaled to the window, with
+    /// subtitles) to `path`. For tests, where the screen can't be captured.
+    pub fn screenshot(&self, path: &std::path::Path) -> Result<()> {
+        self.mpv
+            .command("screenshot-to-file", &[&path.to_string_lossy(), "window"])
+            .map_err(|e| anyhow!("video screenshot: {e}"))
+    }
+
     /// One-line summary of the active video pipeline, for diagnostics.
     pub fn pipeline(&self) -> String {
         let prop = |name: &str| {

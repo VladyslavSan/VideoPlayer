@@ -70,7 +70,10 @@ playback (the pointer hides with it). Once hidden, it only comes back for a deli
 covers them. The subtitles button opens a panel with audio tracks, subtitle tracks (including
 external subtitle files on a Jellyfin server), playback speed, subtitle size and subtitle delay.
 The volume is remembered between videos. The timeline is split at chapter starts, with intros, recaps and credits highlighted;
-hovering it shows the time and the chapter's name.
+hovering it shows the time and the chapter's name. It also shows a picture of that moment: a second,
+hidden player opens the same video on the first hover and snapshots the spot (one picture per 10
+seconds, kept until the video closes). Not for transcoded Jellyfin streams, which are meant for
+slow connections.
 
 For TV shows, the bar adds **Next episode** and **Episodes** (a season-by-season list). When the
 credits start (or the episode ends), an "Up next" card counts down and plays the next one,
@@ -147,6 +150,12 @@ folder).
 - `VIDEO_PLAYER_MPV_LOG=<path>`: write mpv's verbose log
 - `VIDEO_PLAYER_MPV_OPTIONS="ao=null ..."`: extra mpv options (space-separated `key=value`)
 - `cargo run -- <file>`: play a file directly, without the library
+- `VIDEO_PLAYER_TEST_WINDOW=1`: for automated tests on a computer someone is using. The window
+  is cloaked (drawn but never shown), never takes focus and stays out of the taskbar, and the
+  app stays out of the system media controls (unless `VIDEO_PLAYER_TEST_MEDIA=1`). With
+  `VIDEO_PLAYER_TEST_CAPTURE=<dir>`, writing a name into `<dir>/request` makes the app save
+  `<name>.ui.png` (its own frame, transparent over the video) and `<name>.video.png` (mpv's);
+  layering the first over the second gives what the screen would show.
 - `python scripts/make_icon.py`: redraw `assets/app.ico` (embedded in the exe via `assets/app.rc`)
 
 Release builds have no console window; their diagnostics go to `app.log` in the data folder

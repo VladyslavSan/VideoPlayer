@@ -22,6 +22,9 @@ const BORDER: u32 = 0xffffff1a;
 const SEGMENT: u32 = 0xffcf5c99;
 /// The gaps that split the seek bar into chapters.
 const CHAPTER_GAP: u32 = 0x000000b3;
+/// The hover preview's picture.
+const PREVIEW_WIDTH: f32 = 240.0;
+const PREVIEW_HEIGHT: f32 = 135.0;
 /// More chapters than this are usually fixed-interval markers: no ticks.
 const MAX_CHAPTER_TICKS: usize = 40;
 
@@ -203,13 +206,32 @@ impl Player {
                 Some(chapter) => format!("{} · {chapter}", super::format_time(time)),
                 None => super::format_time(time),
             };
+            let picture = self.previews.as_ref().map(|previews| {
+                // Black until the first picture arrives.
+                div()
+                    .w(px(PREVIEW_WIDTH))
+                    .h(px(PREVIEW_HEIGHT))
+                    .rounded_lg()
+                    .overflow_hidden()
+                    .bg(rgb(0x000000))
+                    .border_1()
+                    .border_color(rgba(BORDER))
+                    .children(
+                        previews
+                            .frame_for(time)
+                            .map(|path| img(path).size_full().object_fit(ObjectFit::Contain)),
+                    )
+            });
             div()
                 .absolute()
                 .bottom(px(SLIDER_HEIGHT + 6.0))
                 .left(px(offset - 160.0))
                 .w(px(320.0))
                 .flex()
-                .justify_center()
+                .flex_col()
+                .items_center()
+                .gap_1p5()
+                .children(picture)
                 .child(
                     chip()
                         .max_w(px(320.0))

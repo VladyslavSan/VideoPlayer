@@ -76,6 +76,11 @@ impl Paths {
         })
     }
 
+    /// Seek bar preview pictures of the video playing (temporary).
+    pub fn previews(&self) -> PathBuf {
+        self.db.with_file_name("previews")
+    }
+
     /// Where the library last fetched from a server is kept.
     pub fn library_cache(&self, server: i64) -> PathBuf {
         self.db.with_file_name(format!("jellyfin-{server}.json"))
@@ -343,6 +348,9 @@ impl Shell {
             }
         })
         .detach();
+        if let Some(dir) = crate::test_window::capture_dir() {
+            shell.serve_test_captures(dir, window, cx);
+        }
         shell.reload();
         shell.load_cached_remote();
         shell.refresh(cx);
@@ -364,6 +372,37 @@ impl Shell {
             shell.start_player(source, None, playback, 0.0, None, window, cx);
         }
         Ok(shell)
+    }
+
+    /// Test runs: screenshots on request, taken by the app itself (see
+    /// `test_window::capture_dir`).
+    fn serve_test_captures(&self, dir: PathBuf, window: &mut Window, cx: &mut Context<Self>) {
+        cx.spawn_in(window, async move |this, cx| {
+            loop {
+                cx.background_executor()
+                    .timer(Duration::from_millis(100))
+                    .await;
+                let request = dir.join("request");
+                let Ok(name) = fs::read_to_string(&request) else {
+                    continue;
+                };
+                let _ = fs::remove_file(&request);
+                let name = name.trim().to_string();
+                gpui::frame_capture::capture_next_frame(dir.join(format!("{name}.ui.png")));
+                let served = this.update_in(cx, |this, window, cx| {
+                    if let Some(active) = &this.player {
+                        let video = dir.join(format!("{name}.video.png"));
+                        active.view.read(cx).screenshot(&video);
+                    }
+                    window.refresh();
+                    cx.notify();
+                });
+                if served.is_err() {
+                    break;
+                }
+            }
+        })
+        .detach();
     }
 
     fn items(&self) -> impl Iterator<Item = &Item> {
@@ -1235,14 +1274,26 @@ impl Shell {
         };
         self.error = None;
         let volume = self.saved_volume();
-        if self.media.is_none() {
+        if self.media.is_none() && crate::test_window::media_controls() {
             match MediaSession::new(window) {
                 Ok(media) => self.media = Some(Rc::new(media)),
                 Err(e) => eprintln!("[media] system media controls unavailable: {e:#}"),
             }
         }
         let media = self.media.clone();
-        let view = cx.new(|cx| Player::new(video, playback, volume, media, window, cx));
+        // Previews open the video a second time: not for transcoded streams,
+        // which are for connections too slow for that.
+        let previews = playback
+            .quality
+            .is_none_or(|q| !q.transcodes())
+            .then(|| player::Previews::start(&url, http_header.as_deref(), self.paths.previews()));
+        let view = cx.new(|cx| {
+            let mut player = Player::new(video, playback, volume, media, window, cx);
+            if let Some(previews) = previews {
+                player.set_previews(previews);
+            }
+            player
+        });
         let subscription = cx.subscribe_in(&view, window, |this, _, event, window, cx| {
             this.on_player_event(event, window, cx)
         });
