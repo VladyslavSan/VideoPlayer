@@ -127,7 +127,7 @@ pub fn matches(text: &str, query: &str) -> bool {
 }
 
 /// How many cards fit across the content area.
-fn columns(window: &Window) -> usize {
+pub(super) fn columns(window: &Window) -> usize {
     let width = f32::from(window.viewport_size().width) - 2.0 * PAGE_PADDING;
     (((width + CARD_GAP) / (CARD_WIDTH + CARD_GAP)).floor() as usize).max(1)
 }
@@ -254,7 +254,7 @@ impl Shell {
     ) -> AnyElement {
         let name = show.name.clone();
         let card = Card {
-            id: SharedString::from(format!("{prefix}-show-{}", show.name)).into(),
+            id: super::show_card_id(prefix, &show.name),
             thumb: show.thumb.clone(),
             title: show.name.clone(),
             subtitle: Some(show.subtitle()),
@@ -306,15 +306,22 @@ impl Shell {
                             }))
                     })),
             )
-            .child(
+            .child({
+                let scroll = self
+                    .row_scroll
+                    .borrow_mut()
+                    .entry(id.clone())
+                    .or_default()
+                    .clone();
                 div()
                     .id(id)
                     .flex()
                     .gap_5()
                     .pb_2()
                     .overflow_x_scroll()
-                    .children(cards),
-            )
+                    .track_scroll(&scroll)
+                    .children(cards)
+            })
             .into_any_element()
     }
 
@@ -493,6 +500,7 @@ impl Shell {
                     .collect::<Vec<_>>()
             }),
         )
+        .track_scroll(self.grid_scroll.clone())
         .flex_1()
         .min_h(px(0.0));
         div()

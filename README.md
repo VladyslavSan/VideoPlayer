@@ -114,6 +114,10 @@ Press **F1** (or `?`) in the player to see all shortcuts.
 
 ## Library
 
+The arrow keys move a ring between cards and Enter opens the one it's on (on a movie's page,
+Enter plays it); Esc goes back, with the ring where you left it. From the search field, Down
+moves into the results.
+
 **Home** shows Continue Watching (including the next episode of shows you're watching) and the
 latest additions to each library. Clicking an episode's picture plays it; clicking the text under
 it opens its show at that season, with the episode highlighted. Each Jellyfin library (Movies,

@@ -1,7 +1,7 @@
 //! App shell: the library screens (local folders and Jellyfin), the Jellyfin
 //! sign-in screen, and switching to and from the player.
 
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -11,8 +11,9 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use anyhow::{Context as _, Result, bail};
 use gpui::{
     AnyElement, Bounds, ClickEvent, Context, ElementId, Entity, FocusHandle, Focusable, FontWeight,
-    KeyDownEvent, MouseDownEvent, ObjectFit, PathPromptOptions, Pixels, ScrollHandle, SharedString,
-    Subscription, Window, canvas, div, img, point, prelude::*, px, rgb, rgba,
+    KeyDownEvent, MouseDownEvent, ObjectFit, PathPromptOptions, Pixels, ScrollHandle,
+    ScrollStrategy, SharedString, Subscription, UniformListScrollHandle, Window, canvas, div, img,
+    point, prelude::*, px, rgb, rgba,
 };
 
 use crate::introdb;
@@ -29,6 +30,7 @@ use crate::ui::text_input::TextInput;
 
 mod browse;
 mod details;
+mod keynav;
 mod reports;
 use browse::{Grid, Sort};
 use details::Details;
@@ -124,7 +126,7 @@ enum Screen {
 
 /// What a poster card shows.
 struct Card {
-    id: ElementId,
+    id: SharedString,
     thumb: Option<PathBuf>,
     title: String,
     subtitle: Option<String>,
@@ -132,6 +134,23 @@ struct Card {
     watched: bool,
     /// Ringed: the episode a show page was opened at.
     highlight: bool,
+}
+
+/// Cards drawn in a frame: element id and where.
+type CardBounds = Rc<RefCell<Vec<(SharedString, Bounds<Pixels>)>>>;
+
+/// What Enter does on a card: the same as clicking it.
+type CardAction = Rc<dyn Fn(&mut Shell, &mut Window, &mut Context<Shell>)>;
+
+/// Room kept between the card picked with the keyboard and the page's edge.
+const CURSOR_MARGIN: f32 = 24.0;
+
+fn item_card_id(prefix: &str, item: &Item) -> SharedString {
+    format!("{prefix}-{}", item.key()).into()
+}
+
+fn show_card_id(prefix: &str, show: &str) -> SharedString {
+    format!("{prefix}-show-{show}").into()
 }
 
 /// How long a show page opened at an episode keeps it in place while the
@@ -223,6 +242,21 @@ pub struct Shell {
     focus_scroll: Option<FocusScroll>,
     /// The system's media controls, set up with the first video.
     media: Option<Rc<MediaSession>>,
+    /// The card picked with the arrow keys (its element id), if any.
+    cursor: Option<SharedString>,
+    /// Each screen's cursor when it was left, to put back on return.
+    cursors: Vec<(Screen, SharedString)>,
+    /// Every card drawn in the last frame, and the screen it was drawn for.
+    card_bounds: CardBounds,
+    bounds_screen: Option<Screen>,
+    /// What Enter does for each card being drawn.
+    card_actions: RefCell<HashMap<SharedString, CardAction>>,
+    /// Sideways scrolling of the rows on the home page, by row id.
+    row_scroll: RefCell<HashMap<SharedString, ScrollHandle>>,
+    /// Scrolling of the library grids.
+    grid_scroll: UniformListScrollHandle,
+    /// Bring the cursor's card into view once it has been drawn.
+    reveal_cursor: bool,
 }
 
 impl Shell {
@@ -273,6 +307,14 @@ impl Shell {
             focus_bounds: Rc::default(),
             focus_scroll: None,
             media: None,
+            cursor: None,
+            cursors: Vec::new(),
+            card_bounds: Rc::default(),
+            bounds_screen: None,
+            card_actions: RefCell::default(),
+            row_scroll: RefCell::default(),
+            grid_scroll: UniformListScrollHandle::new(),
+            reveal_cursor: false,
             player: None,
             scanning: false,
             loading_servers: HashSet::new(),
@@ -1352,6 +1394,36 @@ impl Shell {
 
     fn on_key(&mut self, event: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
         let key = event.keystroke.key.as_str();
+        let browsing = !matches!(self.screen, Screen::Connect);
+        let modifiers = &event.keystroke.modifiers;
+        let plain = !(modifiers.control || modifiers.alt || modifiers.platform || modifiers.shift);
+        if browsing && plain {
+            let searching = self.search.focus_handle(cx).is_focused(window);
+            match keynav::Direction::from_key(key) {
+                // From the search field, Down goes into the results.
+                Some(keynav::Direction::Down) if searching => {
+                    window.focus(&self.focus);
+                    self.cursor = None;
+                    if self.move_cursor(keynav::Direction::Down, window, cx) {
+                        return cx.stop_propagation();
+                    }
+                }
+                Some(direction) if !searching && self.move_cursor(direction, window, cx) => {
+                    return cx.stop_propagation();
+                }
+                _ => {}
+            }
+            if key == "enter" && !searching {
+                if self.activate_cursor(window, cx) {
+                    return cx.stop_propagation();
+                }
+                // A movie's page has no cards: Enter is its Play button.
+                if let Screen::Details(item) = self.screen.clone() {
+                    self.play(&item, window, cx);
+                    return cx.stop_propagation();
+                }
+            }
+        }
         match (&self.screen, key) {
             (Screen::Connect, "escape") if self.quality_menu.is_some() => {
                 self.quality_menu = None;
@@ -1503,7 +1575,14 @@ impl Shell {
             watched,
             highlight,
         } = card;
-        let text_id = ElementId::NamedChild(Box::new(id.clone()), "text".into());
+        let text_id = ElementId::NamedChild(Box::new(id.clone().into()), "text".into());
+        let selected = self.cursor.as_ref() == Some(&id);
+        let on_click: CardAction = Rc::new(on_click);
+        self.card_actions
+            .borrow_mut()
+            .insert(id.clone(), on_click.clone());
+        let registry = self.card_bounds.clone();
+        let key = id.clone();
         let color = PLACEHOLDER_COLORS
             [title.bytes().map(usize::from).sum::<usize>() % PLACEHOLDER_COLORS.len()];
         let initial: String = title.chars().next().map(String::from).unwrap_or_default();
@@ -1531,6 +1610,7 @@ impl Shell {
 
         div()
             .id(id)
+            .relative()
             .flex_none()
             .w(px(CARD_WIDTH))
             .flex()
@@ -1539,6 +1619,17 @@ impl Shell {
             .cursor_pointer()
             .hover(|s| s.opacity(0.85))
             .child(
+                // Records where the card is, for the arrow keys.
+                canvas(
+                    move |b, _, _| registry.borrow_mut().push((key, b)),
+                    |_, _, _, _| {},
+                )
+                .absolute()
+                .top_0()
+                .left_0()
+                .size_full(),
+            )
+            .child(
                 div()
                     .relative()
                     .w_full()
@@ -1546,7 +1637,9 @@ impl Shell {
                     .rounded_lg()
                     .overflow_hidden()
                     .bg(rgb(color))
-                    .when(highlight, |d| d.border_2().border_color(rgb(ACCENT)))
+                    .when(highlight || selected, |d| {
+                        d.border_2().border_color(rgb(ACCENT))
+                    })
                     .child(art)
                     .children(highlight.then(|| {
                         // Records where the card is, so the page can scroll to it.
@@ -1616,6 +1709,150 @@ impl Shell {
             .into_any_element()
     }
 
+    /// Moves the keyboard cursor; false if there's nothing to move between.
+    fn move_cursor(
+        &mut self,
+        direction: keynav::Direction,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let grid = Grid::of(&self.screen).filter(|_| self.search_query(cx).is_empty());
+        if let Some(grid) = grid {
+            let ids: Vec<SharedString> = if grid.shows {
+                self.shows(&grid)
+                    .iter()
+                    .map(|s| show_card_id("all", &s.name))
+                    .collect()
+            } else {
+                self.movies(&grid)
+                    .iter()
+                    .map(|m| item_card_id("movie", m))
+                    .collect()
+            };
+            let columns = browse::columns(window);
+            let current = self
+                .cursor
+                .as_ref()
+                .and_then(|c| ids.iter().position(|id| id == c));
+            let next = match current {
+                // Start at the first card in view.
+                None => {
+                    let view = self.grid_scroll.0.borrow().base_handle.bounds();
+                    self.first_card_in(view)
+                        .and_then(|first| ids.iter().position(|id| *id == first))
+                        .or((!ids.is_empty()).then_some(0))
+                }
+                Some(i) => keynav::grid_step(i, ids.len(), columns, direction),
+            };
+            if let Some(next) = next.filter(|n| *n < ids.len()) {
+                self.cursor = Some(ids[next].clone());
+                self.grid_scroll
+                    .scroll_to_item(next / columns, ScrollStrategy::Top);
+            }
+            cx.notify();
+            return !ids.is_empty();
+        }
+
+        let cards = self.card_bounds.borrow().clone();
+        if cards.is_empty() {
+            return false;
+        }
+        let rect = |b: &Bounds<Pixels>| keynav::Rect {
+            left: f32::from(b.left()),
+            top: f32::from(b.top()),
+            right: f32::from(b.right()),
+            bottom: f32::from(b.bottom()),
+        };
+        let current = self
+            .cursor
+            .as_ref()
+            .and_then(|c| cards.iter().position(|(id, _)| id == c));
+        let next = match current {
+            Some(i) => {
+                let rects: Vec<keynav::Rect> = cards.iter().map(|(_, b)| rect(b)).collect();
+                keynav::nearest(rects[i], &rects, direction)
+            }
+            None => self
+                .first_card_in(self.content_scroll.bounds())
+                .and_then(|first| cards.iter().position(|(id, _)| *id == first)),
+        };
+        if let Some(next) = next {
+            let (id, bounds) = cards[next].clone();
+            self.cursor = Some(id);
+            self.reveal(bounds);
+        }
+        cx.notify();
+        true
+    }
+
+    /// The top-left card drawn within `view`, where the cursor starts.
+    fn first_card_in(&self, view: Bounds<Pixels>) -> Option<SharedString> {
+        self.card_bounds
+            .borrow()
+            .iter()
+            .filter(|(_, b)| {
+                b.bottom() > view.top()
+                    && b.top() < view.bottom()
+                    && b.left() >= view.left() - px(1.0)
+            })
+            .min_by(|(_, a), (_, b)| {
+                (a.top(), a.left())
+                    .partial_cmp(&(b.top(), b.left()))
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            })
+            .map(|(id, _)| id.clone())
+    }
+
+    /// Scrolls the page, and the row the card is in, so `card` is in view.
+    fn reveal(&self, card: Bounds<Pixels>) {
+        let margin = px(CURSOR_MARGIN);
+        let handle = &self.content_scroll;
+        let (view, offset, max) = (handle.bounds(), handle.offset(), handle.max_offset());
+        let mut y = offset.y;
+        if card.top() < view.top() + margin {
+            y += view.top() + margin - card.top();
+        } else if card.bottom() > view.bottom() - margin {
+            y -= card.bottom() - (view.bottom() - margin);
+        }
+        let y = y.clamp(-max.height, px(0.0));
+        if y != offset.y {
+            handle.set_offset(point(offset.x, y));
+        }
+        let center = card.top() + card.size.height / 2.0;
+        for row in self.row_scroll.borrow().values() {
+            let view = row.bounds();
+            if center < view.top() || center > view.bottom() {
+                continue;
+            }
+            let (offset, max) = (row.offset(), row.max_offset());
+            let mut x = offset.x;
+            if card.left() < view.left() {
+                x += view.left() - card.left();
+            } else if card.right() > view.right() {
+                x -= card.right() - view.right();
+            }
+            let x = x.clamp(-max.width, px(0.0));
+            if x != offset.x {
+                row.set_offset(point(x, offset.y));
+            }
+        }
+    }
+
+    /// Enter on the keyboard cursor: what clicking its card does.
+    fn activate_cursor(&mut self, window: &mut Window, cx: &mut Context<Self>) -> bool {
+        let action = self
+            .cursor
+            .as_ref()
+            .and_then(|c| self.card_actions.borrow().get(c).cloned());
+        match action {
+            Some(action) => {
+                action(self, window, cx);
+                true
+            }
+            None => false,
+        }
+    }
+
     fn item_card(
         &self,
         prefix: &str,
@@ -1635,7 +1872,7 @@ impl Shell {
         };
         let key = item.key();
         let card = Card {
-            id: SharedString::from(format!("{prefix}-{key}")).into(),
+            id: item_card_id(prefix, item),
             thumb: item.thumb.clone(),
             title,
             subtitle,
@@ -1752,8 +1989,24 @@ impl Shell {
     /// each frame for a moment, unless the viewer scrolls first.
     fn update_scroll(&mut self, window: &mut Window) {
         if self.scrolled_screen.as_ref() != Some(&self.screen) {
+            if let (Some(old), Some(cursor)) = (self.scrolled_screen.take(), self.cursor.take()) {
+                self.cursors.retain(|(screen, _)| *screen != old);
+                self.cursors.push((old, cursor));
+                if self.cursors.len() > 20 {
+                    self.cursors.remove(0);
+                }
+            }
+            self.cursor = self
+                .cursors
+                .iter()
+                .find(|(screen, _)| *screen == self.screen)
+                .map(|(_, cursor)| cursor.clone());
+            self.reveal_cursor = self.cursor.is_some();
             self.scrolled_screen = Some(self.screen.clone());
             self.content_scroll.set_offset(point(px(0.0), px(0.0)));
+        }
+        if self.reveal_cursor {
+            self.reveal_restored_cursor(window);
         }
         let Some(focus) = &mut self.focus_scroll else {
             return;
@@ -1778,6 +2031,48 @@ impl Shell {
             handle.set_offset(point(offset.x, y));
         }
         focus.applied = Some(y);
+    }
+
+    /// Brings a cursor put back on return into view: in a grid by its
+    /// index, on a page once the page has been drawn.
+    fn reveal_restored_cursor(&mut self, window: &mut Window) {
+        let Some(cursor) = self.cursor.clone() else {
+            self.reveal_cursor = false;
+            return;
+        };
+        if let Some(grid) = Grid::of(&self.screen) {
+            let columns = browse::columns(window);
+            let index = if grid.shows {
+                let shows = self.shows(&grid);
+                shows
+                    .iter()
+                    .position(|s| show_card_id("all", &s.name) == cursor)
+            } else {
+                self.movies(&grid)
+                    .iter()
+                    .position(|m| item_card_id("movie", m) == cursor)
+            };
+            if let Some(index) = index {
+                self.grid_scroll
+                    .scroll_to_item(index / columns, ScrollStrategy::Center);
+            }
+            self.reveal_cursor = false;
+            return;
+        }
+        if self.bounds_screen.as_ref() != Some(&self.screen) {
+            window.request_animation_frame();
+            return;
+        }
+        let card = self
+            .card_bounds
+            .borrow()
+            .iter()
+            .find(|(id, _)| *id == cursor)
+            .map(|(_, b)| *b);
+        if let Some(card) = card {
+            self.reveal(card);
+        }
+        self.reveal_cursor = false;
     }
 
     fn show_page(&self, show: &str, cx: &mut Context<Self>) -> Vec<AnyElement> {
@@ -1998,6 +2293,10 @@ impl Render for Shell {
             self.tab = Screen::Home;
         }
         self.update_scroll(window);
+        // Refilled as this frame's cards are laid out.
+        self.card_bounds.borrow_mut().clear();
+        self.card_actions.borrow_mut().clear();
+        self.bounds_screen = Some(self.screen.clone());
         let query = self.search_query(cx);
         let on_tab = matches!(
             self.screen,
