@@ -313,14 +313,18 @@ impl Shell {
                     .entry(id.clone())
                     .or_default()
                     .clone();
-                div()
+                let mut row = div()
                     .id(id)
                     .flex()
                     .gap_5()
                     .pb_2()
                     .overflow_x_scroll()
                     .track_scroll(&scroll)
-                    .children(cards)
+                    .children(cards);
+                // The mouse wheel scrolls the page, not the row under the
+                // pointer; rows move with shift+wheel, a trackpad or the arrows.
+                row.style().restrict_scroll_to_axis = Some(true);
+                row
             })
             .into_any_element()
     }

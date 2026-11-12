@@ -2384,16 +2384,20 @@ impl Render for Shell {
         };
         // Sections scroll as one page; the grids scroll (and virtualize) themselves.
         let content = match body {
-            Ok(sections) => div()
-                .id("content")
-                .flex_1()
-                .min_h(px(0.0))
-                .overflow_y_scroll()
-                .track_scroll(&self.content_scroll)
-                .px_8()
-                .pb_10()
-                .children(sections)
-                .into_any_element(),
+            Ok(sections) => {
+                let mut page = div()
+                    .id("content")
+                    .flex_1()
+                    .min_h(px(0.0))
+                    .overflow_y_scroll()
+                    .track_scroll(&self.content_scroll)
+                    .px_8()
+                    .pb_10()
+                    .children(sections);
+                // Sideways scrolling (shift+wheel, trackpad) is for the rows.
+                page.style().restrict_scroll_to_axis = Some(true);
+                page.into_any_element()
+            }
             Err(grid) => grid,
         };
         div()
