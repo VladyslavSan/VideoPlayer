@@ -42,14 +42,15 @@ The app uses a single window, with the video below GPUI's UI.
 
 ## Jellyfin
 
-Click **Jellyfin** and sign in to your server. Servers that answer Jellyfin's network
+Open **Settings → Library** and click **Add Server** to sign in. You can add several servers,
+or one server as different users. Servers that answer Jellyfin's network
 discovery are listed automatically; otherwise type the address (`192.168.1.10:8096`, a full
 `https://` URL, or a link copied from Jellyfin's web app).
 
 Your password is never stored. The access token Jellyfin issues goes into the system
 credential store (Windows Credential Manager or the macOS Keychain), which
 encrypts it for your user account; `library.db` keeps only the server address and user name.
-**Sign Out** revokes the token on the server and deletes it locally.
+Each server's **Sign Out** (in Settings → Library) revokes the token on the server and deletes it locally.
 
 - Movies and episodes appear in the same library as local folders, with the server's artwork.
 - Files are direct-played by default, so HDR and hardware decoding work as they do for local files.
@@ -94,7 +95,7 @@ The player shows up in the system's media controls (the Windows media flyout, th
 Playing menu) with the title and artwork. Headphone buttons and keyboard media keys play and
 pause, even while another window is in front; next and previous switch episodes, and the
 flyout's timeline seeks. To keep headphone skip buttons from changing episodes, turn off
-**Settings → Next and previous switch episodes**; play and pause keep working.
+**Settings → Playback → Next and previous switch episodes**; play and pause keep working.
 
 The Jellyfin library is cached on disk, so it shows instantly at start and stays browsable when
 the server is offline.
@@ -139,7 +140,7 @@ video/audio/subtitle tracks (from Jellyfin), **Play** or **Resume**, **Play from
 **Mark as watched/unwatched** (synced to the server). A show's page starts with its backdrop,
 overview and a button for the episode to watch next.
 
-Add folders with **Add Folder**. They are scanned in the background, and movie and
+Add folders under **Settings → Library → Add Folder** (and take them out again with **Remove**). They are scanned in the background, and movie and
 episode names are parsed from file and folder names (`Title (Year)`, `Show.S01E02`,
 `Show - 1x02`, `Show/Season 1/...`). Thumbnails are taken from a frame of each video.
 Watch progress is saved every 5 seconds, so playback resumes where you left off.

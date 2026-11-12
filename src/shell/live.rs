@@ -27,7 +27,8 @@ impl Shell {
             .filter(|s| !s.token.is_empty())
             .map(|s| (s.id, s.token.clone()))
             .collect();
-        self.live.retain(|id, (token, _)| wanted.contains(&(*id, token.clone())));
+        self.live
+            .retain(|id, (token, _)| wanted.contains(&(*id, token.clone())));
         for server in self.servers.clone() {
             if server.token.is_empty() || self.live.contains_key(&server.id) {
                 continue;
@@ -65,7 +66,9 @@ impl Shell {
         self.live_refresh_pending = true;
         let wait = self
             .remote_refreshed
-            .map_or(Duration::ZERO, |at| MIN_INTERVAL.saturating_sub(at.elapsed()))
+            .map_or(Duration::ZERO, |at| {
+                MIN_INTERVAL.saturating_sub(at.elapsed())
+            })
             .max(SETTLE);
         cx.spawn(async move |this, cx| {
             cx.background_executor().timer(wait).await;

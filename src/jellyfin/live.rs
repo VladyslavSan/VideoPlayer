@@ -230,7 +230,8 @@ mod tests {
 
     #[test]
     fn reads_the_message_type() {
-        let text = r#"{"MessageType":"LibraryChanged","Data":{"ItemsAdded":["a"]},"MessageId":"x"}"#;
+        let text =
+            r#"{"MessageType":"LibraryChanged","Data":{"ItemsAdded":["a"]},"MessageId":"x"}"#;
         assert_eq!(message_type(text).as_deref(), Some("LibraryChanged"));
         assert_eq!(message_type("not json"), None);
     }

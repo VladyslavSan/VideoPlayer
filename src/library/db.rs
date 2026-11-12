@@ -125,6 +125,18 @@ impl Db {
         Ok(n > 0)
     }
 
+    /// Takes a folder out of the library, with its videos and their
+    /// progress; the files themselves stay where they are.
+    pub fn remove_root(&self, root: &Path) -> Result<()> {
+        self.transaction(|db| {
+            db.conn
+                .execute("DELETE FROM items WHERE root = ?1", [path_key(root)])?;
+            db.conn
+                .execute("DELETE FROM roots WHERE path = ?1", [path_key(root)])?;
+            Ok(())
+        })
+    }
+
     /// Inserts a file, or refreshes its metadata while keeping watch progress.
     /// A changed size or mtime means a new file, so its thumbnail is redone.
     pub fn upsert_file(&self, root: &Path, file: &FileInfo) -> Result<()> {
@@ -623,6 +635,27 @@ mod tests {
         assert!(db.add_root(Path::new("D:/Movies"))?);
         assert!(!db.add_root(Path::new("D:/Movies"))?);
         assert_eq!(db.roots()?, vec![PathBuf::from("D:/Movies")]);
+        Ok(())
+    }
+
+    #[test]
+    fn removing_a_root_removes_its_items_only() -> Result<()> {
+        let db = Db::open_in_memory()?;
+        db.add_root(Path::new("D:/Movies"))?;
+        db.add_root(Path::new("E:/Shows"))?;
+        db.upsert_file(
+            Path::new("D:/Movies"),
+            &file("D:/Movies/Heat (1995).mkv", 1, 1),
+        )?;
+        db.upsert_file(
+            Path::new("E:/Shows"),
+            &file("E:/Shows/Lost S01E01.mkv", 1, 1),
+        )?;
+        db.remove_root(Path::new("D:/Movies"))?;
+        assert_eq!(db.roots()?, vec![PathBuf::from("E:/Shows")]);
+        let items = db.items()?;
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].show.as_deref(), Some("Lost"));
         Ok(())
     }
 }

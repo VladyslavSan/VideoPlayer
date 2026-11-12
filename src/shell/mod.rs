@@ -36,6 +36,7 @@ mod reports;
 mod settings;
 use browse::{Grid, Sort};
 use details::Details;
+use settings::SettingsPage;
 
 const BG: u32 = 0x0b0d12;
 const TEXT: u32 = 0xf4f5f7;
@@ -128,7 +129,6 @@ enum Screen {
     Show(String),
     /// A movie's details page, by item key.
     Details(String),
-    Connect,
     Settings,
 }
 
@@ -232,6 +232,9 @@ pub struct Shell {
     form: ConnectForm,
     /// The server whose streaming quality menu is open.
     quality_menu: Option<i64>,
+    /// The Settings page shown, and whether its sign-in form is open.
+    settings_page: SettingsPage,
+    adding_server: bool,
     reports: reports::Reports,
     /// The item whose resume point is being asked from the server.
     starting: Option<String>,
@@ -310,6 +313,8 @@ impl Shell {
             details: HashMap::new(),
             details_loading: HashSet::new(),
             quality_menu: None,
+            settings_page: SettingsPage::default(),
+            adding_server: false,
             reports: reports::Reports::default(),
             starting: None,
             remote_refreshed: None,
@@ -735,16 +740,6 @@ impl Shell {
         .detach();
     }
 
-    fn open_connect(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        self.screen = Screen::Connect;
-        self.form.error = None;
-        window.focus(&self.form.url.focus_handle(cx));
-        if self.form.found.is_empty() && !self.form.searching {
-            self.discover(cx);
-        }
-        cx.notify();
-    }
-
     fn discover(&mut self, cx: &mut Context<Self>) {
         self.form.searching = true;
         cx.spawn(async move |this, cx| {
@@ -815,8 +810,14 @@ impl Shell {
                         this.form
                             .password
                             .update(cx, |input, cx| input.set_text("", cx));
+                        // A first library goes straight to Home; another
+                        // server shows up in the Settings list.
+                        let first = this.servers.is_empty() && this.roots.is_empty();
                         this.reload();
-                        this.screen = Screen::Home;
+                        this.adding_server = false;
+                        if first {
+                            this.screen = Screen::Home;
+                        }
                         window.focus(&focus);
                         this.refresh_remote(cx);
                     }
@@ -1459,7 +1460,7 @@ impl Shell {
 
     fn on_key(&mut self, event: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
         let key = event.keystroke.key.as_str();
-        let browsing = !matches!(self.screen, Screen::Connect);
+        let browsing = !matches!(self.screen, Screen::Settings);
         let modifiers = &event.keystroke.modifiers;
         let plain = !(modifiers.control || modifiers.alt || modifiers.platform || modifiers.shift);
         if browsing && plain {
@@ -1490,13 +1491,19 @@ impl Shell {
             }
         }
         match (&self.screen, key) {
-            (Screen::Connect, "escape") if self.quality_menu.is_some() => {
+            (Screen::Settings, "escape") if self.quality_menu.is_some() => {
                 self.quality_menu = None;
                 cx.notify();
             }
-            (Screen::Connect, "enter") => self.connect(window, cx),
-            (Screen::Connect, "tab") => self.focus_next_field(window, cx),
-            (Screen::Connect | Screen::Settings, "escape")
+            (Screen::Settings, "escape") if self.adding_server => {
+                self.adding_server = false;
+                self.form.error = None;
+                window.focus(&self.focus);
+                cx.notify();
+            }
+            (Screen::Settings, "enter") if self.adding_server => self.connect(window, cx),
+            (Screen::Settings, "tab") if self.adding_server => self.focus_next_field(window, cx),
+            (Screen::Settings, "escape")
             | (Screen::Show(_) | Screen::Details(_), "escape" | "backspace") => {
                 self.screen = self.tab.clone();
                 window.focus(&self.focus);
@@ -1555,19 +1562,12 @@ impl Shell {
         let title: AnyElement = match &self.screen {
             Screen::Home | Screen::Movies(_) | Screen::Shows(_) => self.tabs(cx),
             Screen::Show(_) | Screen::Details(_) => back(self, cx),
-            Screen::Connect | Screen::Settings => div()
+            Screen::Settings => div()
                 .flex()
                 .items_center()
                 .gap_3()
                 .child(back(self, cx))
-                .child(heading(
-                    if self.screen == Screen::Settings {
-                        "Settings"
-                    } else {
-                        "Jellyfin"
-                    }
-                    .into(),
-                ))
+                .child(heading("Settings".into()))
                 .into_any_element(),
         };
         let status = if self.scanning {
@@ -1620,14 +1620,10 @@ impl Shell {
                     .children(can_refresh.then(|| {
                         self.button("refresh", "Refresh", cx, |this, _, cx| this.refresh(cx))
                     }))
-                    .child(self.button("jellyfin", "Jellyfin", cx, |this, window, cx| {
-                        this.open_connect(window, cx)
-                    }))
-                    .child(self.button("add", "Add Folder", cx, |this, _, cx| this.add_folder(cx)))
-                    .child(self.button("settings", "Settings", cx, |this, window, cx| {
-                        this.screen = Screen::Settings;
-                        window.focus(&this.focus);
-                        cx.notify();
+                    .children((self.screen != Screen::Settings).then(|| {
+                        self.button("settings", "Settings", cx, |this, window, cx| {
+                            this.open_settings(this.settings_page, window, cx)
+                        })
                     })),
             )
             .into_any_element()
@@ -2239,118 +2235,6 @@ impl Shell {
         }
         picker.into_any_element()
     }
-
-    fn connect_page(&self, window: &Window, cx: &mut Context<Self>) -> Vec<AnyElement> {
-        let form = &self.form;
-        let found: Vec<AnyElement> = form
-            .found
-            .iter()
-            .enumerate()
-            .map(|(i, server)| {
-                let address = server.address.clone();
-                self.button(
-                    SharedString::from(format!("found-{i}")),
-                    format!("{} · {}", server.name, server.address),
-                    cx,
-                    move |this, _, cx| {
-                        let address = address.clone();
-                        this.form
-                            .url
-                            .update(cx, |input, cx| input.set_text(address, cx));
-                    },
-                )
-            })
-            .collect();
-        let network_note = if form.searching {
-            Some("Looking for servers on your network…")
-        } else if form.found.is_empty() {
-            Some("No servers found on your network. Enter the address instead.")
-        } else {
-            None
-        };
-
-        let sign_in = div()
-            .flex()
-            .flex_col()
-            .gap_4()
-            .w(px(440.0))
-            .child(
-                div()
-                    .flex()
-                    .flex_col()
-                    .gap_2()
-                    .children(network_note.map(|n| div().text_sm().text_color(rgb(MUTED)).child(n)))
-                    .child(div().flex().flex_wrap().gap_2().children(found)),
-            )
-            .child(Self::field("Server address", &form.url))
-            .child(Self::field("Username", &form.user))
-            .child(Self::field("Password", &form.password))
-            .child(
-                div()
-                    .flex()
-                    .items_center()
-                    .gap_3()
-                    .child(self.button(
-                        "sign-in",
-                        if form.busy {
-                            "Signing in…"
-                        } else {
-                            "Sign In"
-                        },
-                        cx,
-                        |this, window, cx| this.connect(window, cx),
-                    ))
-                    .children(
-                        form.error
-                            .clone()
-                            .map(|e| div().text_sm().text_color(rgb(ERROR)).child(e)),
-                    ),
-            );
-
-        let mut sections = vec![Self::section("Sign in to a server", sign_in)];
-        if !self.servers.is_empty() {
-            let rows: Vec<AnyElement> = self
-                .servers
-                .iter()
-                .map(|server| {
-                    let id = server.id;
-                    div()
-                        .flex()
-                        .items_center()
-                        .gap_4()
-                        .child(
-                            div()
-                                .flex()
-                                .flex_col()
-                                .child(
-                                    div()
-                                        .font_weight(FontWeight::MEDIUM)
-                                        .child(server.name.clone()),
-                                )
-                                .child(
-                                    div()
-                                        .text_sm()
-                                        .text_color(rgb(MUTED))
-                                        .child(format!("{} · {}", server.user_name, server.url)),
-                                ),
-                        )
-                        .child(self.quality_picker(id, window, cx))
-                        .child(self.button(
-                            SharedString::from(format!("sign-out-{id}")),
-                            "Sign Out",
-                            cx,
-                            move |this, _, cx| this.sign_out(id, cx),
-                        ))
-                        .into_any_element()
-                })
-                .collect();
-            sections.push(Self::section(
-                "Signed in",
-                div().flex().flex_col().gap_3().children(rows),
-            ));
-        }
-        sections
-    }
 }
 
 impl Render for Shell {
@@ -2388,8 +2272,7 @@ impl Render for Shell {
             }
             Screen::Show(name) => Ok(self.show_page(&name, cx)),
             Screen::Details(key) => Ok(self.details_page(&key, cx)),
-            Screen::Connect => Ok(self.connect_page(window, cx)),
-            Screen::Settings => Ok(self.settings_page(cx)),
+            Screen::Settings => Err(self.settings_view(window, cx)),
         };
         // Sections scroll as one page; the grids scroll (and virtualize) themselves.
         let content = match body {
