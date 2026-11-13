@@ -2,6 +2,7 @@
 //! what Jellyfin then serves. Both have the same v3 web API, authorized by
 //! an API key in the `X-Api-Key` header (never in the address).
 
+use std::collections::HashSet;
 use std::time::Duration;
 
 use anyhow::{Context as _, Result, bail};
@@ -10,8 +11,10 @@ use serde::de::DeserializeOwned;
 use serde_json::{Value, json};
 use ureq::Agent;
 
+mod activity;
 mod seasons;
-pub use seasons::{SeasonSummary, format_date, next_airing, summarize};
+pub use activity::{Download, Event, Recent, State as DownloadState, Subject};
+pub use seasons::{SeasonSummary, format_date, next_airing, parse_utc, summarize};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Kind {
@@ -127,11 +130,7 @@ pub struct Release {
 impl Release {
     /// "WEBDL-1080p".
     pub fn quality(&self) -> Option<String> {
-        let quality = self.quality.as_ref()?;
-        quality["quality"]["name"]
-            .as_str()
-            .or_else(|| quality["name"].as_str())
-            .map(String::from)
+        activity::quality_name(self.quality.as_ref()?)
     }
 
     pub fn languages(&self) -> Vec<String> {
@@ -337,6 +336,30 @@ impl Client {
         let search = json!({ "name": "SeasonSearch", "seriesId": series, "seasonNumber": season });
         let _: Value = self.request("POST", "/command", Some(&search))?;
         Ok(())
+    }
+
+    /// Everything in the queue, one entry per download.
+    pub fn downloads(&self) -> Result<Vec<Download>> {
+        let include = match self.kind {
+            Kind::Sonarr => "includeSeries=true&includeEpisode=true&includeUnknownSeriesItems=true",
+            Kind::Radarr => "includeMovie=true&includeUnknownMovieItems=true",
+        };
+        let page: activity::Page<activity::QueueRecord> =
+            self.get(&format!("/queue?page=1&pageSize=200&{include}"))?;
+        Ok(activity::downloads(page.records))
+    }
+
+    /// What last happened to the latest downloads (`limit` of them), apart
+    /// from the ones still `queued`.
+    pub fn recent(&self, queued: &HashSet<String>, limit: usize) -> Result<Vec<Recent>> {
+        let include = match self.kind {
+            Kind::Sonarr => "includeSeries=true&includeEpisode=true",
+            Kind::Radarr => "includeMovie=true",
+        };
+        let page: activity::Page<activity::HistoryRecord> = self.get(&format!(
+            "/history?page=1&pageSize=100&sortKey=date&sortDirection=descending&{include}"
+        ))?;
+        Ok(activity::recent(page.records, queued, limit))
     }
 
     /// Checks the address and key, and that it's the right app.

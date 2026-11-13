@@ -87,6 +87,13 @@ indexers: every release, best first, with quality, size, seeders, age, indexer, 
 custom format score. Sonarr's own pick is marked; releases it would reject are folded away with its
 reasons. **Download** on one sends exactly that release to the download client.
 
+**Downloads** in the sidebar (with the number in progress) lists what Sonarr and Radarr are
+downloading: one line per download (a season pack is one), with progress, size, time left and the
+download client, and, in red, what's stuck and why (say, "Can't import" with Sonarr's reason).
+Below it, **Recently**: what they last added, grabbed or failed at. The page asks again every 5
+seconds while it's open, and once a minute otherwise (not during playback). A line about a show or
+movie in the library opens it. It only reads; nothing on it changes Sonarr or Radarr.
+
 ## Player
 
 A floating control bar appears when you move the mouse and hides after a few seconds of

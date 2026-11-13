@@ -11,7 +11,7 @@ use gpui::{
     px, rgb, rgba, uniform_list,
 };
 
-use super::{CARD_WIDTH, Card, MUTED, Screen, Shell, TEXT};
+use super::{ACCENT, CARD_WIDTH, Card, MUTED, Screen, Shell, TEXT};
 use crate::library::{self, Item, Library};
 
 /// Horizontal padding of the content area and the gap between cards.
@@ -432,6 +432,9 @@ impl Shell {
     }
 
     pub(super) fn set_tab(&mut self, screen: Screen, cx: &mut Context<Self>) {
+        if screen == Screen::Downloads {
+            self.refresh_downloads(cx);
+        }
         self.tab = screen.clone();
         self.screen = screen;
         cx.notify();
@@ -778,6 +781,42 @@ impl Shell {
             true,
             cx,
         )];
+        if !self.arr_apps().is_empty() {
+            let active = self.downloads.active();
+            let screen = Screen::Downloads;
+            let selected = *current == screen;
+            children.push(
+                div()
+                    .id("side-downloads")
+                    .flex()
+                    .flex_none()
+                    .items_center()
+                    .gap_2()
+                    .px_3()
+                    .py_1p5()
+                    .rounded_md()
+                    .cursor_pointer()
+                    .font_weight(FontWeight::SEMIBOLD)
+                    .when(selected, |d| d.bg(rgba(0xffffff1a)))
+                    .when(!selected, |d| d.hover(|s| s.bg(rgba(0xffffff0d))))
+                    .child(div().flex_1().min_w(px(0.0)).truncate().child("Downloads"))
+                    .when(active > 0, |d| {
+                        d.child(
+                            div()
+                                .flex_none()
+                                .px_2()
+                                .rounded_full()
+                                .text_xs()
+                                .bg(rgb(ACCENT))
+                                .child(active.to_string()),
+                        )
+                    })
+                    .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
+                        this.set_tab(screen.clone(), cx)
+                    }))
+                    .into_any_element(),
+            );
+        }
         for source in self.sources() {
             let key = source.origin.map_or("local".to_string(), |s| s.to_string());
             children.push(div().h(px(14.0)).flex_none().into_any_element());

@@ -120,6 +120,7 @@ impl Shell {
                 }
             }
         }
+        self.start_downloads_poll(cx);
     }
 
     /// A build from before this was per server kept one Sonarr and one
@@ -159,6 +160,17 @@ impl Shell {
             }
             self.arr.remove(&(server.id, kind));
         }
+    }
+
+    /// Every set-up app: (server, which, client), by server, Sonarr first.
+    pub(super) fn arr_apps(&self) -> Vec<(i64, Kind, Client)> {
+        let mut apps: Vec<(i64, Kind, Client)> = self
+            .arr
+            .keys()
+            .filter_map(|&(server, kind)| Some((server, kind, self.arr_client(server, kind)?)))
+            .collect();
+        apps.sort_by_key(|(server, kind, _)| (*server, *kind == Kind::Radarr));
+        apps
     }
 
     /// A client for a server's connected app, for the features that use it.
@@ -217,6 +229,7 @@ impl Shell {
                     form.key.update(cx, |input, cx| input.set_text("", cx));
                     form.saved = Some(saved);
                     form.editing = false;
+                    this.start_downloads_poll(cx);
                 }
                 cx.notify();
             })

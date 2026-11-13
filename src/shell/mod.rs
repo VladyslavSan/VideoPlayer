@@ -31,6 +31,7 @@ use crate::ui::text_input::TextInput;
 mod arr_settings;
 mod browse;
 mod details;
+mod downloads;
 mod keynav;
 mod live;
 mod releases;
@@ -134,6 +135,8 @@ enum Screen {
     Show(String),
     /// A movie's details page, by item key.
     Details(String),
+    /// What Sonarr and Radarr are downloading.
+    Downloads,
     Settings,
 }
 
@@ -249,6 +252,7 @@ pub struct Shell {
     sonarr: HashMap<String, sonarr::SonarrView>,
     sonarr_loading: HashSet<String>,
     sonarr_requests: HashMap<(String, u32), sonarr::Request>,
+    downloads: downloads::Downloads,
     /// Open release lists, by show and season.
     release_panels: HashMap<releases::PanelKey, releases::ReleasePanel>,
     /// The server whose streaming quality menu is open.
@@ -386,6 +390,7 @@ impl Shell {
             sonarr: HashMap::new(),
             sonarr_loading: HashSet::new(),
             sonarr_requests: HashMap::new(),
+            downloads: Default::default(),
             release_panels: HashMap::new(),
         };
         // Closing the window while a video is open still reports it.
@@ -1564,15 +1569,27 @@ impl Shell {
                 window.focus(&self.focus);
                 cx.notify();
             }
-            (Screen::Home | Screen::Source(_) | Screen::Movies(_) | Screen::Shows(_), "escape") => {
+            (
+                Screen::Home
+                | Screen::Source(_)
+                | Screen::Movies(_)
+                | Screen::Shows(_)
+                | Screen::Downloads,
+                "escape",
+            ) => {
                 // Clear the search and leave the field.
                 self.search.update(cx, |input, cx| input.set_text("", cx));
                 window.focus(&self.focus);
                 cx.notify();
             }
-            (Screen::Home | Screen::Source(_) | Screen::Movies(_) | Screen::Shows(_), "f")
-                if event.keystroke.modifiers.secondary() =>
-            {
+            (
+                Screen::Home
+                | Screen::Source(_)
+                | Screen::Movies(_)
+                | Screen::Shows(_)
+                | Screen::Downloads,
+                "f",
+            ) if event.keystroke.modifiers.secondary() => {
                 window.focus(&self.search.focus_handle(cx));
                 cx.notify();
             }
@@ -1615,9 +1632,11 @@ impl Shell {
             })
         };
         let title: AnyElement = match &self.screen {
-            Screen::Home | Screen::Source(_) | Screen::Movies(_) | Screen::Shows(_) => {
-                self.search_field()
-            }
+            Screen::Home
+            | Screen::Source(_)
+            | Screen::Movies(_)
+            | Screen::Shows(_)
+            | Screen::Downloads => self.search_field(),
             Screen::Show(_) | Screen::Details(_) => back(self, cx),
             Screen::Settings => div()
                 .flex()
@@ -2498,6 +2517,7 @@ impl Render for Shell {
         let gone = match &self.screen {
             Screen::Movies(_) | Screen::Shows(_) => !self.library_screens().contains(&self.screen),
             Screen::Source(origin) => !self.sources().iter().any(|s| s.origin == *origin),
+            Screen::Downloads => self.arr_apps().is_empty(),
             _ => false,
         };
         if gone {
@@ -2513,7 +2533,11 @@ impl Render for Shell {
         let query = self.search_query(cx);
         let on_tab = matches!(
             self.screen,
-            Screen::Home | Screen::Source(_) | Screen::Movies(_) | Screen::Shows(_)
+            Screen::Home
+                | Screen::Source(_)
+                | Screen::Movies(_)
+                | Screen::Shows(_)
+                | Screen::Downloads
         );
         let body: Result<Vec<AnyElement>, AnyElement> = match self.screen.clone() {
             _ if on_tab && !query.is_empty() => Ok(self.search_results(&query, cx)),
@@ -2525,6 +2549,7 @@ impl Render for Shell {
             }
             Screen::Show(name) => Ok(self.show_page(&name, cx)),
             Screen::Details(key) => Ok(self.details_page(&key, cx)),
+            Screen::Downloads => Ok(self.downloads_page(cx)),
             Screen::Settings => Err(self.settings_view(window, cx)),
         };
         // Sections scroll as one page; the grids scroll (and virtualize) themselves.
