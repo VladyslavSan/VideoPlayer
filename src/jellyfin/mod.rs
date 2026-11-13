@@ -225,6 +225,9 @@ pub struct ItemInfo {
     pub backdrop_image_tags: Vec<String>,
     #[serde(default)]
     pub media_streams: Vec<StreamInfo>,
+    /// "Tvdb", "Tmdb", "Imdb" ids (the key's case varies between versions).
+    #[serde(default)]
+    pub provider_ids: HashMap<String, String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]

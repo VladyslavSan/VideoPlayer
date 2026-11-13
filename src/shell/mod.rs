@@ -35,6 +35,7 @@ mod keynav;
 mod live;
 mod reports;
 mod settings;
+mod sonarr;
 use browse::{Grid, Sort};
 use details::Details;
 use settings::SettingsPage;
@@ -235,6 +236,11 @@ pub struct Shell {
     form: ConnectForm,
     /// Sonarr and Radarr connections, and their Settings forms.
     arr: arr_settings::ArrForms,
+    /// What Sonarr says about shows (by name), which are being asked,
+    /// and the Download buttons pressed (show, season).
+    sonarr: HashMap<String, sonarr::SonarrView>,
+    sonarr_loading: HashSet<String>,
+    sonarr_requests: HashMap<(String, u32), sonarr::Request>,
     /// The server whose streaming quality menu is open.
     quality_menu: Option<i64>,
     /// The Settings page shown, and whether its sign-in form is open.
@@ -350,6 +356,9 @@ impl Shell {
             focus,
             form,
             arr: HashMap::new(),
+            sonarr: HashMap::new(),
+            sonarr_loading: HashSet::new(),
+            sonarr_requests: HashMap::new(),
         };
         // Closing the window while a video is open still reports it.
         let this = cx.weak_entity();
@@ -2177,6 +2186,7 @@ impl Shell {
                 .push(item);
         }
         let header = self.show_header(show, cx);
+        let sonarr = self.sonarr_section(show, cx);
         std::iter::once(header)
             .chain(seasons.into_iter().map(|(season, mut episodes)| {
                 episodes.sort_by_key(|e| e.episode);
@@ -2191,6 +2201,7 @@ impl Shell {
                     .collect();
                 Self::section(&title, Self::grid(cards))
             }))
+            .chain(sonarr)
             .collect()
     }
 

@@ -73,8 +73,14 @@ Each Jellyfin server can have its own Sonarr and Radarr (the apps that fill its 
 the app under Settings → General) and **Save and Test**. The address is filled in from the
 server's host with the usual port (8989, 7878); any full URL works, including `https://` and a
 path behind a reverse proxy. API keys go into the system credential store and are sent only in
-the `X-Api-Key` header; signing out of the server removes them. For now this connects and checks
-the apps; requesting seasons and movies from the library comes next.
+the `X-Api-Key` header; signing out of the server removes them.
+
+With Sonarr set up, a show's page ends with **More from Sonarr**: each season with aired episodes
+that aren't downloaded ("2 of 12 missing", "12 episodes not downloaded") and a **Download** button,
+which monitors the show, the season and its episodes in Sonarr and starts a season search. While
+the page is open it follows the downloads (checking every 10 seconds); once Jellyfin imports them,
+they appear among the seasons. It also says when the next episode airs. Shows are matched by their
+TVDB id.
 
 ## Player
 

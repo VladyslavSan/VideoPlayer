@@ -162,7 +162,6 @@ impl Shell {
     }
 
     /// A client for a server's connected app, for the features that use it.
-    #[allow(dead_code)]
     pub(super) fn arr_client(&self, server: i64, kind: Kind) -> Option<Client> {
         let (url, key) = self.arr.get(&(server, kind))?.saved.as_ref()?;
         Some(Client::new(kind, url, key))

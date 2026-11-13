@@ -29,6 +29,8 @@ pub struct Details {
     pub audio: Vec<String>,
     pub subtitles: Vec<String>,
     pub backdrop: Option<PathBuf>,
+    /// The TVDB id, which links a show to Sonarr.
+    pub tvdb: Option<String>,
 }
 
 impl Details {
@@ -43,6 +45,11 @@ impl Details {
             audio: info.streams("Audio"),
             subtitles: info.streams("Subtitle"),
             backdrop,
+            tvdb: info
+                .provider_ids
+                .iter()
+                .find(|(k, v)| k.eq_ignore_ascii_case("Tvdb") && !v.trim().is_empty())
+                .map(|(_, v)| v.trim().to_string()),
         }
     }
 }
@@ -133,7 +140,11 @@ impl Shell {
                 this.details_loading.remove(&key);
                 match result {
                     Ok(details) => {
-                        this.details.insert(key, details);
+                        this.details.insert(key.clone(), details);
+                        // A show's page can now find it in Sonarr.
+                        if let Some(show) = key.strip_prefix("show:") {
+                            this.load_sonarr(show.to_string(), cx);
+                        }
                     }
                     Err(e) => eprintln!("[jellyfin] details: {e:#}"),
                 }

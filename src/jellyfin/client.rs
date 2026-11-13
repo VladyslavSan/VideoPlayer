@@ -346,7 +346,10 @@ impl Client {
             &[
                 ("ids", item_id.to_string()),
                 ("userId", user_id.to_string()),
-                ("Fields", "Overview,Genres,Taglines,MediaStreams".into()),
+                (
+                    "Fields",
+                    "Overview,Genres,Taglines,MediaStreams,ProviderIds".into(),
+                ),
             ],
         )?;
         page.items

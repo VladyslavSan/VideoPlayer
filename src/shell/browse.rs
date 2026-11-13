@@ -337,7 +337,9 @@ impl Shell {
         if let Some(episode) = episode {
             self.load_details(format!("show:{name}"), episode, true, cx);
         }
-        self.screen = Screen::Show(name);
+        self.screen = Screen::Show(name.clone());
+        // Fresh each time the page opens (once its TVDB id is known).
+        self.load_sonarr(name, cx);
         cx.notify();
     }
 
