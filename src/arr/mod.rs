@@ -408,7 +408,7 @@ impl Client {
             Kind::Radarr => "includeMovie=true",
         };
         let page: activity::Page<activity::HistoryRecord> = self.get(&format!(
-            "/history?page=1&pageSize=100&sortKey=date&sortDirection=descending&{include}"
+            "/history?page=1&pageSize=250&sortKey=date&sortDirection=descending&{include}"
         ))?;
         Ok(activity::recent(page.records, queued, limit))
     }

@@ -383,7 +383,8 @@ pub(super) fn recent(
     limit: usize,
 ) -> Vec<Recent> {
     let mut out: Vec<Recent> = Vec::new();
-    let mut index: HashMap<String, usize> = HashMap::new();
+    // Where each download's line is; None for downloads left out.
+    let mut index: HashMap<String, Option<usize>> = HashMap::new();
     for record in records {
         let Some(event) = Event::from(&record.event_type) else {
             continue;
@@ -395,22 +396,24 @@ pub(super) fn recent(
             .unwrap_or_else(|| format!("history-{}", record.id));
         let release = record.source_title.clone().unwrap_or_default();
         let subject = subject(record.series, record.episode, record.movie, &release);
-        if let Some(&i) = index.get(&id) {
+        if let Some(&line) = index.get(&id) {
             // An older event of the same download: its other episodes
             // count, its earlier steps don't.
-            if out[i].event == event {
-                out[i].subject.add_episodes(&subject);
+            if let Some(line) = line.and_then(|i| out.get_mut(i))
+                && line.event == event
+            {
+                line.subject.add_episodes(&subject);
             }
             continue;
         }
         if queued.contains(&id) || out.len() >= limit {
-            index.insert(id, usize::MAX);
+            index.insert(id, None);
             continue;
         }
         let Some(at) = parse_utc(&record.date) else {
             continue;
         };
-        index.insert(id.clone(), out.len());
+        index.insert(id.clone(), Some(out.len()));
         out.push(Recent {
             id,
             subject,
@@ -473,6 +476,30 @@ mod tests {
         assert_eq!(movie.state, State::ImportBlocked);
         assert!(movie.state.is_problem());
         assert_eq!(movie.messages, ["No files found are eligible for import"]);
+    }
+
+    #[test]
+    fn downloads_past_the_limit_or_still_queued_are_left_out() {
+        // A season pack's import is one record per episode; the ones of a
+        // download already left out must be skipped too.
+        let record = |id: i64, download: &str, event: &str| {
+            json!({"id": id, "eventType": event, "date": "2026-11-13T19:17:01Z",
+                   "downloadId": download, "sourceTitle": "x",
+                   "series": {"title": "Show"}, "episode": {"seasonNumber": 1, "episodeNumber": id}})
+        };
+        let records: Page<HistoryRecord> = serde_json::from_value(json!({"records": [
+            record(1, "A", "downloadFolderImported"),
+            record(2, "B", "downloadFolderImported"),
+            record(3, "B", "downloadFolderImported"),
+            record(4, "Q", "grabbed"),
+            record(5, "Q", "grabbed"),
+            record(6, "B", "grabbed"),
+        ]}))
+        .unwrap();
+        let queued = HashSet::from(["Q".to_string()]);
+        let recent = recent(records.records, &queued, 1);
+        assert_eq!(recent.len(), 1);
+        assert_eq!(recent[0].id, "A");
     }
 
     #[test]
