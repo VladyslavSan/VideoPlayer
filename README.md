@@ -161,8 +161,8 @@ movies, shows and episode titles; Esc clears it.
 Selecting a movie opens its details: backdrop, year, runtime, rating, genres, overview, the
 video/audio/subtitle tracks (from Jellyfin), **Play** or **Resume**, **Play from beginning** and
 **Mark as watched/unwatched** (synced to the server). A show's page starts with its backdrop,
-overview and a button for the episode to watch next, then a list of its seasons: each one opens and
-closes with a click, and only the season being watched starts open (or the one of the episode the
+overview and a button for the episode to watch next, then a list of its seasons: each one folds open and
+shut with a click, and only the season being watched starts open (or the one of the episode the
 page was opened from), so the last season is never a long scroll away.
 
 Add folders under **Settings → Library → Add Folder** (and take them out again with **Remove**). They are scanned in the background, and movie and
@@ -187,6 +187,9 @@ folder).
   `VIDEO_PLAYER_TEST_CAPTURE=<dir>`, writing a name into `<dir>/request` makes the app save
   `<name>.ui.png` (its own frame, transparent over the video) and `<name>.video.png` (mpv's);
   layering the first over the second gives what the screen would show.
+- `VIDEO_PLAYER_MOTION_SCALE=<n>`: stretch animations `n` times, to capture them midway;
+  `VIDEO_PLAYER_NO_MOTION=1` turns them off (as Windows' "Animation effects" and macOS's "Reduce
+  motion" do)
 - `python scripts/make_icon.py`: redraw `assets/app.ico` (embedded in the exe via `assets/app.rc`)
 
 Release builds have no console window; their diagnostics go to `app.log` in the data folder

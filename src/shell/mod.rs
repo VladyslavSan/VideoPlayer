@@ -10,10 +10,10 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context as _, Result, bail};
 use gpui::{
-    AnyElement, Bounds, ClickEvent, Context, ElementId, Entity, FocusHandle, Focusable, FontWeight,
-    KeyDownEvent, MouseDownEvent, ObjectFit, PathPromptOptions, Pixels, ScrollHandle,
-    ScrollStrategy, SharedString, Subscription, UniformListScrollHandle, Window, canvas, div, img,
-    point, prelude::*, px, rgb, rgba,
+    Animation, AnimationExt as _, AnyElement, Bounds, ClickEvent, Context, ElementId, Entity,
+    FocusHandle, Focusable, FontWeight, KeyDownEvent, MouseDownEvent, ObjectFit, PathPromptOptions,
+    Pixels, ScrollHandle, ScrollStrategy, SharedString, Subscription, UniformListScrollHandle,
+    Window, canvas, div, img, point, prelude::*, px, rgb, rgba,
 };
 
 use crate::introdb;
@@ -135,6 +135,13 @@ enum Screen {
     /// A movie's details page, by item key.
     Details(String),
     Settings,
+}
+
+/// A season folding open or shut, from when; `id` restarts the animation.
+struct Fold {
+    opening: bool,
+    started: Instant,
+    id: u64,
 }
 
 /// What a poster card shows.
@@ -264,6 +271,13 @@ pub struct Shell {
     scrolled_screen: Option<Screen>,
     /// The seasons open on each show's page (the rest are folded).
     open_seasons: HashMap<String, BTreeSet<u16>>,
+    /// Seasons being folded open or shut (show, season), for the animation.
+    folds: HashMap<(String, u16), Fold>,
+    fold_count: u64,
+    /// Cards across, as last laid out (for a season's height while it folds).
+    columns_hint: Cell<usize>,
+    /// Counts screen changes; each new page fades in.
+    page_generation: usize,
     /// On a show page: the episode it was opened at (by item key), ringed.
     focus_episode: Option<String>,
     /// Where the focused episode's card was last drawn, and whether the
@@ -339,6 +353,10 @@ impl Shell {
             content_scroll: ScrollHandle::new(),
             scrolled_screen: None,
             open_seasons: HashMap::new(),
+            folds: HashMap::new(),
+            fold_count: 0,
+            columns_hint: Cell::new(4),
+            page_generation: 0,
             focus_episode: None,
             focus_bounds: Rc::default(),
             focus_scroll: None,
@@ -2100,6 +2118,7 @@ impl Shell {
     /// each frame for a moment, unless the viewer scrolls first.
     fn update_scroll(&mut self, window: &mut Window) {
         if self.scrolled_screen.as_ref() != Some(&self.screen) {
+            self.page_generation += 1;
             if let (Some(old), Some(cursor)) = (self.scrolled_screen.take(), self.cursor.take()) {
                 self.cursors.retain(|(screen, _)| *screen != old);
                 self.cursors.push((old, cursor));
@@ -2271,9 +2290,19 @@ impl Shell {
                 d.cursor_pointer()
                     .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
                         let open = this.open_seasons.entry(toggle_show.clone()).or_default();
-                        if !open.remove(&number) {
+                        let opening = !open.remove(&number);
+                        if opening {
                             open.insert(number);
                         }
+                        this.fold_count += 1;
+                        this.folds.insert(
+                            (toggle_show.clone(), number),
+                            Fold {
+                                opening,
+                                started: Instant::now(),
+                                id: this.fold_count,
+                            },
+                        );
                         cx.notify();
                     }))
             })
@@ -2316,12 +2345,46 @@ impl Shell {
             .child(label)
             .children(buttons);
         let panel = sonarr.and_then(|s| self.release_panel(show, s.number, cx));
-        let grid = open.then(|| {
+        // Folding: the episodes grow from nothing (or shrink to it) while
+        // fading; a closing season stays drawn until it's folded away.
+        let fold = self
+            .folds
+            .get(&(show.to_string(), number))
+            .filter(|_| crate::motion::enabled());
+        let closing = fold.is_some_and(|f| {
+            !f.opening && f.started.elapsed() < crate::motion::duration(crate::motion::FOLD)
+        });
+        let rows = episodes.len().div_ceil(self.columns_hint.get().max(1));
+        // A card, its title and the gap under it.
+        let height = 8.0 + rows as f32 * (CARD_HEIGHT + 64.0);
+        let grid = (open || (have && closing)).then(|| {
             let cards = episodes
                 .into_iter()
                 .map(|e| self.item_card("episode", e, false, cx))
                 .collect();
-            div().pt_2().pb_4().child(Self::grid(cards))
+            let grid = div().pt_2().pb_4().child(Self::grid(cards));
+            match fold {
+                Some(fold) => {
+                    let opening = fold.opening;
+                    grid.with_animation(
+                        ("fold", fold.id),
+                        Animation::new(crate::motion::duration(crate::motion::FOLD))
+                            .with_easing(crate::motion::ease_out),
+                        move |grid, t| {
+                            let shown = if opening { t } else { 1.0 - t };
+                            if opening && t >= 1.0 {
+                                grid
+                            } else {
+                                grid.max_h(px(height * shown))
+                                    .overflow_hidden()
+                                    .opacity(shown)
+                            }
+                        },
+                    )
+                    .into_any_element()
+                }
+                None => grid.into_any_element(),
+            }
         });
         div()
             .flex()
@@ -2416,6 +2479,7 @@ impl Render for Shell {
             self.tab = Screen::Home;
         }
         self.update_scroll(window);
+        self.columns_hint.set(browse::columns(window));
         // Refilled as this frame's cards are laid out.
         self.card_bounds.borrow_mut().clear();
         self.card_actions.borrow_mut().clear();
@@ -2454,6 +2518,29 @@ impl Render for Shell {
                 page.into_any_element()
             }
             Err(grid) => grid,
+        };
+        // Each new page fades in, rising a little.
+        let content = if crate::motion::enabled() {
+            div()
+                .flex()
+                .flex_col()
+                .flex_1()
+                .min_h(px(0.0))
+                .min_w(px(0.0))
+                .child(content)
+                .with_animation(
+                    ("page", self.page_generation),
+                    Animation::new(crate::motion::duration(crate::motion::PAGE))
+                        .with_easing(crate::motion::ease_out),
+                    |page, t| {
+                        page.opacity(t)
+                            .relative()
+                            .top(px((1.0 - t) * crate::motion::PAGE_RISE))
+                    },
+                )
+                .into_any_element()
+        } else {
+            content
         };
         // Settings has its own sidebar; everything else has the library's.
         let main = if self.screen == Screen::Settings {

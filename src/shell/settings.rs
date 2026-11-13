@@ -62,6 +62,10 @@ impl Shell {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if self.screen == Screen::Settings && self.settings_page != page {
+            // Another Settings page fades in like another screen.
+            self.page_generation += 1;
+        }
         self.screen = Screen::Settings;
         self.settings_page = page;
         self.quality_menu = None;
