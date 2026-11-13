@@ -94,6 +94,18 @@ Below it, **Recently**: what they last added, grabbed or failed at. The page ask
 seconds while it's open, and once a minute otherwise (not during playback). A line about a show or
 movie in the library opens it. It only reads; nothing on it changes Sonarr or Radarr.
 
+**Adding shows and movies**: a moment after you stop typing in the search field (3 letters or
+more), Sonarr and Radarr are asked for shows and movies by that name, and the results end with
+what they found: poster, year, network, seasons, genres and overview; ones already there say so
+("In your library ›" opens it). **Add…** opens the choices: the root folder, the quality profile,
+what to monitor (shows: all episodes, future ones, the first or latest season, or nothing) and
+whether to start searching now. The folder is suggested from what's already in each one: anime
+(TVDB's Anime genre, or animated and Japanese) goes to the folder with the most anime, everything
+else to the one with the least, so separate anime and non-anime folders work without setting
+anything up. The profile, tags (say, an `anime` tag), series type and season folders are the ones
+most of that folder's shows or movies have. Posters come from TVDB and TMDB, as in Sonarr and
+Radarr.
+
 ## Player
 
 A floating control bar appears when you move the mouse and hides after a few seconds of

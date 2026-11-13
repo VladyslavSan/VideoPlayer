@@ -52,7 +52,7 @@ impl Downloads {
 }
 
 /// Where a line on the page leads in the library.
-enum Target {
+pub(super) enum Target {
     Show(String, Option<u32>),
     Movie(String),
 }
@@ -216,7 +216,7 @@ impl Shell {
     }
 
     /// The show or movie in the server's library a line is about.
-    fn library_target(&self, server: i64, subject: &Subject) -> Option<Target> {
+    pub(super) fn library_target(&self, server: i64, subject: &Subject) -> Option<Target> {
         let on_server = self
             .items()
             .filter(|i| matches!(i.source, Source::Jellyfin { server: s, .. } if s == server));
@@ -247,7 +247,7 @@ impl Shell {
         }
     }
 
-    fn open_target(&mut self, target: &Target, cx: &mut Context<Self>) {
+    pub(super) fn open_target(&mut self, target: &Target, cx: &mut Context<Self>) {
         match target {
             Target::Show(name, season) => {
                 self.open_show(name.clone(), cx);

@@ -32,6 +32,7 @@ mod arr_settings;
 mod browse;
 mod details;
 mod downloads;
+mod finder;
 mod keynav;
 mod live;
 mod releases;
@@ -253,6 +254,7 @@ pub struct Shell {
     sonarr_loading: HashSet<String>,
     sonarr_requests: HashMap<(String, u32), sonarr::Request>,
     downloads: downloads::Downloads,
+    finder: finder::Finder,
     /// Open release lists, by show and season.
     release_panels: HashMap<releases::PanelKey, releases::ReleasePanel>,
     /// The server whose streaming quality menu is open.
@@ -332,7 +334,11 @@ impl Shell {
         };
         let search = cx.new(|cx| TextInput::new("Search", false, cx));
         // Re-render results as the query changes.
-        cx.observe(&search, |_, _, cx| cx.notify()).detach();
+        cx.observe(&search, |this, _, cx| {
+            this.search_changed(cx);
+            cx.notify();
+        })
+        .detach();
         let mut shell = Self {
             db,
             paths,
@@ -391,6 +397,7 @@ impl Shell {
             sonarr_loading: HashSet::new(),
             sonarr_requests: HashMap::new(),
             downloads: Default::default(),
+            finder: Default::default(),
             release_panels: HashMap::new(),
         };
         // Closing the window while a video is open still reports it.

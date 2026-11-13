@@ -12,8 +12,10 @@ use serde_json::{Value, json};
 use ureq::Agent;
 
 mod activity;
+mod add;
 mod seasons;
 pub use activity::{Download, Event, Recent, State as DownloadState, Subject};
+pub use add::{AddOptions, Candidate, Monitor, Setup};
 pub use seasons::{SeasonSummary, format_date, next_airing, parse_utc, summarize};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -179,6 +181,43 @@ pub struct Client {
     key: String,
 }
 
+/// Saves a poster from the metadata sites (TVDB, TMDB) to `out`.
+pub fn fetch_poster(url: &str, out: &std::path::Path) -> Result<()> {
+    if !url.starts_with("https://") && !url.starts_with("http://") {
+        bail!("not a web address");
+    }
+    let agent: Agent = Agent::config_builder()
+        .timeout_global(Some(Duration::from_secs(30)))
+        .build()
+        .into();
+    let bytes = agent
+        .get(url)
+        .call()?
+        .body_mut()
+        .with_config()
+        .limit(20 << 20)
+        .read_to_vec()?;
+    if let Some(dir) = out.parent() {
+        std::fs::create_dir_all(dir)?;
+    }
+    let partial = out.with_extension("part");
+    std::fs::write(&partial, bytes)?;
+    std::fs::rename(&partial, out)?;
+    Ok(())
+}
+
+/// A query string value, percent-encoded.
+fn encode(text: &str) -> String {
+    text.bytes()
+        .map(|b| match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                (b as char).to_string()
+            }
+            _ => format!("%{b:02X}"),
+        })
+        .collect()
+}
+
 /// `moto-moto-srv.local:8989/` → `http://moto-moto-srv.local:8989`; keeps
 /// `https://` and a path prefix (as behind a reverse proxy).
 pub fn normalize_url(input: &str) -> String {
@@ -278,6 +317,18 @@ impl Client {
         self.get(&format!("/episode?seriesId={series}"))
     }
 
+    /// For calls that reach out to metadata sites or list everything.
+    fn slow(&self) -> Self {
+        Self {
+            agent: Agent::config_builder()
+                .timeout_global(Some(Duration::from_secs(45)))
+                .http_status_as_error(false)
+                .build()
+                .into(),
+            ..self.clone()
+        }
+    }
+
     /// The same, with a longer wait: searching indexers takes a while.
     fn patient(&self) -> Self {
         Self {
@@ -362,6 +413,49 @@ impl Client {
         Ok(activity::recent(page.records, queued, limit))
     }
 
+    /// Shows (Sonarr) or movies (Radarr) by name, from the app's metadata
+    /// source; those already in the app have their id.
+    pub fn lookup(&self, term: &str) -> Result<Vec<Candidate>> {
+        let path = match self.kind {
+            Kind::Sonarr => "/series/lookup",
+            Kind::Radarr => "/movie/lookup",
+        };
+        let term = encode(term.trim());
+        let found: Vec<Value> = self.slow().get(&format!("{path}?term={term}"))?;
+        Ok(add::candidates(self.kind, found))
+    }
+
+    /// The root folders and quality profiles, and how each folder is used.
+    pub fn setup(&self) -> Result<Setup> {
+        let roots: Vec<add::RootFolder> = self.get("/rootfolder")?;
+        let profiles: Vec<add::Profile> = self.get("/qualityprofile")?;
+        let tags: Vec<add::Tag> = self.get("/tag")?;
+        let items: Vec<Value> = self.slow().get(match self.kind {
+            Kind::Sonarr => "/series",
+            Kind::Radarr => "/movie",
+        })?;
+        let habits = add::habits(&roots, &items);
+        Ok(Setup {
+            kind: self.kind,
+            roots,
+            profiles,
+            tags,
+            habits,
+        })
+    }
+
+    /// Adds a show or movie (and, if asked, starts searching for it); its
+    /// new id.
+    pub fn add(&self, setup: &Setup, candidate: &Candidate, options: &AddOptions) -> Result<i64> {
+        let body = add::add_body(setup, candidate, options).context("nothing to add")?;
+        let path = match self.kind {
+            Kind::Sonarr => "/series",
+            Kind::Radarr => "/movie",
+        };
+        let added: Value = self.slow().request("POST", path, Some(&body))?;
+        added["id"].as_i64().context("no id in the answer")
+    }
+
     /// Checks the address and key, and that it's the right app.
     pub fn status(&self) -> Result<Status> {
         let status: Status = self.get("/system/status")?;
@@ -399,6 +493,12 @@ mod tests {
         assert_eq!(releases[0].quality().as_deref(), Some("WEBDL-1080p"));
         assert_eq!(releases[0].languages(), ["English"]);
         assert_eq!(releases[2].rejections(), ["Size too big"]);
+    }
+
+    #[test]
+    fn encodes_search_terms() {
+        assert_eq!(encode("Frieren: Beyond"), "Frieren%3A%20Beyond");
+        assert_eq!(encode("Amélie"), "Am%C3%A9lie");
     }
 
     #[test]

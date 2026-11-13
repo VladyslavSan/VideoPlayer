@@ -720,15 +720,22 @@ impl Shell {
                 .collect();
             sections.push(Self::section("Episodes", Self::grid(cards)));
         }
+        let found = self.finder_sections(cx);
         if sections.is_empty() {
+            let text = if found.is_empty() {
+                format!("Nothing matches “{query}”.")
+            } else {
+                format!("Nothing in your library matches “{query}”.")
+            };
             sections.push(
                 div()
                     .pt_10()
                     .text_color(rgb(MUTED))
-                    .child(format!("Nothing matches “{query}”."))
+                    .child(text)
                     .into_any_element(),
             );
         }
+        sections.extend(found);
         sections
     }
 
