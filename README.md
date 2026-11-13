@@ -75,8 +75,8 @@ server's host with the usual port (8989, 7878); any full URL works, including `h
 path behind a reverse proxy. API keys go into the system credential store and are sent only in
 the `X-Api-Key` header; signing out of the server removes them.
 
-With Sonarr set up, a show's page ends with **More from Sonarr**: each season with aired episodes
-that aren't downloaded ("2 of 12 missing", "12 episodes not downloaded") and a **Download** button,
+With Sonarr set up, a show's season list also says what Sonarr could still get: each season with
+aired episodes that aren't downloaded, in its place in the list ("2 of 12 missing", "12 episodes not downloaded") and a **Download** button,
 which monitors the show, the season and its episodes in Sonarr and starts a season search. While
 the page is open it follows the downloads (checking every 10 seconds); once Jellyfin imports them,
 they appear among the seasons. It also says when the next episode airs. Shows are matched by their
@@ -161,7 +161,9 @@ movies, shows and episode titles; Esc clears it.
 Selecting a movie opens its details: backdrop, year, runtime, rating, genres, overview, the
 video/audio/subtitle tracks (from Jellyfin), **Play** or **Resume**, **Play from beginning** and
 **Mark as watched/unwatched** (synced to the server). A show's page starts with its backdrop,
-overview and a button for the episode to watch next.
+overview and a button for the episode to watch next, then a list of its seasons: each one opens and
+closes with a click, and only the season being watched starts open (or the one of the episode the
+page was opened from), so the last season is never a long scroll away.
 
 Add folders under **Settings → Library → Add Folder** (and take them out again with **Remove**). They are scanned in the background, and movie and
 episode names are parsed from file and folder names (`Title (Year)`, `Show.S01E02`,

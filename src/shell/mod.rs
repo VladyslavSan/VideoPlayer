@@ -2,7 +2,7 @@
 //! sign-in screen, and switching to and from the player.
 
 use std::cell::{Cell, RefCell};
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
@@ -262,6 +262,8 @@ pub struct Shell {
     content_scroll: ScrollHandle,
     /// The screen the page was last drawn for; a new one starts at the top.
     scrolled_screen: Option<Screen>,
+    /// The seasons open on each show's page (the rest are folded).
+    open_seasons: HashMap<String, BTreeSet<u16>>,
     /// On a show page: the episode it was opened at (by item key), ringed.
     focus_episode: Option<String>,
     /// Where the focused episode's card was last drawn, and whether the
@@ -336,6 +338,7 @@ impl Shell {
             live_refresh_pending: false,
             content_scroll: ScrollHandle::new(),
             scrolled_screen: None,
+            open_seasons: HashMap::new(),
             focus_episode: None,
             focus_bounds: Rc::default(),
             focus_scroll: None,
@@ -2072,14 +2075,16 @@ impl Shell {
     /// The show page of an episode's show, scrolled to that episode, which
     /// is ringed.
     fn open_show_at(&mut self, key: &str, cx: &mut Context<Self>) {
-        let Some(show) = self
+        let Some((show, season)) = self
             .items()
             .find(|i| i.key() == key)
-            .and_then(|i| i.show.clone())
+            .and_then(|i| Some((i.show.clone()?, i.season.unwrap_or(0))))
         else {
             return;
         };
-        self.open_show(show, cx);
+        self.open_show(show.clone(), cx);
+        // The episode's season is open, so it can be shown.
+        self.open_seasons.entry(show).or_default().insert(season);
         self.focus_episode = Some(key.to_string());
         self.focus_bounds.set(None);
         self.focus_scroll = Some(FocusScroll {
@@ -2190,23 +2195,142 @@ impl Shell {
                 .push(item);
         }
         let header = self.show_header(show, cx);
-        let sonarr = self.sonarr_section(show, cx);
-        std::iter::once(header)
-            .chain(seasons.into_iter().map(|(season, mut episodes)| {
-                episodes.sort_by_key(|e| e.episode);
-                let title = if season == 0 {
-                    "Specials".to_string()
-                } else {
-                    format!("Season {season}")
-                };
-                let cards = episodes
-                    .into_iter()
-                    .map(|e| self.item_card("episode", e, false, cx))
-                    .collect();
-                Self::section(&title, Self::grid(cards))
-            }))
-            .chain(sonarr)
-            .collect()
+        // Seasons Sonarr could still get join the list in order.
+        let sonarr: BTreeMap<u16, &crate::arr::SeasonSummary> = self
+            .sonarr_seasons(show)
+            .into_iter()
+            .filter_map(|s| Some((u16::try_from(s.number).ok()?, s)))
+            .collect();
+        let mut numbers: Vec<u16> = seasons.keys().chain(sonarr.keys()).copied().collect();
+        numbers.sort_unstable();
+        numbers.dedup();
+        let blocks: Vec<AnyElement> = numbers
+            .into_iter()
+            .map(|number| {
+                let episodes = seasons.remove(&number).unwrap_or_default();
+                self.season_block(show, number, episodes, sonarr.get(&number).copied(), cx)
+            })
+            .collect();
+        let list = div()
+            .flex()
+            .flex_col()
+            .gap_2()
+            .children(blocks)
+            .children(self.sonarr_notes(show));
+        vec![header, Self::section("Seasons", list)]
+    }
+
+    /// One season on a show's page: a row that opens and closes it (with
+    /// what Sonarr says about it), and its episodes when open.
+    fn season_block(
+        &self,
+        show: &str,
+        number: u16,
+        mut episodes: Vec<&Item>,
+        sonarr: Option<&crate::arr::SeasonSummary>,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        episodes.sort_by_key(|e| e.episode);
+        let have = !episodes.is_empty();
+        let open = have
+            && self
+                .open_seasons
+                .get(show)
+                .is_some_and(|open| open.contains(&number));
+        let title = if number == 0 {
+            "Specials".to_string()
+        } else {
+            format!("Season {number}")
+        };
+        let unwatched = episodes.iter().filter(|e| !e.watched).count();
+        let summary = match (episodes.len(), unwatched) {
+            (0, _) => None,
+            (1, 0) => Some("1 episode · watched".to_string()),
+            (n, 0) => Some(format!("{n} episodes · all watched")),
+            (1, _) => Some("1 episode".to_string()),
+            (n, u) if u == n => Some(format!("{n} episodes")),
+            (n, u) => Some(format!("{n} episodes · {u} unwatched")),
+        };
+        let (status, buttons) = match sonarr {
+            Some(season) => {
+                let (text, color, buttons) = self.sonarr_season_controls(show, season, cx);
+                (Some((text, color)), buttons)
+            }
+            None => (None, Vec::new()),
+        };
+        let toggle_show = show.to_string();
+        let label = div()
+            .id(SharedString::from(format!("season-{number}")))
+            .flex()
+            .items_center()
+            .gap_3()
+            .flex_1()
+            .min_w(px(0.0))
+            .py_3()
+            .when(have, |d| {
+                d.cursor_pointer()
+                    .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
+                        let open = this.open_seasons.entry(toggle_show.clone()).or_default();
+                        if !open.remove(&number) {
+                            open.insert(number);
+                        }
+                        cx.notify();
+                    }))
+            })
+            .child(
+                div()
+                    .w(px(14.0))
+                    .flex_none()
+                    .text_color(rgb(MUTED))
+                    .child(if !have {
+                        ""
+                    } else if open {
+                        "▾"
+                    } else {
+                        "▸"
+                    }),
+            )
+            .child(
+                div()
+                    .flex_none()
+                    .font_weight(FontWeight::SEMIBOLD)
+                    .child(title),
+            )
+            .children(summary.map(|s| div().flex_none().text_sm().text_color(rgb(MUTED)).child(s)))
+            .children(status.map(|(text, color)| {
+                div()
+                    .min_w(px(0.0))
+                    .truncate()
+                    .text_sm()
+                    .text_color(rgb(color))
+                    .child(if have { format!("· {text}") } else { text })
+            }));
+        let row = div()
+            .flex()
+            .items_center()
+            .gap_3()
+            .px_4()
+            .rounded_lg()
+            .bg(rgba(0xffffff0a))
+            .hover(|s| s.bg(rgba(0xffffff12)))
+            .child(label)
+            .children(buttons);
+        let panel = sonarr.and_then(|s| self.release_panel(show, s.number, cx));
+        let grid = open.then(|| {
+            let cards = episodes
+                .into_iter()
+                .map(|e| self.item_card("episode", e, false, cx))
+                .collect();
+            div().pt_2().pb_4().child(Self::grid(cards))
+        });
+        div()
+            .flex()
+            .flex_col()
+            .gap_2()
+            .child(row)
+            .children(panel)
+            .children(grid)
+            .into_any_element()
     }
 
     fn field(label: &str, input: &Entity<TextInput>) -> AnyElement {

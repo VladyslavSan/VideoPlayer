@@ -16,6 +16,8 @@ use crate::library::{self, Item, Source};
 /// Width of the backdrop downloaded for a details page.
 const BACKDROP_WIDTH: u32 = 1920;
 const HERO_HEIGHT: f32 = 420.0;
+/// Lower on a show's page, so its seasons are in view.
+const SHOW_HERO_HEIGHT: f32 = 280.0;
 
 /// Extra information for a details page, fetched when it opens.
 #[derive(Debug, Clone, Default)]
@@ -219,6 +221,7 @@ impl Shell {
 
     /// A wide image with the title and facts over a fade to the background.
     fn hero(
+        height: f32,
         image: Option<PathBuf>,
         title: String,
         facts: Vec<String>,
@@ -227,7 +230,7 @@ impl Shell {
         div()
             .relative()
             .w_full()
-            .h(px(HERO_HEIGHT))
+            .h(px(height))
             .mt_2()
             .rounded_2xl()
             .overflow_hidden()
@@ -288,7 +291,13 @@ impl Shell {
         facts
     }
 
-    fn overview(details: Option<&Details>, loading: bool) -> Option<AnyElement> {
+    /// The item's overview; `lines` limits it (a show's page keeps it short
+    /// so the seasons follow soon).
+    fn overview(
+        details: Option<&Details>,
+        loading: bool,
+        lines: Option<usize>,
+    ) -> Option<AnyElement> {
         let text = match details.and_then(|d| d.overview.clone()) {
             Some(text) => text,
             None if loading => "Loading details…".into(),
@@ -300,6 +309,7 @@ impl Shell {
                 .max_w(px(780.0))
                 .line_height(px(24.0))
                 .text_color(rgb(if loading { MUTED } else { 0xd5d9e3 }))
+                .when_some(lines, |d, lines| d.line_clamp(lines))
                 .child(text)
                 .into_any_element(),
         )
@@ -342,6 +352,7 @@ impl Shell {
             .and_then(|d| d.backdrop.clone())
             .or_else(|| item.thumb.clone());
         let mut page = vec![Self::hero(
+            HERO_HEIGHT,
             image,
             item.title.clone(),
             Self::facts(item.year, item.duration, details),
@@ -396,7 +407,7 @@ impl Shell {
                 ))
                 .into_any_element(),
         );
-        page.extend(Self::overview(details, loading));
+        page.extend(Self::overview(details, loading, None));
 
         let mut info = Vec::new();
         if let Some(d) = details {
@@ -421,6 +432,30 @@ impl Shell {
         page
     }
 
+    /// The episode to play from a show's page: next up if the show is being
+    /// watched, else something in progress, else the first unwatched
+    /// episode, else the first one.
+    pub(super) fn next_episode(&self, show: &str) -> Option<&Item> {
+        let mut ordered: Vec<&Item> = self
+            .items()
+            .filter(|i| i.show.as_deref() == Some(show))
+            .collect();
+        ordered.sort_by_key(|e| e.watch_order());
+        library::next_up(ordered.iter().copied())
+            .into_iter()
+            .map(|(_, e)| e)
+            .next()
+            .or_else(|| {
+                ordered
+                    .iter()
+                    .copied()
+                    .filter(|e| e.progress().is_some())
+                    .max_by_key(|e| e.last_played)
+            })
+            .or_else(|| ordered.iter().copied().find(|e| !e.watched))
+            .or_else(|| ordered.first().copied())
+    }
+
     /// The top of a show's page: backdrop, facts, overview, and a button for
     /// the episode to watch next.
     pub(super) fn show_header(&self, show: &str, cx: &mut Context<Self>) -> AnyElement {
@@ -437,28 +472,18 @@ impl Shell {
         let mut facts = vec![format!("{} episodes", episodes.len())];
         facts.extend(Self::facts(None, None, details));
 
-        // Next up if the show is being watched, else something in progress,
-        // else the first unwatched episode, else the first one.
-        let mut ordered = episodes.clone();
-        ordered.sort_by_key(|e| e.watch_order());
-        let next = library::next_up(ordered.iter().copied())
-            .into_iter()
-            .map(|(_, e)| e)
-            .next()
-            .or_else(|| {
-                ordered
-                    .iter()
-                    .copied()
-                    .filter(|e| e.progress().is_some())
-                    .max_by_key(|e| e.last_played)
-            })
-            .or_else(|| ordered.iter().copied().find(|e| !e.watched))
-            .or_else(|| ordered.first().copied());
+        let next = self.next_episode(show);
 
         div()
             .flex()
             .flex_col()
-            .child(Self::hero(image, show.to_string(), facts, None))
+            .child(Self::hero(
+                SHOW_HERO_HEIGHT,
+                image,
+                show.to_string(),
+                facts,
+                None,
+            ))
             .children(next.map(|episode| {
                 let key = episode.key();
                 let verb = if episode.progress().is_some() {
@@ -490,7 +515,7 @@ impl Shell {
                     )
                     .into_any_element()
             }))
-            .children(Self::overview(details, loading))
+            .children(Self::overview(details, loading, Some(3)))
             .into_any_element()
     }
 }

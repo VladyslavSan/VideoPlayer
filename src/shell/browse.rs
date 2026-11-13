@@ -337,6 +337,11 @@ impl Shell {
         if let Some(episode) = episode {
             self.load_details(format!("show:{name}"), episode, true, cx);
         }
+        // Only the season being watched starts open; the others are a
+        // click away instead of a long scroll.
+        let current = self.next_episode(&name).map(|e| e.season.unwrap_or(0));
+        self.open_seasons
+            .insert(name.clone(), current.into_iter().collect());
         self.screen = Screen::Show(name.clone());
         // Fresh each time the page opens (once its TVDB id is known).
         self.load_sonarr(name, cx);

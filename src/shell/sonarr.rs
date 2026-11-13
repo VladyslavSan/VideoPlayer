@@ -4,7 +4,7 @@
 
 use std::time::{Duration, Instant};
 
-use gpui::{AnyElement, Context, FontWeight, SharedString, div, prelude::*, px, rgb, rgba};
+use gpui::{AnyElement, Context, SharedString, div, prelude::*, rgb};
 
 use super::{ERROR, MUTED, Screen, Shell, TEXT};
 use crate::arr::{self, Client, Kind, SeasonSummary};
@@ -175,9 +175,32 @@ impl Shell {
         .detach();
     }
 
-    /// Under a show's seasons: what Sonarr could still get.
-    pub(super) fn sonarr_section(&self, show: &str, cx: &mut Context<Self>) -> Option<AnyElement> {
-        self.sonarr_for(show)?;
+    /// The seasons Sonarr has something to say about: missing episodes,
+    /// downloads, or a Download pressed.
+    pub(super) fn sonarr_seasons(&self, show: &str) -> Vec<&SeasonSummary> {
+        let Some(SonarrView::Ready(found)) = self.sonarr.get(show) else {
+            return Vec::new();
+        };
+        if self.sonarr_for(show).is_none() {
+            return Vec::new();
+        }
+        found
+            .seasons
+            .iter()
+            .filter(|s| {
+                s.wanted()
+                    || self
+                        .sonarr_requests
+                        .contains_key(&(show.to_string(), s.number))
+            })
+            .collect()
+    }
+
+    /// Lines under the season list: Sonarr's state, and the next air date.
+    pub(super) fn sonarr_notes(&self, show: &str) -> Vec<AnyElement> {
+        if self.sonarr_for(show).is_none() {
+            return Vec::new();
+        }
         let note = |text: String, color: u32| {
             div()
                 .text_sm()
@@ -185,54 +208,35 @@ impl Shell {
                 .child(text)
                 .into_any_element()
         };
-        let body: AnyElement = match self.sonarr.get(show)? {
-            SonarrView::Loading => note("Checking Sonarr…".into(), MUTED),
-            SonarrView::Absent => note(
+        match self.sonarr.get(show) {
+            None => Vec::new(),
+            Some(SonarrView::Loading) => vec![note("Checking Sonarr…".into(), MUTED)],
+            Some(SonarrView::Absent) => vec![note(
                 "Sonarr doesn't have this show, so it can't download more of it.".into(),
                 MUTED,
-            ),
-            SonarrView::Failed(e) => note(e.to_string(), ERROR),
-            SonarrView::Ready(found) => {
-                let mut lines: Vec<AnyElement> = found
-                    .seasons
-                    .iter()
-                    .filter(|s| {
-                        s.wanted()
-                            || self
-                                .sonarr_requests
-                                .contains_key(&(show.to_string(), s.number))
-                    })
-                    .map(|season| self.season_line(show, season, cx))
-                    .collect();
-                if lines.is_empty() {
-                    lines.push(note(
-                        "Every episode that has aired is downloaded.".into(),
-                        MUTED,
-                    ));
-                }
-                if let Some((label, at)) = &found.next {
-                    lines.push(note(
+            )],
+            Some(SonarrView::Failed(e)) => vec![note(e.to_string(), ERROR)],
+            Some(SonarrView::Ready(found)) => found
+                .next
+                .iter()
+                .map(|(label, at)| {
+                    note(
                         format!("Next episode: {label}, airs {}", arr::format_date(*at)),
                         MUTED,
-                    ));
-                }
-                div()
-                    .flex()
-                    .flex_col()
-                    .gap_2()
-                    .children(lines)
-                    .into_any_element()
-            }
-        };
-        Some(Self::section("More from Sonarr", body))
+                    )
+                })
+                .collect(),
+        }
     }
 
-    fn season_line(
+    /// What Sonarr says about a season, in a season's row: the text, its
+    /// colour, and the buttons (Choose Release, Download).
+    pub(super) fn sonarr_season_controls(
         &self,
         show: &str,
         season: &SeasonSummary,
         cx: &mut Context<Self>,
-    ) -> AnyElement {
+    ) -> (String, u32, Vec<AnyElement>) {
         let request = self.sonarr_requests.get(&(show.to_string(), season.number));
         let episodes = |n: usize| {
             if n == 1 {
@@ -287,10 +291,11 @@ impl Shell {
         let choosing = self
             .release_panels
             .contains_key(&(show.to_string(), number));
+        let mut buttons = Vec::new();
         // An open list can always be closed again.
-        let choose = (choosing || (season.missing > 0 && season.downloading == 0)).then(|| {
+        if choosing || (season.missing > 0 && season.downloading == 0) {
             let show = show.to_string();
-            self.button(
+            buttons.push(self.button(
                 SharedString::from(format!("sonarr-choose-{number}")),
                 if choosing {
                     "Hide Releases"
@@ -299,48 +304,17 @@ impl Shell {
                 },
                 cx,
                 move |this, _, cx| this.toggle_releases(show.clone(), number, cx),
-            )
-        });
-        let panel = self.release_panel(show, number, cx);
-        let show = show.to_string();
-        let line = div()
-            .flex()
-            .items_center()
-            .gap_4()
-            .px_4()
-            .py_3()
-            .rounded_lg()
-            .bg(rgba(0xffffff0a))
-            .child(
-                div()
-                    .w(px(96.0))
-                    .flex_none()
-                    .font_weight(FontWeight::MEDIUM)
-                    .child(format!("Season {number}")),
-            )
-            .child(
-                div()
-                    .flex_1()
-                    .min_w(px(0.0))
-                    .text_sm()
-                    .text_color(rgb(color))
-                    .child(status),
-            )
-            .children(choose)
-            .children(button.map(|label| {
-                self.button(
-                    SharedString::from(format!("sonarr-season-{number}")),
-                    label,
-                    cx,
-                    move |this, _, cx| this.download_season(show.clone(), number, cx),
-                )
-            }));
-        div()
-            .flex()
-            .flex_col()
-            .gap_2()
-            .child(line)
-            .children(panel)
-            .into_any_element()
+            ));
+        }
+        if let Some(label) = button {
+            let show = show.to_string();
+            buttons.push(self.button(
+                SharedString::from(format!("sonarr-season-{number}")),
+                label,
+                cx,
+                move |this, _, cx| this.download_season(show.clone(), number, cx),
+            ));
+        }
+        (status, color, buttons)
     }
 }
