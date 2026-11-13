@@ -232,7 +232,7 @@ pub struct Shell {
     focus: FocusHandle,
     form: ConnectForm,
     /// Sonarr and Radarr connections, and their Settings forms.
-    arr: HashMap<crate::arr::Kind, arr_settings::ArrForm>,
+    arr: arr_settings::ArrForms,
     /// The server whose streaming quality menu is open.
     quality_menu: Option<i64>,
     /// The Settings page shown, and whether its sign-in form is open.
@@ -347,7 +347,7 @@ impl Shell {
             error: None,
             focus,
             form,
-            arr: arr_settings::new_forms(cx),
+            arr: HashMap::new(),
         };
         // Closing the window while a video is open still reports it.
         let this = cx.weak_entity();
@@ -370,7 +370,6 @@ impl Shell {
             shell.serve_test_captures(dir, window, cx);
         }
         shell.reload();
-        shell.load_arr(cx);
         shell.load_cached_remote();
         shell.refresh(cx);
         shell.generate_thumbs(cx);
@@ -592,6 +591,7 @@ impl Shell {
     fn refresh_remote(&mut self, cx: &mut Context<Self>) {
         self.remote_refreshed = Some(Instant::now());
         self.sync_live(cx);
+        self.sync_arr(cx);
         for server in self.servers.clone() {
             if server.token.is_empty() {
                 // Removed from the credential store outside the app.
@@ -845,11 +845,11 @@ impl Shell {
                 })
                 .detach();
         }
-        let account = self
-            .servers
-            .iter()
-            .find(|s| s.id == server_id)
-            .map(|s| s.token_account(&self.device_id));
+        let server = self.servers.iter().find(|s| s.id == server_id).cloned();
+        if let Some(server) = &server {
+            self.forget_arr(server);
+        }
+        let account = server.map(|s| s.token_account(&self.device_id));
         let removed = account
             .map_or(Ok(()), |account| secrets::delete(&account))
             .and_then(|()| self.db.remove_server(server_id));
@@ -862,6 +862,7 @@ impl Shell {
         );
         self.reload();
         self.sync_live(cx);
+        self.sync_arr(cx);
         cx.notify();
     }
 
@@ -1506,16 +1507,18 @@ impl Shell {
                 window.focus(&self.focus);
                 cx.notify();
             }
-            (Screen::Settings, "enter") if self.adding_server => self.connect(window, cx),
-            (Screen::Settings, "tab") if self.adding_server => self.focus_next_field(window, cx),
-            (Screen::Settings, "enter") if self.settings_page == SettingsPage::Arr => {
-                if let Some(kind) = self.focused_arr(window, cx) {
-                    self.save_arr(kind, cx);
+            (Screen::Settings, "enter" | "tab") if self.focused_arr(window, cx).is_some() => {
+                if let Some(id) = self.focused_arr(window, cx) {
+                    if key == "enter" {
+                        self.save_arr(id, cx);
+                    } else {
+                        self.focus_next_arr_field(id, window, cx);
+                    }
                 }
             }
-            (Screen::Settings, "tab") if self.settings_page == SettingsPage::Arr => {
-                self.focus_next_arr_field(window, cx)
-            }
+            (Screen::Settings, "enter") if self.adding_server => self.connect(window, cx),
+            (Screen::Settings, "tab") if self.adding_server => self.focus_next_field(window, cx),
+
             (Screen::Settings, "escape")
             | (Screen::Show(_) | Screen::Details(_), "escape" | "backspace") => {
                 self.screen = self.tab.clone();

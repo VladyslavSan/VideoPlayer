@@ -16,22 +16,15 @@ const MEDIA_SKIP_SETTING: &str = "media_skip_buttons";
 pub(super) enum SettingsPage {
     #[default]
     Library,
-    /// Sonarr and Radarr.
-    Arr,
     Playback,
 }
 
 impl SettingsPage {
-    const ALL: [SettingsPage; 3] = [
-        SettingsPage::Library,
-        SettingsPage::Arr,
-        SettingsPage::Playback,
-    ];
+    const ALL: [SettingsPage; 2] = [SettingsPage::Library, SettingsPage::Playback];
 
     fn label(self) -> &'static str {
         match self {
             SettingsPage::Library => "Library",
-            SettingsPage::Arr => "Sonarr & Radarr",
             SettingsPage::Playback => "Playback",
         }
     }
@@ -72,9 +65,6 @@ impl Shell {
         self.screen = Screen::Settings;
         self.settings_page = page;
         self.quality_menu = None;
-        if page == SettingsPage::Arr {
-            self.suggest_arr_urls(cx);
-        }
         window.focus(&self.focus);
         cx.notify();
     }
@@ -135,7 +125,6 @@ impl Shell {
             }));
         let sections = match self.settings_page {
             SettingsPage::Library => self.library_settings(window, cx),
-            SettingsPage::Arr => self.arr_settings(cx),
             SettingsPage::Playback => self.playback_settings(cx),
         };
         let mut page = div()
@@ -153,7 +142,13 @@ impl Shell {
                     .flex_col()
                     .gap_2()
                     .max_w(px(760.0))
-                    .children(sections),
+                    // Taller than the window, the page scrolls; the
+                    // sections mustn't shrink to fit it.
+                    .children(
+                        sections
+                            .into_iter()
+                            .map(|section| div().flex_none().child(section)),
+                    ),
             );
         page.style().restrict_scroll_to_axis = Some(true);
         div()
@@ -173,22 +168,24 @@ impl Shell {
             .iter()
             .map(|server| {
                 let id = server.id;
-                row(div()
-                    .flex()
-                    .flex_col()
-                    .min_w(px(0.0))
-                    .child(
-                        div()
-                            .font_weight(FontWeight::MEDIUM)
-                            .child(server.name.clone()),
-                    )
-                    .child(
-                        div()
-                            .text_sm()
-                            .text_color(rgb(MUTED))
-                            .truncate()
-                            .child(format!("{} · {}", server.user_name, server.url)),
-                    ))
+                let top = line(
+                    div()
+                        .flex()
+                        .flex_col()
+                        .min_w(px(0.0))
+                        .child(
+                            div()
+                                .font_weight(FontWeight::MEDIUM)
+                                .child(server.name.clone()),
+                        )
+                        .child(
+                            div()
+                                .text_sm()
+                                .text_color(rgb(MUTED))
+                                .truncate()
+                                .child(format!("{} · {}", server.user_name, server.url)),
+                        ),
+                )
                 .child(
                     div()
                         .flex()
@@ -202,8 +199,15 @@ impl Shell {
                             cx,
                             move |this, _, cx| this.sign_out(id, cx),
                         )),
-                )
-                .into_any_element()
+                );
+                div()
+                    .flex()
+                    .flex_col()
+                    .rounded_lg()
+                    .bg(rgba(0xffffff0a))
+                    .child(top)
+                    .child(self.server_apps(server, cx))
+                    .into_any_element()
             })
             .collect();
         let servers_body = div()
@@ -212,7 +216,8 @@ impl Shell {
             .gap_2()
             .child(note(
                 "Movies and shows on these servers appear in your library. You can sign in to \
-                 several servers, or to one server as different users.",
+                 several servers, or to one server as different users. Each server can have \
+                 its own Sonarr and Radarr, for requesting what it doesn't have yet.",
             ))
             .children(servers)
             .child(if self.adding_server {
@@ -386,6 +391,11 @@ fn note(text: &'static str) -> gpui::Div {
 
 /// One entry in a list: what it is on the left, its buttons on the right.
 fn row(label: impl IntoElement) -> gpui::Div {
+    line(label).rounded_lg().bg(rgba(0xffffff0a))
+}
+
+/// A row's layout without its background, for a line inside a card.
+fn line(label: impl IntoElement) -> gpui::Div {
     div()
         .flex()
         .items_center()
@@ -393,8 +403,6 @@ fn row(label: impl IntoElement) -> gpui::Div {
         .gap_4()
         .px_4()
         .py_3()
-        .rounded_lg()
-        .bg(rgba(0xffffff0a))
         .child(label)
 }
 
