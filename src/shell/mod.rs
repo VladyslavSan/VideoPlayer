@@ -271,8 +271,10 @@ pub struct Shell {
     scrolled_screen: Option<Screen>,
     /// The seasons open on each show's page (the rest are folded).
     open_seasons: HashMap<String, BTreeSet<u16>>,
-    /// Seasons being folded open or shut (show, season), for the animation.
+    /// Seasons being folded open or shut (show, season), for the animation,
+    /// and each open season's height as last drawn.
     folds: HashMap<(String, u16), Fold>,
+    season_heights: Rc<RefCell<HashMap<(String, u16), f32>>>,
     fold_count: u64,
     /// Cards across, as last laid out (for a season's height while it folds).
     columns_hint: Cell<usize>,
@@ -354,6 +356,7 @@ impl Shell {
             scrolled_screen: None,
             open_seasons: HashMap::new(),
             folds: HashMap::new(),
+            season_heights: Rc::default(),
             fold_count: 0,
             columns_hint: Cell::new(4),
             page_generation: 0,
@@ -2346,52 +2349,75 @@ impl Shell {
             .children(buttons);
         let panel = sonarr.and_then(|s| self.release_panel(show, s.number, cx));
         // Folding: the episodes grow from nothing (or shrink to it) while
-        // fading; a closing season stays drawn until it's folded away.
-        let fold = self
-            .folds
-            .get(&(show.to_string(), number))
-            .filter(|_| crate::motion::enabled());
-        let closing = fold.is_some_and(|f| {
-            !f.opening && f.started.elapsed() < crate::motion::duration(crate::motion::FOLD)
-        });
-        let rows = episodes.len().div_ceil(self.columns_hint.get().max(1));
-        // A card, its title and the gap under it.
-        let height = 8.0 + rows as f32 * (CARD_HEIGHT + 64.0);
+        // fading, as one motion over their real height (measured each time
+        // they're drawn); a closing season stays drawn until it's folded
+        // away. All spacing is inside the folding part, so it ends at zero.
+        let key = (show.to_string(), number);
+        let fold_time = crate::motion::duration(crate::motion::FOLD);
+        let fold = self.folds.get(&key).filter(|_| crate::motion::enabled());
+        let closing = fold.is_some_and(|f| !f.opening && f.started.elapsed() < fold_time);
+        let height = self
+            .season_heights
+            .borrow()
+            .get(&key)
+            .copied()
+            .unwrap_or_else(|| {
+                // Not drawn yet: a guess, corrected after the first frame.
+                let rows = episodes.len().div_ceil(self.columns_hint.get().max(1));
+                24.0 + rows as f32 * (CARD_HEIGHT + 56.0)
+            });
         let grid = (open || (have && closing)).then(|| {
             let cards = episodes
                 .into_iter()
                 .map(|e| self.item_card("episode", e, false, cx))
                 .collect();
-            let grid = div().pt_2().pb_4().child(Self::grid(cards));
+            let heights = self.season_heights.clone();
+            let inner = div()
+                .relative()
+                .pt_2()
+                .pb_4()
+                .child(Self::grid(cards))
+                .child(
+                    canvas(
+                        move |bounds, _, _| {
+                            heights
+                                .borrow_mut()
+                                .insert(key, f32::from(bounds.size.height));
+                        },
+                        |_, _, _, _| {},
+                    )
+                    .absolute()
+                    .top_0()
+                    .left_0()
+                    .size_full(),
+                );
+            let outer = div().overflow_hidden().child(inner);
             match fold {
                 Some(fold) => {
                     let opening = fold.opening;
-                    grid.with_animation(
-                        ("fold", fold.id),
-                        Animation::new(crate::motion::duration(crate::motion::FOLD))
-                            .with_easing(crate::motion::ease_out),
-                        move |grid, t| {
-                            let shown = if opening { t } else { 1.0 - t };
-                            if opening && t >= 1.0 {
-                                grid
-                            } else {
-                                grid.max_h(px(height * shown))
-                                    .overflow_hidden()
-                                    .opacity(shown)
-                            }
-                        },
-                    )
-                    .into_any_element()
+                    outer
+                        .with_animation(
+                            ("fold", fold.id),
+                            Animation::new(fold_time).with_easing(gpui::ease_in_out),
+                            move |outer, t| {
+                                let shown = if opening { t } else { 1.0 - t };
+                                if opening && t >= 1.0 {
+                                    outer
+                                } else {
+                                    outer.max_h(px(height * shown)).opacity(shown)
+                                }
+                            },
+                        )
+                        .into_any_element()
                 }
-                None => grid.into_any_element(),
+                None => outer.into_any_element(),
             }
         });
         div()
             .flex()
             .flex_col()
-            .gap_2()
             .child(row)
-            .children(panel)
+            .children(panel.map(|panel| div().pt_2().child(panel)))
             .children(grid)
             .into_any_element()
     }
