@@ -28,6 +28,7 @@ use crate::secrets;
 use crate::ui::menu;
 use crate::ui::text_input::TextInput;
 
+mod arr_settings;
 mod browse;
 mod details;
 mod keynav;
@@ -230,6 +231,8 @@ pub struct Shell {
     error: Option<SharedString>,
     focus: FocusHandle,
     form: ConnectForm,
+    /// Sonarr and Radarr connections, and their Settings forms.
+    arr: HashMap<crate::arr::Kind, arr_settings::ArrForm>,
     /// The server whose streaming quality menu is open.
     quality_menu: Option<i64>,
     /// The Settings page shown, and whether its sign-in form is open.
@@ -344,6 +347,7 @@ impl Shell {
             error: None,
             focus,
             form,
+            arr: arr_settings::new_forms(cx),
         };
         // Closing the window while a video is open still reports it.
         let this = cx.weak_entity();
@@ -366,6 +370,7 @@ impl Shell {
             shell.serve_test_captures(dir, window, cx);
         }
         shell.reload();
+        shell.load_arr(cx);
         shell.load_cached_remote();
         shell.refresh(cx);
         shell.generate_thumbs(cx);
@@ -592,7 +597,7 @@ impl Shell {
                 // Removed from the credential store outside the app.
                 self.error = Some(
                     format!(
-                        "{}: signed out; sign in again from the Jellyfin page",
+                        "{}: signed out; sign in again in Settings → Library",
                         server.name
                     )
                     .into(),
@@ -1503,6 +1508,14 @@ impl Shell {
             }
             (Screen::Settings, "enter") if self.adding_server => self.connect(window, cx),
             (Screen::Settings, "tab") if self.adding_server => self.focus_next_field(window, cx),
+            (Screen::Settings, "enter") if self.settings_page == SettingsPage::Arr => {
+                if let Some(kind) = self.focused_arr(window, cx) {
+                    self.save_arr(kind, cx);
+                }
+            }
+            (Screen::Settings, "tab") if self.settings_page == SettingsPage::Arr => {
+                self.focus_next_arr_field(window, cx)
+            }
             (Screen::Settings, "escape")
             | (Screen::Show(_) | Screen::Details(_), "escape" | "backspace") => {
                 self.screen = self.tab.clone();
@@ -2190,7 +2203,7 @@ impl Shell {
     }
 
     /// "Streaming" and a button that opens a menu of quality presets, for
-    /// a server on the Jellyfin page.
+    /// a server in Settings → Library.
     fn quality_picker(&self, server: i64, window: &Window, cx: &mut Context<Self>) -> AnyElement {
         let current = self.quality_for(server);
         let open = self.quality_menu == Some(server);

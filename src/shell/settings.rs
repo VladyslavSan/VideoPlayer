@@ -16,15 +16,22 @@ const MEDIA_SKIP_SETTING: &str = "media_skip_buttons";
 pub(super) enum SettingsPage {
     #[default]
     Library,
+    /// Sonarr and Radarr.
+    Arr,
     Playback,
 }
 
 impl SettingsPage {
-    const ALL: [SettingsPage; 2] = [SettingsPage::Library, SettingsPage::Playback];
+    const ALL: [SettingsPage; 3] = [
+        SettingsPage::Library,
+        SettingsPage::Arr,
+        SettingsPage::Playback,
+    ];
 
     fn label(self) -> &'static str {
         match self {
             SettingsPage::Library => "Library",
+            SettingsPage::Arr => "Sonarr & Radarr",
             SettingsPage::Playback => "Playback",
         }
     }
@@ -65,6 +72,9 @@ impl Shell {
         self.screen = Screen::Settings;
         self.settings_page = page;
         self.quality_menu = None;
+        if page == SettingsPage::Arr {
+            self.suggest_arr_urls(cx);
+        }
         window.focus(&self.focus);
         cx.notify();
     }
@@ -125,6 +135,7 @@ impl Shell {
             }));
         let sections = match self.settings_page {
             SettingsPage::Library => self.library_settings(window, cx),
+            SettingsPage::Arr => self.arr_settings(cx),
             SettingsPage::Playback => self.playback_settings(cx),
         };
         let mut page = div()

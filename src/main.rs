@@ -1,6 +1,7 @@
 // Release builds are GUI apps: no console window opens next to the player.
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+mod arr;
 mod introdb;
 mod jellyfin;
 mod library;

@@ -66,6 +66,15 @@ Each server's **Sign Out** (in Settings → Library) revokes the token on the se
 
 `cargo test -- --ignored` runs a round trip against Jellyfin's public demo server.
 
+## Sonarr and Radarr
+
+Under **Settings → Sonarr & Radarr**, enter each app's address and API key (in the app under
+Settings → General), then **Save and Test**. The address is filled in from your Jellyfin
+server's host with the usual port (8989, 7878); any full URL works, including `https://` and a
+path behind a reverse proxy. API keys go into the system credential store and are sent only in
+the `X-Api-Key` header. For now this connects and checks the apps; requesting seasons and movies
+from the library comes next.
+
 ## Player
 
 A floating control bar appears when you move the mouse and hides after a few seconds of
