@@ -122,11 +122,13 @@ fn now() -> i64 {
 
 #[derive(Clone, PartialEq)]
 enum Screen {
+    /// Every source together.
     Home,
-    /// A library tab of movies, or of shows: a Jellyfin library by name,
-    /// or None for local folders.
-    Movies(Option<String>),
-    Shows(Option<String>),
+    /// One source's page: a Jellyfin server, or None for local folders.
+    Source(browse::Origin),
+    /// A library's grid of movies, or of shows.
+    Movies(browse::Shelf),
+    Shows(browse::Shelf),
     Show(String),
     /// A movie's details page, by item key.
     Details(String),
@@ -1525,13 +1527,13 @@ impl Shell {
                 window.focus(&self.focus);
                 cx.notify();
             }
-            (Screen::Home | Screen::Movies(_) | Screen::Shows(_), "escape") => {
+            (Screen::Home | Screen::Source(_) | Screen::Movies(_) | Screen::Shows(_), "escape") => {
                 // Clear the search and leave the field.
                 self.search.update(cx, |input, cx| input.set_text("", cx));
                 window.focus(&self.focus);
                 cx.notify();
             }
-            (Screen::Home | Screen::Movies(_) | Screen::Shows(_), "f")
+            (Screen::Home | Screen::Source(_) | Screen::Movies(_) | Screen::Shows(_), "f")
                 if event.keystroke.modifiers.secondary() =>
             {
                 window.focus(&self.search.focus_handle(cx));
@@ -1576,7 +1578,9 @@ impl Shell {
             })
         };
         let title: AnyElement = match &self.screen {
-            Screen::Home | Screen::Movies(_) | Screen::Shows(_) => self.tabs(cx),
+            Screen::Home | Screen::Source(_) | Screen::Movies(_) | Screen::Shows(_) => {
+                self.search_field()
+            }
             Screen::Show(_) | Screen::Details(_) => back(self, cx),
             Screen::Settings => div()
                 .flex()
@@ -2263,9 +2267,12 @@ impl Render for Shell {
         }
         // A library tab that's gone (the server's libraries changed, or the
         // cache from before they were tracked was replaced) falls back to Home.
-        if Grid::of(&self.screen).is_some()
-            && !self.library_tabs().iter().any(|(_, s)| *s == self.screen)
-        {
+        let gone = match &self.screen {
+            Screen::Movies(_) | Screen::Shows(_) => !self.library_screens().contains(&self.screen),
+            Screen::Source(origin) => !self.sources().iter().any(|s| s.origin == *origin),
+            _ => false,
+        };
+        if gone {
             self.screen = Screen::Home;
             self.tab = Screen::Home;
         }
@@ -2277,11 +2284,12 @@ impl Render for Shell {
         let query = self.search_query(cx);
         let on_tab = matches!(
             self.screen,
-            Screen::Home | Screen::Movies(_) | Screen::Shows(_)
+            Screen::Home | Screen::Source(_) | Screen::Movies(_) | Screen::Shows(_)
         );
         let body: Result<Vec<AnyElement>, AnyElement> = match self.screen.clone() {
             _ if on_tab && !query.is_empty() => Ok(self.search_results(&query, cx)),
-            Screen::Home => Ok(self.home(cx)),
+            Screen::Home => Ok(self.home(None, cx)),
+            Screen::Source(origin) => Ok(self.home(Some(origin), cx)),
             ref screen @ (Screen::Movies(_) | Screen::Shows(_)) => {
                 let grid = Grid::of(screen).expect("a library tab");
                 Err(self.library_grid(grid, window, cx))
@@ -2308,6 +2316,25 @@ impl Render for Shell {
             }
             Err(grid) => grid,
         };
+        // Settings has its own sidebar; everything else has the library's.
+        let main = if self.screen == Screen::Settings {
+            content
+        } else {
+            div()
+                .flex()
+                .flex_1()
+                .min_h(px(0.0))
+                .child(self.sidebar(cx))
+                .child(
+                    div()
+                        .flex()
+                        .flex_col()
+                        .flex_1()
+                        .min_w(px(0.0))
+                        .child(content),
+                )
+                .into_any_element()
+        };
         div()
             .size_full()
             .flex()
@@ -2317,7 +2344,7 @@ impl Render for Shell {
             .track_focus(&self.focus)
             .on_key_down(cx.listener(Self::on_key))
             .child(self.header(cx))
-            .child(content)
+            .child(main)
             .into_any_element()
     }
 }

@@ -126,30 +126,52 @@ pub fn matches(text: &str, query: &str) -> bool {
         .all(|word| text.contains(&word.to_lowercase()))
 }
 
-/// How many cards fit across the content area.
+/// How many cards fit across the content area (beside the sidebar).
 pub(super) fn columns(window: &Window) -> usize {
-    let width = f32::from(window.viewport_size().width) - 2.0 * PAGE_PADDING;
+    let width = f32::from(window.viewport_size().width) - SIDEBAR_WIDTH - 2.0 * PAGE_PADDING;
     (((width + CARD_GAP) / (CARD_WIDTH + CARD_GAP)).floor() as usize).max(1)
 }
 
-/// A grid tab: the movies, or the shows, of one library. `library` is a
-/// Jellyfin library's name; None means items in no library (local folders).
+/// Width of the sidebar of sources and libraries.
+pub(super) const SIDEBAR_WIDTH: f32 = 230.0;
+
+/// Where an item comes from: a Jellyfin server (our row id), or None for
+/// local folders.
+pub type Origin = Option<i64>;
+
+pub fn origin(item: &Item) -> Origin {
+    match item.source {
+        crate::library::Source::Jellyfin { server, .. } => Some(server),
+        crate::library::Source::Local { .. } => None,
+    }
+}
+
+/// One library of one source: a Jellyfin library by name, or None for
+/// items in no library (local folders, or a server whose libraries
+/// couldn't be listed).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Shelf {
+    pub origin: Origin,
+    pub library: Option<String>,
+}
+
+/// A grid: the movies, or the shows, of one shelf.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Grid {
     pub shows: bool,
-    pub library: Option<String>,
+    pub shelf: Shelf,
 }
 
 impl Grid {
     pub fn of(screen: &Screen) -> Option<Grid> {
         match screen {
-            Screen::Movies(library) => Some(Grid {
+            Screen::Movies(shelf) => Some(Grid {
                 shows: false,
-                library: library.clone(),
+                shelf: shelf.clone(),
             }),
-            Screen::Shows(library) => Some(Grid {
+            Screen::Shows(shelf) => Some(Grid {
                 shows: true,
-                library: library.clone(),
+                shelf: shelf.clone(),
             }),
             _ => None,
         }
@@ -157,17 +179,28 @@ impl Grid {
 
     fn contains(&self, item: &Item) -> bool {
         item.is_episode() == self.shows
-            && item.library.as_ref().map(|l| l.name.as_str()) == self.library.as_deref()
+            && origin(item) == self.shelf.origin
+            && item.library.as_ref().map(|l| l.name.as_str()) == self.shelf.library.as_deref()
     }
 
     fn id(&self) -> SharedString {
         format!(
-            "{}-grid-{}",
+            "{}-grid-{}-{}",
             if self.shows { "shows" } else { "movies" },
-            self.library.as_deref().unwrap_or("")
+            self.shelf
+                .origin
+                .map_or("local".to_string(), |s| s.to_string()),
+            self.shelf.library.as_deref().unwrap_or("")
         )
         .into()
     }
+}
+
+/// A source in the sidebar: its name, its page, and its libraries.
+pub struct SourceEntry {
+    pub origin: Origin,
+    pub name: String,
+    pub libraries: Vec<(String, Screen)>,
 }
 
 impl Shell {
@@ -185,43 +218,105 @@ impl Shell {
         shows
     }
 
-    /// The library tabs after Home: one per Jellyfin library, in the
-    /// server's order, then Movies / TV Shows for local folders. With no
-    /// libraries at all, plain Movies and TV Shows.
-    pub(super) fn library_tabs(&self) -> Vec<(String, Screen)> {
-        let mut libraries: Vec<&Library> = Vec::new();
-        let (mut local_movies, mut local_shows) = (false, false);
+    /// The sidebar's sources: each signed-in Jellyfin server with its
+    /// libraries in the server's order, then local folders (Movies, TV
+    /// Shows) if there are any.
+    pub(super) fn sources(&self) -> Vec<SourceEntry> {
+        struct Found<'a> {
+            libraries: Vec<&'a Library>,
+            /// Items in no library: movies, episodes.
+            loose: (bool, bool),
+        }
+        let mut found: BTreeMap<Origin, Found> = BTreeMap::new();
         for item in self.items() {
+            let entry = found.entry(origin(item)).or_insert(Found {
+                libraries: Vec::new(),
+                loose: (false, false),
+            });
             match &item.library {
-                Some(l) if !libraries.iter().any(|known| known.name == l.name) => libraries.push(l),
+                Some(l) if !entry.libraries.iter().any(|known| known.name == l.name) => {
+                    entry.libraries.push(l)
+                }
                 Some(_) => {}
-                None if item.is_episode() => local_shows = true,
-                None => local_movies = true,
+                None if item.is_episode() => entry.loose.1 = true,
+                None => entry.loose.0 = true,
             }
         }
-        libraries.sort_by_key(|l| l.order);
-        let named = !libraries.is_empty();
-        let mut tabs: Vec<(String, Screen)> = libraries
-            .into_iter()
-            .map(|l| {
-                let library = Some(l.name.clone());
-                let screen = if l.shows {
-                    Screen::Shows(library)
-                } else {
-                    Screen::Movies(library)
+        let entry = |origin: Origin, name: String, found: Option<&Found>| {
+            let mut libraries: Vec<(String, Screen)> = Vec::new();
+            if let Some(found) = found {
+                let mut named = found.libraries.clone();
+                named.sort_by_key(|l| l.order);
+                for l in named {
+                    let shelf = Shelf {
+                        origin,
+                        library: Some(l.name.clone()),
+                    };
+                    let screen = if l.shows {
+                        Screen::Shows(shelf)
+                    } else {
+                        Screen::Movies(shelf)
+                    };
+                    libraries.push((l.name.clone(), screen));
+                }
+                let shelf = Shelf {
+                    origin,
+                    library: None,
                 };
-                (l.name.clone(), screen)
+                if found.loose.0 {
+                    libraries.push(("Movies".into(), Screen::Movies(shelf.clone())));
+                }
+                if found.loose.1 {
+                    libraries.push(("TV Shows".into(), Screen::Shows(shelf)));
+                }
+            }
+            SourceEntry {
+                origin,
+                name,
+                libraries,
+            }
+        };
+        let mut sources: Vec<SourceEntry> = self
+            .servers
+            .iter()
+            .map(|server| {
+                // One server signed in as two users needs telling apart.
+                let twin = self
+                    .servers
+                    .iter()
+                    .any(|s| s.id != server.id && s.name == server.name);
+                let name = if twin {
+                    format!("{} ({})", server.name, server.user_name)
+                } else {
+                    server.name.clone()
+                };
+                entry(Some(server.id), name, found.get(&Some(server.id)))
             })
             .collect();
-        if local_movies || !named {
-            let label = if named { "Local Movies" } else { "Movies" };
-            tabs.push((label.into(), Screen::Movies(None)));
+        if found.contains_key(&None) || !self.roots.is_empty() {
+            sources.push(entry(None, "Local folders".into(), found.get(&None)));
         }
-        if local_shows || !named {
-            let label = if named { "Local Shows" } else { "TV Shows" };
-            tabs.push((label.into(), Screen::Shows(None)));
+        sources
+    }
+
+    /// Every library screen in the sidebar.
+    pub(super) fn library_screens(&self) -> Vec<Screen> {
+        self.sources()
+            .into_iter()
+            .flat_map(|s| s.libraries.into_iter().map(|(_, screen)| screen))
+            .collect()
+    }
+
+    /// A source's name in the sidebar.
+    pub(super) fn source_name(&self, origin: Origin) -> String {
+        match origin {
+            Some(id) => self
+                .servers
+                .iter()
+                .find(|s| s.id == id)
+                .map_or_else(|| "Jellyfin".into(), |s| s.name.clone()),
+            None => "Local folders".into(),
         }
-        tabs
     }
 
     pub(super) fn search_query(&self, cx: &Context<Self>) -> String {
@@ -335,41 +430,94 @@ impl Shell {
         cx.notify();
     }
 
-    pub(super) fn home(&self, cx: &mut Context<Self>) -> Vec<AnyElement> {
-        if self.items().next().is_none() {
-            return vec![self.empty_state(cx)];
-        }
+    /// Home (`scope` None: every source) or one source's page: what to
+    /// continue, then the newest in each library.
+    pub(super) fn home(&self, scope: Option<Origin>, cx: &mut Context<Self>) -> Vec<AnyElement> {
+        let in_scope = |item: &&Item| scope.is_none_or(|o| origin(item) == o);
         let mut rows = Vec::new();
+        if let Some(origin) = scope {
+            rows.push(
+                div()
+                    .pt_6()
+                    .text_2xl()
+                    .font_weight(FontWeight::BOLD)
+                    .child(self.source_name(origin))
+                    .into_any_element(),
+            );
+        }
+        if !self.items().any(|i| in_scope(&i)) {
+            rows.push(if scope.is_none() {
+                self.empty_state(cx)
+            } else {
+                div()
+                    .pt_10()
+                    .text_color(rgb(MUTED))
+                    .child(if self.loading_servers.is_empty() {
+                        "Nothing here yet."
+                    } else {
+                        "Loading…"
+                    })
+                    .into_any_element()
+            });
+            return rows;
+        }
+        let prefix = match scope {
+            None => "home".to_string(),
+            Some(o) => format!("source-{}", o.map_or("local".into(), |s| s.to_string())),
+        };
 
         // Half-watched videos, and the next episode of shows being watched,
         // most recently watched first.
         let mut continuing: Vec<(Option<i64>, &Item)> = self
             .items()
+            .filter(in_scope)
             .filter(|i| i.progress().is_some())
             .map(|i| (i.last_played, i))
             .collect();
-        continuing.extend(library::next_up(self.items()));
+        continuing.extend(library::next_up(self.items().filter(in_scope)));
         continuing.sort_by_key(|(played, _)| Reverse(*played));
         if !continuing.is_empty() {
             let cards = continuing
                 .into_iter()
                 .take(super::CONTINUE_LIMIT)
-                .map(|(_, i)| self.item_card("continue", i, true, cx))
+                .map(|(_, i)| self.item_card(&format!("{prefix}-continue"), i, true, cx))
                 .collect();
-            rows.push(self.row("continue-row", "Continue Watching", cards, None, cx));
+            rows.push(self.row(
+                format!("{prefix}-continue-row"),
+                "Continue Watching",
+                cards,
+                None,
+                cx,
+            ));
         }
 
         // The newest in each library, like Jellyfin's "Latest ..." rows.
-        for (label, screen) in self.library_tabs() {
+        let sources: Vec<SourceEntry> = self
+            .sources()
+            .into_iter()
+            .filter(|s| scope.is_none_or(|o| s.origin == o))
+            .collect();
+        // On Home with several sources, rows say which one they're from.
+        let several = scope.is_none() && sources.len() > 1;
+        let libraries = sources.iter().flat_map(|source| {
+            source
+                .libraries
+                .iter()
+                .map(move |(label, screen)| (source, label, screen.clone()))
+        });
+        for (source, label, screen) in libraries {
             let Some(grid) = Grid::of(&screen) else {
                 continue;
             };
-            let title = match (&grid.library, grid.shows) {
+            let mut title = match (&grid.shelf.library, grid.shows) {
                 (Some(_), _) => format!("Latest {label}"),
                 (None, false) => format!("Recently Added {label}"),
                 (None, true) => format!("Recently Updated {label}"),
             };
-            let id = grid.id();
+            if several {
+                title = format!("{title} · {}", source.name);
+            }
+            let id = format!("{prefix}-{}", grid.id());
             let cards: Vec<AnyElement> = if grid.shows {
                 let mut shows = show_summaries(self.items().filter(|i| grid.contains(i)));
                 sort_shows(&mut shows, Sort::RecentlyAdded);
@@ -574,54 +722,90 @@ impl Shell {
         sections
     }
 
-    /// Home, a tab per library, and the search field.
-    pub(super) fn tabs(&self, cx: &mut Context<Self>) -> AnyElement {
-        let tab =
-            |id: SharedString, label: SharedString, screen: Screen, cx: &mut Context<Self>| {
-                let active = self.screen == screen;
+    /// The search field, in the header over the library.
+    pub(super) fn search_field(&self) -> AnyElement {
+        div()
+            .w(px(320.0))
+            .flex_none()
+            .child(self.search.clone())
+            .into_any_element()
+    }
+
+    /// The left sidebar: Home, then each source with its libraries.
+    /// What's open is highlighted (a show or movie page counts as the
+    /// library it was opened from).
+    pub(super) fn sidebar(&self, cx: &mut Context<Self>) -> AnyElement {
+        let current = &self.tab;
+        let entry =
+            |id: SharedString,
+             label: String,
+             screen: Screen,
+             indent: bool,
+             heading: bool,
+             cx: &mut Context<Self>| {
+                let active = *current == screen;
                 div()
                     .id(id)
                     .flex_none()
-                    .whitespace_nowrap()
-                    .px_4()
+                    .px_3()
                     .py_1p5()
-                    .rounded_full()
-                    .font_weight(FontWeight::SEMIBOLD)
+                    .when(indent, |d| d.pl_6())
+                    .rounded_md()
+                    .truncate()
                     .cursor_pointer()
-                    .text_color(rgb(if active { TEXT } else { MUTED }))
-                    .when(active, |d| d.bg(rgba(0xffffff1f)))
-                    .hover(|d| d.text_color(rgb(TEXT)))
+                    .when(heading, |d| d.font_weight(FontWeight::SEMIBOLD))
+                    .text_color(rgb(if active || heading { TEXT } else { MUTED }))
+                    .when(active, |d| d.bg(rgba(0xffffff1a)))
+                    .when(!active, |d| d.hover(|s| s.bg(rgba(0xffffff0d))))
                     .child(label)
                     .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
                         this.set_tab(screen.clone(), cx)
                     }))
                     .into_any_element()
             };
-        let libraries: Vec<AnyElement> = self
-            .library_tabs()
-            .into_iter()
-            .map(|(label, screen)| {
+        let mut children = vec![entry(
+            "side-home".into(),
+            "Home".into(),
+            Screen::Home,
+            false,
+            true,
+            cx,
+        )];
+        for source in self.sources() {
+            let key = source.origin.map_or("local".to_string(), |s| s.to_string());
+            children.push(div().h(px(14.0)).flex_none().into_any_element());
+            children.push(entry(
+                format!("side-source-{key}").into(),
+                source.name.clone(),
+                Screen::Source(source.origin),
+                false,
+                true,
+                cx,
+            ));
+            for (label, screen) in source.libraries {
                 let id = match Grid::of(&screen) {
-                    Some(grid) => format!("tab-{}", grid.id()),
-                    None => format!("tab-{label}"),
+                    Some(grid) => format!("side-{}", grid.id()),
+                    None => format!("side-{key}-{label}"),
                 };
-                tab(id.into(), label.into(), screen, cx)
-            })
-            .collect();
-        div()
+                children.push(entry(id.into(), label, screen, true, false, cx));
+            }
+        }
+        let mut sidebar = div()
+            .id("sidebar")
             .flex()
-            .items_center()
-            .gap_1()
-            .child(tab("tab-home".into(), "Home".into(), Screen::Home, cx))
-            .children(libraries)
-            .child(
-                div()
-                    .w(px(260.0))
-                    .flex_none()
-                    .ml_4()
-                    .child(self.search.clone()),
-            )
-            .into_any_element()
+            .flex_col()
+            .flex_none()
+            .w(px(SIDEBAR_WIDTH))
+            .h_full()
+            .gap_0p5()
+            .pl_6()
+            .pr_2()
+            .pt_2()
+            .pb_6()
+            .overflow_y_scroll()
+            .children(children);
+        sidebar.style().restrict_scroll_to_axis = Some(true);
+        sidebar.into_any_element()
     }
 }
 
@@ -666,14 +850,30 @@ mod tests {
         anime.library = library("Anime Movies", false);
         let mut episode = item("Ep", Some("Show"));
         episode.library = library("Shows", true);
-        let local = item("Home Video", None);
+        let mut local = item("Home Video", None);
+        local.source = Source::Local {
+            id: 1,
+            path: "D:/Home Video.mkv".into(),
+        };
+        // Another server's library of the same name.
+        let mut other = item("Other Movie", None);
+        other.library = library("Movies", false);
+        other.source = Source::Jellyfin {
+            server: 2,
+            id: "x".into(),
+        };
+        let shelf = |origin, library: Option<&str>| Shelf {
+            origin,
+            library: library.map(String::from),
+        };
 
-        let grid = Grid::of(&Screen::Movies(Some("Movies".into()))).unwrap();
+        let grid = Grid::of(&Screen::Movies(shelf(Some(1), Some("Movies")))).unwrap();
         assert!(grid.contains(&movie));
         assert!(!grid.contains(&anime) && !grid.contains(&episode) && !grid.contains(&local));
-        let local_grid = Grid::of(&Screen::Movies(None)).unwrap();
+        assert!(!grid.contains(&other));
+        let local_grid = Grid::of(&Screen::Movies(shelf(None, None))).unwrap();
         assert!(local_grid.contains(&local) && !local_grid.contains(&movie));
-        let shows = Grid::of(&Screen::Shows(Some("Shows".into()))).unwrap();
+        let shows = Grid::of(&Screen::Shows(shelf(Some(1), Some("Shows")))).unwrap();
         assert!(shows.contains(&episode) && !shows.contains(&movie));
         assert_eq!(Grid::of(&Screen::Home), None);
     }

@@ -137,12 +137,14 @@ Enter plays it); Esc goes back, with the ring where you left it. From the search
 moves into the results. The mouse wheel scrolls the page; Shift+wheel, a tilting wheel or
 a trackpad scrolls the row under the pointer sideways.
 
+The sidebar on the left lists **Home**, then each Jellyfin server with its libraries (Movies,
+Shows, Anime Series, ...) in the server's order, then **Local folders** with Movies and TV Shows.
 **Home** shows Continue Watching (including the next episode of shows you're watching) and the
-latest additions to each library. Clicking an episode's picture plays it; clicking the text under
-it opens its show at that season, with the episode highlighted. Each Jellyfin library (Movies,
-Shows, Anime Series, ...) gets its own tab, in the server's order; local folders get **Movies** and
-**TV Shows** tabs. The tabs are full grids with sorting (title, recently added, recently watched,
-year); they only draw the rows on screen, so large libraries stay fast. **Search** (Ctrl+F, ⌘F on a Mac) matches
+latest additions to each library of every source; clicking a server's name opens the same page for
+that server alone. Clicking an episode's picture plays it; clicking the text under it opens its show
+at that season, with the episode highlighted. Each library is a full grid with sorting (title,
+recently added, recently watched, year); it only draws the rows on screen, so large libraries stay
+fast. **Search** (Ctrl+F, ⌘F on a Mac) matches
 movies, shows and episode titles; Esc clears it.
 
 Selecting a movie opens its details: backdrop, year, runtime, rating, genres, overview, the
