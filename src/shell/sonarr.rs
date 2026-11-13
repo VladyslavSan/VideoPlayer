@@ -24,7 +24,7 @@ pub(super) enum SonarrView {
 }
 
 pub(super) struct SonarrShow {
-    series: i64,
+    pub(super) series: i64,
     seasons: Vec<SeasonSummary>,
     /// "S12E3 · Title" and when it airs.
     next: Option<(String, i64)>,
@@ -32,7 +32,10 @@ pub(super) struct SonarrShow {
 
 pub(super) enum Request {
     Sending,
+    /// Asked Sonarr to search for the season.
     Sent(Instant),
+    /// Sent a chosen release to the download client.
+    Grabbed(Instant),
     Failed(SharedString),
 }
 
@@ -42,7 +45,7 @@ fn now() -> i64 {
 
 impl Shell {
     /// The Sonarr for a show's server, and the show's TVDB id.
-    fn sonarr_for(&self, show: &str) -> Option<(Client, String)> {
+    pub(super) fn sonarr_for(&self, show: &str) -> Option<(Client, String)> {
         let server = self.items().find_map(|i| match &i.source {
             Source::Jellyfin { server, .. } if i.show.as_deref() == Some(show) => Some(*server),
             _ => None,
@@ -104,7 +107,7 @@ impl Shell {
                         found.seasons.iter().any(|s| s.downloading > 0)
                             || this.sonarr_requests.iter().any(|((name, _), request)| {
                                 name == &show
-                                    && matches!(request, Request::Sent(at) if at.elapsed() < SEARCHING_FOR)
+                                    && matches!(request, Request::Sent(at) | Request::Grabbed(at) if at.elapsed() < SEARCHING_FOR)
                             })
                     }
                     _ => false,
@@ -262,6 +265,15 @@ impl Shell {
                     MUTED,
                     None,
                 ),
+                Some(Request::Grabbed(at))
+                    if at.elapsed() < SEARCHING_FOR && season.missing > 0 =>
+                {
+                    (
+                        format!("{missing} · sent to the download client"),
+                        MUTED,
+                        None,
+                    )
+                }
                 _ if season.missing == 0 => ("Downloaded".to_string(), MUTED, None),
                 _ if season.monitored => (
                     format!("{missing} · Sonarr is watching for releases"),
@@ -272,8 +284,26 @@ impl Shell {
             }
         };
         let number = season.number;
+        let choosing = self
+            .release_panels
+            .contains_key(&(show.to_string(), number));
+        // An open list can always be closed again.
+        let choose = (choosing || (season.missing > 0 && season.downloading == 0)).then(|| {
+            let show = show.to_string();
+            self.button(
+                SharedString::from(format!("sonarr-choose-{number}")),
+                if choosing {
+                    "Hide Releases"
+                } else {
+                    "Choose Release"
+                },
+                cx,
+                move |this, _, cx| this.toggle_releases(show.clone(), number, cx),
+            )
+        });
+        let panel = self.release_panel(show, number, cx);
         let show = show.to_string();
-        div()
+        let line = div()
             .flex()
             .items_center()
             .gap_4()
@@ -296,6 +326,7 @@ impl Shell {
                     .text_color(rgb(color))
                     .child(status),
             )
+            .children(choose)
             .children(button.map(|label| {
                 self.button(
                     SharedString::from(format!("sonarr-season-{number}")),
@@ -303,7 +334,13 @@ impl Shell {
                     cx,
                     move |this, _, cx| this.download_season(show.clone(), number, cx),
                 )
-            }))
+            }));
+        div()
+            .flex()
+            .flex_col()
+            .gap_2()
+            .child(line)
+            .children(panel)
             .into_any_element()
     }
 }

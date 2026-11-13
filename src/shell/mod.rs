@@ -33,6 +33,7 @@ mod browse;
 mod details;
 mod keynav;
 mod live;
+mod releases;
 mod reports;
 mod settings;
 mod sonarr;
@@ -241,6 +242,8 @@ pub struct Shell {
     sonarr: HashMap<String, sonarr::SonarrView>,
     sonarr_loading: HashSet<String>,
     sonarr_requests: HashMap<(String, u32), sonarr::Request>,
+    /// Open release lists, by show and season.
+    release_panels: HashMap<releases::PanelKey, releases::ReleasePanel>,
     /// The server whose streaming quality menu is open.
     quality_menu: Option<i64>,
     /// The Settings page shown, and whether its sign-in form is open.
@@ -359,6 +362,7 @@ impl Shell {
             sonarr: HashMap::new(),
             sonarr_loading: HashSet::new(),
             sonarr_requests: HashMap::new(),
+            release_panels: HashMap::new(),
         };
         // Closing the window while a video is open still reports it.
         let this = cx.weak_entity();

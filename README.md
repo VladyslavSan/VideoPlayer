@@ -82,6 +82,11 @@ the page is open it follows the downloads (checking every 10 seconds); once Jell
 they appear among the seasons. It also says when the next episode airs. Shows are matched by their
 TVDB id.
 
+**Choose Release** instead shows what Sonarr's interactive search finds for the season on your
+indexers: every release, best first, with quality, size, seeders, age, indexer, languages and
+custom format score. Sonarr's own pick is marked; releases it would reject are folded away with its
+reasons. **Download** on one sends exactly that release to the download client.
+
 ## Player
 
 A floating control bar appears when you move the mouse and hides after a few seconds of
