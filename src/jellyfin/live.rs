@@ -21,7 +21,7 @@ use tungstenite::http::HeaderValue;
 use tungstenite::stream::MaybeTlsStream;
 use tungstenite::{Message, WebSocket};
 
-use super::Client;
+use super::{Client, ItemUserData};
 
 /// The server drops a client it hasn't heard from in 60 seconds.
 const KEEP_ALIVE: Duration = Duration::from_secs(30);
@@ -31,12 +31,13 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 const RETRY_FIRST: Duration = Duration::from_secs(2);
 const RETRY_MAX: Duration = Duration::from_secs(60);
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum Change {
     /// Items were added, changed or removed.
     Library,
-    /// Watched state or a resume point changed.
-    UserData,
+    /// Watched state or resume points changed (here, on the TV, on the
+    /// web): the new state of each item comes with it.
+    UserData(Vec<ItemUserData>),
     /// Connected again after losing the connection; anything may have
     /// changed in between.
     Reconnected,
@@ -137,10 +138,13 @@ fn listen(
             last_sent = Instant::now();
         }
         match socket.read() {
-            Ok(Message::Text(text)) => match message_type(text.as_str()).as_deref() {
-                Some("LibraryChanged") if !notify(Change::Library) => return Ok(()),
-                Some("UserDataChanged") if !notify(Change::UserData) => return Ok(()),
-                Some("ForceKeepAlive") => {
+            Ok(Message::Text(text)) => match parse(text.as_str()) {
+                Some(Pushed::Change(change)) => {
+                    if !notify(change) {
+                        return Ok(());
+                    }
+                }
+                Some(Pushed::KeepAlive) => {
                     keep_alive(&mut socket)?;
                     last_sent = Instant::now();
                 }
@@ -200,15 +204,40 @@ fn keep_alive(socket: &mut WebSocket<MaybeTlsStream<TcpStream>>) -> Result<()> {
     Ok(())
 }
 
-fn message_type(text: &str) -> Option<String> {
+enum Pushed {
+    Change(Change),
+    KeepAlive,
+}
+
+fn parse(text: &str) -> Option<Pushed> {
     #[derive(Deserialize)]
     #[serde(rename_all = "PascalCase")]
     struct Envelope {
         message_type: String,
+        #[serde(default)]
+        data: serde_json::Value,
     }
-    serde_json::from_str::<Envelope>(text)
-        .ok()
-        .map(|e| e.message_type)
+    #[derive(Deserialize)]
+    #[serde(rename_all = "PascalCase")]
+    struct UserDataChanged {
+        #[serde(default)]
+        user_data_list: Vec<ItemUserData>,
+    }
+    let envelope: Envelope = serde_json::from_str(text).ok()?;
+    match envelope.message_type.as_str() {
+        "LibraryChanged" => Some(Pushed::Change(Change::Library)),
+        "UserDataChanged" => {
+            let changed: UserDataChanged = serde_json::from_value(envelope.data).ok()?;
+            let items = changed
+                .user_data_list
+                .into_iter()
+                .map(ItemUserData::normalized)
+                .collect();
+            Some(Pushed::Change(Change::UserData(items)))
+        }
+        "ForceKeepAlive" => Some(Pushed::KeepAlive),
+        _ => None,
+    }
 }
 
 #[cfg(test)]
@@ -228,11 +257,40 @@ mod tests {
         assert!(socket_url("ftp://x").is_err());
     }
 
+    fn change(text: &str) -> Option<Change> {
+        match parse(text)? {
+            Pushed::Change(change) => Some(change),
+            Pushed::KeepAlive => None,
+        }
+    }
+
     #[test]
-    fn reads_the_message_type() {
+    fn reads_library_changes() {
         let text =
             r#"{"MessageType":"LibraryChanged","Data":{"ItemsAdded":["a"]},"MessageId":"x"}"#;
-        assert_eq!(message_type(text).as_deref(), Some("LibraryChanged"));
-        assert_eq!(message_type("not json"), None);
+        assert_eq!(change(text), Some(Change::Library));
+        assert!(parse("not json").is_none());
+        assert!(parse(r#"{"MessageType":"Sessions","Data":[]}"#).is_none());
+    }
+
+    #[test]
+    fn reads_the_play_states_pushed() {
+        // As Jellyfin sends it when an episode is finished on another device.
+        let text = r#"{"MessageType":"UserDataChanged","Data":{"UserId":"d29f2020b4894243ab6e08a0e469ccc7",
+            "UserDataList":[{"PlayedPercentage":0,"PlaybackPositionTicks":0,"PlayCount":2,"IsFavorite":false,
+            "LastPlayedDate":"2026-11-18T18:09:57.9751521Z","Played":true,"Key":"401","ItemId":"E836DACE-F2E5-5373-FDA9-3250DC1C5AAF"},
+            {"UnplayedItemCount":3,"PlaybackPositionTicks":0,"PlayCount":0,"IsFavorite":false,"Played":false,"Key":"x",
+            "ItemId":"ac3e3624aaaaaaaaaaaaaaaaaaaaaaaa"}]},"MessageId":"m"}"#;
+        let Some(Change::UserData(items)) = change(text) else {
+            panic!("not read");
+        };
+        assert_eq!(items.len(), 2);
+        assert_eq!(items[0].item_id, "e836dacef2e55373fda93250dc1c5aaf");
+        assert!(items[0].data.played);
+        assert_eq!(
+            items[0].data.last_played_date.as_deref(),
+            Some("2026-11-18T18:09:57.9751521Z")
+        );
+        assert_eq!(items[1].data.last_played_date, None);
     }
 }

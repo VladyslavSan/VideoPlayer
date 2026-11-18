@@ -57,8 +57,15 @@ const UP_NEXT_SECONDS: u64 = 8;
 const END_CREDITS_FROM: f64 = 0.7;
 
 pub enum PlayerEvent {
-    /// Periodic and final position report, for resume.
-    Progress { position: f64, duration: f64 },
+    /// Position report, for resume: every few seconds while playing, once
+    /// when paused (a paused player has nothing new to say, and repeating
+    /// itself would overwrite what other devices do meanwhile), once when
+    /// playing again, and at the end.
+    Progress {
+        position: f64,
+        duration: f64,
+        paused: bool,
+    },
     /// The user left the player, or the video ended.
     Exit,
     /// Switch to another item (an episode of the same show), by library key.
@@ -188,6 +195,8 @@ pub struct Player {
     exited: bool,
     last_activity: Instant,
     last_report: Instant,
+    /// Whether the last report said paused.
+    reported_paused: bool,
     pipeline: String,
     /// Pictures for the seek bar's hover preview, when available.
     previews: Option<Previews>,
@@ -328,6 +337,7 @@ impl Player {
             exited: false,
             last_activity: Instant::now(),
             last_report: Instant::now(),
+            reported_paused: false,
             pipeline: String::new(),
             previews: None,
             seek_bounds: Rc::default(),
@@ -547,7 +557,10 @@ impl Player {
                 self.credits_dismissed = false;
             }
         }
-        if self.last_report.elapsed() >= PROGRESS_INTERVAL {
+        let paused = self.reporting_paused();
+        if paused != self.reported_paused
+            || (!paused && self.last_report.elapsed() >= PROGRESS_INTERVAL)
+        {
             self.report(cx);
         }
         cx.notify();
@@ -680,12 +693,21 @@ impl Player {
         self.tracks.iter().filter(move |t| t.kind == kind)
     }
 
+    /// Paused by the viewer. At the end mpv also pauses, but that's the
+    /// video finishing, not someone stepping away.
+    fn reporting_paused(&self) -> bool {
+        self.status.paused && !self.status.ended
+    }
+
     fn report(&mut self, cx: &mut Context<Self>) {
         self.last_report = Instant::now();
         if self.status.duration > 0.0 {
+            let paused = self.reporting_paused();
+            self.reported_paused = paused;
             cx.emit(PlayerEvent::Progress {
                 position: self.status.position,
                 duration: self.status.duration,
+                paused,
             });
         }
     }

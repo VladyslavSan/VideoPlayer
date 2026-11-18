@@ -23,8 +23,9 @@ struct Job {
     /// A progress report, superseded by any newer one.
     progress: bool,
     send: Send,
-    /// Re-read the library afterwards, so watched state shows up.
-    refresh: bool,
+    /// Read this item's play state back afterwards (server, item id), so
+    /// what the server made of it shows.
+    confirm: Option<(i64, String)>,
 }
 
 #[derive(Default)]
@@ -43,7 +44,7 @@ impl Reports {
 
 impl Shell {
     /// Tells the server about playback so its resume/watched state follows.
-    /// After "stopped", the library is re-read.
+    /// After "stopped", the item's state is read back.
     pub(super) fn report(
         &mut self,
         source: &Source,
@@ -56,19 +57,22 @@ impl Shell {
             source,
             kind,
             position,
+            false,
             session,
             kind == PlaybackReport::Stopped,
             cx,
         );
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub(super) fn queue_report(
         &mut self,
         source: &Source,
         kind: PlaybackReport,
         position: f64,
+        paused: bool,
         session: Option<PlaySession>,
-        refresh: bool,
+        confirm: bool,
         cx: &mut Context<Self>,
     ) {
         let (Source::Jellyfin { server, id }, Some(session)) = (source, session) else {
@@ -77,9 +81,10 @@ impl Shell {
         let Some(client) = self.client(*server) else {
             return;
         };
+        let confirm = confirm.then(|| (*server, id.clone()));
         let id = id.clone();
         let send: Send = Box::new(move || {
-            let reported = client.report(kind, &id, position, false, &session);
+            let reported = client.report(kind, &id, position, paused, &session);
             if kind == PlaybackReport::Stopped && session.transcoding {
                 // Don't leave the server transcoding for nobody.
                 if let Err(e) = client.stop_transcoding(&session) {
@@ -103,7 +108,7 @@ impl Shell {
                 label,
                 progress,
                 send,
-                refresh,
+                confirm,
             },
             cx,
         );
@@ -122,7 +127,26 @@ impl Shell {
                 label,
                 progress: false,
                 send: Box::new(send),
-                refresh: false,
+                confirm: None,
+            },
+            cx,
+        );
+    }
+
+    /// Like `queue_task`, then reads the item's play state back.
+    pub(super) fn queue_checked(
+        &mut self,
+        label: &'static str,
+        send: impl FnOnce() -> Result<()> + std::marker::Send + 'static,
+        item: (i64, String),
+        cx: &mut Context<Self>,
+    ) {
+        self.enqueue(
+            Job {
+                label,
+                progress: false,
+                send: Box::new(send),
+                confirm: Some(item),
             },
             cx,
         );
@@ -148,10 +172,10 @@ impl Shell {
                 if let Err(e) = cx.background_executor().spawn(async move { send() }).await {
                     eprintln!("[jellyfin] {}: {e:#}", job.label);
                 }
-                if job.refresh {
+                if let Some((server, id)) = job.confirm {
                     let _ = this.update(cx, |this, cx| {
                         if !this.reports.closing {
-                            this.refresh_remote(cx);
+                            this.confirm_play_state(server, id, cx);
                         }
                     });
                 }

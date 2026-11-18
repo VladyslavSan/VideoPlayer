@@ -108,7 +108,7 @@ pub struct BaseItem {
     pub library: Option<Library>,
 }
 
-#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+#[derive(Debug, Clone, Default, PartialEq, Deserialize, Serialize)]
 #[serde(rename_all = "PascalCase")]
 pub struct UserData {
     #[serde(default)]
@@ -116,6 +116,36 @@ pub struct UserData {
     #[serde(default)]
     pub played: bool,
     pub last_played_date: Option<String>,
+}
+
+impl UserData {
+    /// Whether someone has played the item since `self` was read: it was
+    /// started, moved along or finished somewhere. Jellyfin rounds resume
+    /// points, so a few seconds either way is the same place.
+    pub fn moved_on_from(&self, earlier: &UserData) -> bool {
+        const SAME_PLACE_TICKS: i64 = 5 * 10_000_000;
+        self.played != earlier.played
+            || (self.playback_position_ticks - earlier.playback_position_ticks).abs()
+                > SAME_PLACE_TICKS
+            || self.last_played_date != earlier.last_played_date
+    }
+}
+
+/// One item's play state, as the server pushes it when it changes.
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[serde(rename_all = "PascalCase")]
+pub struct ItemUserData {
+    pub item_id: String,
+    #[serde(flatten)]
+    pub data: UserData,
+}
+
+impl ItemUserData {
+    /// Item ids as the library lists them: 32 hex digits, no dashes.
+    pub fn normalized(mut self) -> Self {
+        self.item_id = self.item_id.replace('-', "").to_ascii_lowercase();
+        self
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -490,6 +520,25 @@ pub fn cache_play_state(
     save_library_cache(path, &items)
 }
 
+/// Records play states pushed by the server (or read after playback) in
+/// the cached library, so the next start shows them before refreshing.
+pub fn cache_user_data(path: &Path, updates: &[ItemUserData]) -> Result<()> {
+    let mut items = load_library_cache(path)?;
+    let mut changed = false;
+    for update in updates {
+        if let Some(item) = items.iter_mut().find(|i| i.id == update.item_id)
+            && item.user_data.as_ref() != Some(&update.data)
+        {
+            item.user_data = Some(update.data.clone());
+            changed = true;
+        }
+    }
+    if changed {
+        save_library_cache(path, &items)?;
+    }
+    Ok(())
+}
+
 /// Unix seconds as Jellyfin's `2026-11-07T18:11:04Z`.
 pub fn format_timestamp(unix: i64) -> String {
     let (days, secs) = (unix.div_euclid(86_400), unix.rem_euclid(86_400));
@@ -647,6 +696,65 @@ mod tests {
         assert_eq!(as_items(&loaded), as_items(&items));
         assert_eq!(loaded[0].card_image(), items[0].card_image());
         Ok(())
+    }
+
+    #[test]
+    fn pushed_play_states_go_into_the_cache() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let path = dir.path().join("jellyfin-1.json");
+        let items: Vec<BaseItem> =
+            vec![serde_json::from_str(EPISODE)?, serde_json::from_str(MOVIE)?];
+        save_library_cache(&path, &items)?;
+        let finished = UserData {
+            playback_position_ticks: 0,
+            played: true,
+            last_played_date: Some("2026-11-18T18:09:57Z".into()),
+        };
+        cache_user_data(
+            &path,
+            &[
+                ItemUserData {
+                    item_id: items[0].id.clone(),
+                    data: finished.clone(),
+                },
+                ItemUserData {
+                    item_id: "not-in-the-library".into(),
+                    data: finished.clone(),
+                },
+            ],
+        )?;
+        let loaded = load_library_cache(&path)?;
+        assert_eq!(loaded[0].user_data.as_ref(), Some(&finished));
+        assert_eq!(loaded[1].user_data, items[1].user_data);
+        Ok(())
+    }
+
+    #[test]
+    fn played_elsewhere_is_told_apart_from_rounding() {
+        let paused = UserData {
+            playback_position_ticks: 137 * 10_000_000,
+            played: false,
+            last_played_date: Some("2026-11-18T17:20:00Z".into()),
+        };
+        // The server's own rounding of the same place.
+        let same = UserData {
+            playback_position_ticks: 139 * 10_000_000,
+            ..paused.clone()
+        };
+        assert!(!same.moved_on_from(&paused));
+        // Finished on the TV.
+        let finished = UserData {
+            playback_position_ticks: 0,
+            played: true,
+            last_played_date: Some("2026-11-18T17:31:00Z".into()),
+        };
+        assert!(finished.moved_on_from(&paused));
+        // Started on the TV, still near the start.
+        let started = UserData {
+            last_played_date: Some("2026-11-18T17:25:00Z".into()),
+            ..paused.clone()
+        };
+        assert!(started.moved_on_from(&paused));
     }
 
     #[test]

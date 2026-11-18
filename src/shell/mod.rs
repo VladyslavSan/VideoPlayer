@@ -39,6 +39,7 @@ mod releases;
 mod reports;
 mod settings;
 mod sonarr;
+mod sync;
 use browse::{Grid, Sort};
 use details::Details;
 use settings::SettingsPage;
@@ -54,8 +55,11 @@ const CONTINUE_LIMIT: usize = 12;
 const VOLUME_SETTING: &str = "volume";
 const GENERAL_PREFS: &str = "general";
 const DISCOVERY_WAIT: Duration = Duration::from_millis(1500);
-/// Switching back to the app re-reads Jellyfin libraries older than this.
-const REFRESH_ON_FOCUS_AFTER: Duration = Duration::from_secs(60);
+/// Switching back to the app catches up on what was played elsewhere, if
+/// it hasn't for this long...
+const CATCH_UP_ON_FOCUS_AFTER: Duration = Duration::from_secs(15);
+/// ...and fetches the whole library again if it's older than this.
+const REFRESH_ON_FOCUS_AFTER: Duration = Duration::from_secs(30 * 60);
 const PLACEHOLDER_COLORS: [u32; 6] = [0x2b3a55, 0x3d2b55, 0x2b5547, 0x55402b, 0x552b3a, 0x2b4d55];
 
 /// Where the library database and thumbnails live.
@@ -204,6 +208,8 @@ struct ActivePlayer {
     /// The item's streams, to rebuild the subtitle list when the quality
     /// changes (a transcoded stream needs more of them as files).
     playback_info: Option<PlaybackInfo>,
+    /// Set while paused (Jellyfin playback).
+    pause: Option<sync::Pause>,
     _subscription: Subscription,
 }
 
@@ -271,6 +277,17 @@ pub struct Shell {
     live: HashMap<i64, (String, crate::jellyfin::live::Watcher)>,
     /// A fetch because of server changes is waiting to run.
     live_refresh_pending: bool,
+    /// Items were added or removed while a video played: fetch the library
+    /// when it stops.
+    library_stale: bool,
+    /// When each item's play state (by key) was last learned from its
+    /// server outside a library fetch.
+    fresh: HashMap<String, Instant>,
+    /// Pushed play states not yet written to each server's cached library.
+    cache_updates: HashMap<i64, Vec<jellyfin::ItemUserData>>,
+    cache_write_pending: bool,
+    /// When the app last caught up on what was played lately.
+    caught_up: Option<Instant>,
     /// The scrolling page (everything but the virtualized grids).
     content_scroll: ScrollHandle,
     /// The screen the page was last drawn for; a new one starts at the top.
@@ -362,6 +379,11 @@ impl Shell {
             remote_refreshed: None,
             live: HashMap::new(),
             live_refresh_pending: false,
+            library_stale: false,
+            fresh: HashMap::new(),
+            cache_updates: HashMap::new(),
+            cache_write_pending: false,
+            caught_up: None,
             content_scroll: ScrollHandle::new(),
             scrolled_screen: None,
             open_seasons: HashMap::new(),
@@ -406,14 +428,19 @@ impl Shell {
             this.update(cx, |this, cx| this.close_requested(cx))
                 .unwrap_or(true)
         });
-        // Coming back to the app picks up changes made elsewhere (watched in
-        // another app, marked watched on the web).
+        // Coming back to the app picks up changes made elsewhere (watched on
+        // the TV, marked watched on the web), in case some weren't pushed.
         cx.observe_window_activation(window, |this, window, cx| {
-            let stale = this
-                .remote_refreshed
-                .is_none_or(|at| at.elapsed() >= REFRESH_ON_FOCUS_AFTER);
-            if window.is_window_active() && this.player.is_none() && stale {
+            if !window.is_window_active() || this.player.is_some() {
+                return;
+            }
+            let older = |at: Option<Instant>, than| at.is_none_or(|at| at.elapsed() >= than);
+            if older(this.remote_refreshed, REFRESH_ON_FOCUS_AFTER) {
                 this.refresh_remote(cx);
+            } else if older(this.caught_up, CATCH_UP_ON_FOCUS_AFTER)
+                && older(this.remote_refreshed, CATCH_UP_ON_FOCUS_AFTER)
+            {
+                this.catch_up(cx);
             }
         })
         .detach();
@@ -662,6 +689,7 @@ impl Shell {
             let client = Client::for_server(&server, &self.device_id);
             let thumbs = self.paths.thumbs.clone();
             let cache = self.paths.library_cache(server.id);
+            let started = Instant::now();
             cx.spawn(async move |this, cx| {
                 let user_id = server.user_id.clone();
                 let server_row = server.id;
@@ -685,6 +713,7 @@ impl Shell {
                     this.loading_servers.remove(&server.id);
                     match fetched {
                         Ok(entries) => {
+                            let kept = this.fresher_than(server.id, started);
                             this.remote.retain(|i| {
                                 !matches!(&i.source, Source::Jellyfin { server: s, .. } if *s == server.id)
                             });
@@ -697,6 +726,7 @@ impl Shell {
                                 }
                                 this.remote.push(item);
                             }
+                            this.restore_fresh(kept);
                             this.fetch_artwork(client, wanted, cx);
                         }
                         Err(e) => {
@@ -1191,15 +1221,26 @@ impl Shell {
         eprintln!("[jellyfin] quality {} ({})", quality.label(), session.id);
         // The old session stops (ending its transcode) and the new one starts.
         let source = Source::Jellyfin { server, id };
-        self.queue_report(&source, PlaybackReport::Stopped, position, old, false, cx);
+        let paused = active.pause.is_some();
+        self.queue_report(
+            &source,
+            PlaybackReport::Stopped,
+            position,
+            paused,
+            old,
+            false,
+            cx,
+        );
         self.queue_report(
             &source,
             PlaybackReport::Started,
             position,
+            paused,
             Some(session),
             false,
             cx,
         );
+        self.restart_pause(cx);
     }
 
     fn saved_volume(&self) -> f64 {
@@ -1377,6 +1418,7 @@ impl Shell {
             show: None,
             session: None,
             playback_info: None,
+            pause: None,
             _subscription: subscription,
         });
         cx.notify();
@@ -1389,7 +1431,11 @@ impl Shell {
         cx: &mut Context<Self>,
     ) {
         match event {
-            PlayerEvent::Progress { position, duration } => {
+            PlayerEvent::Progress {
+                position,
+                duration,
+                paused,
+            } => {
                 let Some(active) = self.player.as_mut() else {
                     return;
                 };
@@ -1401,10 +1447,7 @@ impl Shell {
                             eprintln!("[library] saving progress: {e}");
                         }
                     }
-                    Some(source @ Source::Jellyfin { .. }) => {
-                        let session = active.session.clone();
-                        self.report(&source, PlaybackReport::Progress, *position, session, cx)
-                    }
+                    Some(Source::Jellyfin { .. }) => self.playback_progress(*position, *paused, cx),
                     None => {}
                 }
             }
@@ -1449,6 +1492,9 @@ impl Shell {
     /// Ends the current video: saves the volume, records progress, tells the
     /// server, and re-reads the library so watched state shows up.
     fn finish_playback(&mut self, cx: &mut Context<Self>) {
+        // Paused (perhaps for long, perhaps while watching on the TV): the
+        // paused position mustn't overwrite what happened elsewhere.
+        let paused = self.finish_paused(cx);
         // Dropping the view shuts mpv down and destroys its window.
         let Some(active) = self.player.take() else {
             return;
@@ -1482,8 +1528,10 @@ impl Shell {
                     eprintln!("[library] saving progress: {e}");
                 }
             }
+            Some(Source::Jellyfin { .. }) if paused => {}
             Some(source @ Source::Jellyfin { .. }) => {
-                // Update the card now; the refresh after "stopped" confirms it.
+                // Update the card now; reading it back after "stopped"
+                // confirms it.
                 if let Some(item) = self.remote.iter_mut().find(|i| &i.source == source) {
                     item.position = if finished { 0.0 } else { position };
                     item.watched |= finished;
@@ -1513,6 +1561,9 @@ impl Shell {
             None => {}
         }
         self.reload();
+        if std::mem::take(&mut self.library_stale) {
+            self.refresh_remote(cx);
+        }
     }
 
     fn on_key(&mut self, event: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {

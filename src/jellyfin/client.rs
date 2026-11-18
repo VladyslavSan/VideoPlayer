@@ -1,6 +1,7 @@
 use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::Path;
+use std::sync::Mutex;
 use std::time::Duration;
 
 use anyhow::{Context as _, Result, bail};
@@ -18,6 +19,11 @@ use crate::video::Segment;
 
 const CLIENT_NAME: &str = "VideoPlayer";
 const PAGE_SIZE: usize = 500;
+/// Library pages asked at once. The server takes about a second for each
+/// whatever its size, so a large library comes in a quarter of the time.
+const PARALLEL_PAGES: usize = 6;
+/// Items in "what was played lately", enough to cover a long absence.
+const RECENT_LIMIT: usize = 100;
 /// Asking for an item's resume point mustn't hold up playback for long.
 const USER_DATA_TIMEOUT: Duration = Duration::from_secs(3);
 const IMAGE_WIDTH: u32 = 640;
@@ -81,7 +87,13 @@ struct PlaybackReportBody<'a> {
     is_paused: bool,
     can_seek: bool,
     play_method: &'static str,
-    play_session_id: &'a str,
+    /// Left out when a paused, transcoded playback is let go: with it, the
+    /// server would end the transcode the player may still resume.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    play_session_id: Option<&'a str>,
+    /// The server leaves the item's play state alone.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    failed: bool,
 }
 
 /// One playback of an item: the server ties reports and transcoding to it.
@@ -209,14 +221,16 @@ impl Client {
             Err(e) => {
                 // Still show everything, just not split by library.
                 eprintln!("[jellyfin] listing libraries: {e:#}");
-                return self.items_in(user_id, None);
+                return Ok(self.items_in(user_id, &[None])?.remove(0));
             }
         };
+        let views: Vec<View> = views.into_iter().filter(|v| v.browsable()).collect();
+        let parents: Vec<Option<&str>> = views.iter().map(|v| Some(v.id.as_str())).collect();
+        let lists = self.items_in(user_id, &parents)?;
         let mut seen = HashSet::new();
         let mut items = Vec::new();
         let mut order = 0;
-        for view in views.iter().filter(|v| v.browsable()) {
-            let mut found = self.items_in(user_id, Some(&view.id))?;
+        for (view, mut found) in views.iter().zip(lists) {
             found.retain(|i| seen.insert(i.id.clone()));
             if found.is_empty() {
                 continue;
@@ -252,30 +266,64 @@ impl Client {
         Ok(page.items)
     }
 
-    /// Movies and episodes in one library (`parent`), or in all of them.
-    fn items_in(&self, user_id: &str, parent: Option<&str>) -> Result<Vec<BaseItem>> {
-        let mut items = Vec::new();
-        loop {
-            let mut query = vec![
+    /// Movies and episodes in each library of `parents` (None: all of
+    /// them), in the server's order. Every library's first page is asked
+    /// at once, then all the remaining pages.
+    fn items_in(&self, user_id: &str, parents: &[Option<&str>]) -> Result<Vec<Vec<BaseItem>>> {
+        let firsts = in_parallel(parents.len(), |i| self.items_page(user_id, parents[i], 0))?;
+        let mut rest = Vec::new();
+        for (i, first) in firsts.iter().enumerate() {
+            let mut start = first.items.len();
+            while !first.items.is_empty() && start < first.total_record_count {
+                rest.push((i, start));
+                start += PAGE_SIZE;
+            }
+        }
+        let pages = in_parallel(rest.len(), |n| {
+            let (i, start) = rest[n];
+            self.items_page(user_id, parents[i], start)
+        })?;
+        let mut lists: Vec<Vec<BaseItem>> = firsts.into_iter().map(|p| p.items).collect();
+        for ((i, _), page) in rest.iter().zip(pages) {
+            lists[*i].extend(page.items);
+        }
+        Ok(lists)
+    }
+
+    fn items_page(&self, user_id: &str, parent: Option<&str>, start: usize) -> Result<ItemsPage> {
+        let mut query = vec![
+            ("userId", user_id.to_string()),
+            ("Recursive", "true".into()),
+            ("IncludeItemTypes", "Movie,Episode".into()),
+            ("Fields", "ParentBackdropItemId,DateCreated".into()),
+            ("EnableUserData", "true".into()),
+            ("SortBy", "SortName".into()),
+            ("StartIndex", start.to_string()),
+            ("Limit", PAGE_SIZE.to_string()),
+        ];
+        if let Some(parent) = parent {
+            query.push(("ParentId", parent.to_string()));
+        }
+        self.get_json("/Items", &query)
+    }
+
+    /// The movies and episodes played most lately, anywhere, with their
+    /// play state: a quick catch-up on what happened while the app wasn't
+    /// listening (about a second, against several for the whole library).
+    pub fn recently_played(&self, user_id: &str) -> Result<Vec<BaseItem>> {
+        let page: ItemsPage = self.get_json(
+            "/Items",
+            &[
                 ("userId", user_id.to_string()),
                 ("Recursive", "true".into()),
                 ("IncludeItemTypes", "Movie,Episode".into()),
-                ("Fields", "ParentBackdropItemId,DateCreated".into()),
                 ("EnableUserData", "true".into()),
-                ("SortBy", "SortName".into()),
-                ("StartIndex", items.len().to_string()),
-                ("Limit", PAGE_SIZE.to_string()),
-            ];
-            if let Some(parent) = parent {
-                query.push(("ParentId", parent.to_string()));
-            }
-            let page: ItemsPage = self.get_json("/Items", &query)?;
-            let received = page.items.len();
-            items.extend(page.items);
-            if received == 0 || items.len() >= page.total_record_count {
-                return Ok(items);
-            }
-        }
+                ("SortBy", "DatePlayed".into()),
+                ("SortOrder", "Descending".into()),
+                ("Limit", RECENT_LIMIT.to_string()),
+            ],
+        )?;
+        Ok(page.items)
     }
 
     pub fn download_image(&self, image: &ImageRef, out: &Path) -> Result<()> {
@@ -515,6 +563,44 @@ impl Client {
         paused: bool,
         session: &PlaySession,
     ) -> Result<()> {
+        self.send_report(kind, item_id, position, paused, Some(session), false)
+    }
+
+    /// Ends the server's record of a paused playback, so a player left
+    /// paused here doesn't hold the item while it's watched elsewhere.
+    /// With `keep_state`, the item's resume point and watched state stay
+    /// as they are (it has been played elsewhere since).
+    pub fn report_let_go(
+        &self,
+        item_id: &str,
+        position: f64,
+        session: &PlaySession,
+        keep_state: bool,
+    ) -> Result<()> {
+        let session = (!session.transcoding).then_some(session);
+        self.send_report(
+            PlaybackReport::Stopped,
+            item_id,
+            position,
+            true,
+            session,
+            keep_state,
+        )
+    }
+
+    fn send_report(
+        &self,
+        kind: PlaybackReport,
+        item_id: &str,
+        position: f64,
+        paused: bool,
+        session: Option<&PlaySession>,
+        failed: bool,
+    ) -> Result<()> {
+        let play_method = match session {
+            Some(s) if s.transcoding => "Transcode",
+            _ => "DirectPlay",
+        };
         let path = match kind {
             PlaybackReport::Started => "/Sessions/Playing",
             PlaybackReport::Progress => "/Sessions/Playing/Progress",
@@ -529,15 +615,50 @@ impl Client {
                 position_ticks: seconds_to_ticks(position),
                 is_paused: paused,
                 can_seek: true,
-                play_method: if session.transcoding {
-                    "Transcode"
-                } else {
-                    "DirectPlay"
-                },
-                play_session_id: &session.id,
+                play_method,
+                play_session_id: session.map(|s| s.id.as_str()),
+                failed,
             })?;
         Self::check(&response, path)
     }
+}
+
+/// Runs `count` requests, a few at a time; the results keep their order.
+fn in_parallel<T: Send>(count: usize, job: impl Fn(usize) -> Result<T> + Sync) -> Result<Vec<T>> {
+    let next = Mutex::new(0usize);
+    let results: Mutex<Vec<Option<Result<T>>>> = Mutex::new((0..count).map(|_| None).collect());
+    std::thread::scope(|scope| {
+        for _ in 0..PARALLEL_PAGES.min(count) {
+            scope.spawn(|| {
+                loop {
+                    let i = {
+                        let mut next = next.lock().unwrap();
+                        let i = *next;
+                        *next += 1;
+                        i
+                    };
+                    if i >= count {
+                        return;
+                    }
+                    let result = job(i);
+                    let failed = result.is_err();
+                    results.lock().unwrap()[i] = Some(result);
+                    if failed {
+                        // No point asking for the rest.
+                        *next.lock().unwrap() = count;
+                    }
+                }
+            });
+        }
+    });
+    let mut out = Vec::with_capacity(count);
+    for result in results.into_inner().unwrap() {
+        match result {
+            Some(result) => out.push(result?),
+            None => bail!("a library page wasn't fetched"),
+        }
+    }
+    Ok(out)
 }
 
 /// This computer's name, shown in Jellyfin's device list.
@@ -588,6 +709,37 @@ mod tests {
             base_from_final("https://x/other", "/System/Info/Public"),
             None
         );
+    }
+
+    #[test]
+    fn parallel_requests_keep_their_order() {
+        let squares = in_parallel(40, |i| Ok(i * i)).unwrap();
+        assert_eq!(squares, (0..40).map(|i| i * i).collect::<Vec<_>>());
+        assert!(in_parallel(0, Ok).unwrap().is_empty());
+        let failed = in_parallel(40, |i| if i == 7 { bail!("page 7") } else { Ok(i) });
+        assert_eq!(failed.unwrap_err().to_string(), "page 7");
+    }
+
+    #[test]
+    fn letting_go_keeps_the_play_state_and_the_transcode() {
+        let body = |session: Option<&str>, failed| {
+            serde_json::to_value(PlaybackReportBody {
+                item_id: "i",
+                position_ticks: 1,
+                is_paused: true,
+                can_seek: true,
+                play_method: "DirectPlay",
+                play_session_id: session,
+                failed,
+            })
+            .unwrap()
+        };
+        let usual = body(Some("s"), false);
+        assert_eq!(usual["PlaySessionId"], "s");
+        assert!(usual.get("Failed").is_none());
+        let let_go = body(None, true);
+        assert!(let_go.get("PlaySessionId").is_none());
+        assert_eq!(let_go["Failed"], true);
     }
 
     /// Talks to Jellyfin's public demo server: `cargo test -- --ignored`.

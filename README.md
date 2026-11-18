@@ -59,10 +59,15 @@ Each server's **Sign Out** (in Settings → Library) revokes the token on the se
   audio/subtitles panel, which switches at once and keeps your place. The server then transcodes to HLS; text
   subtitles are fetched as separate files (picture-based ones like PGS aren't available then).
 - Playback start, progress and stop are reported to the server, so resume positions and watched
-  state stay in sync with other Jellyfin apps.
-- The library stays current while the app is open: the server announces changes (a new season
-  imported, an episode watched on another device) and the app fetches the library a few seconds
-  later. It reconnects by itself after the server restarts.
+  state stay in sync with other Jellyfin apps. A paused player says so once and then stays quiet;
+  after two minutes it lets go of the item, and if the item was played elsewhere meanwhile (you
+  moved to the TV), neither letting go nor closing the player puts the old position back.
+- The library stays current while the app is open. Watched state and resume points changed
+  elsewhere arrive from the server as they happen and show at once; after playing something here,
+  only that item is read back. New or removed items (a season imported) make the app fetch the
+  library a few seconds later, several pages at a time. Switching back to the app catches up on
+  what was played lately, in case a change was missed. It reconnects by itself after the server
+  restarts.
 
 `cargo test -- --ignored` runs a round trip against Jellyfin's public demo server.
 

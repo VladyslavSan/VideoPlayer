@@ -1,6 +1,7 @@
 //! Keeps the Jellyfin libraries current while the app is open: each server
-//! says when something changed (a new season imported, an episode watched
-//! on the TV), and the library is fetched again shortly after.
+//! says when something changed. Watched state and resume points come with
+//! the message and are applied at once (see `sync`); for new or removed
+//! items (a season imported), the library is fetched again shortly after.
 
 use std::time::Duration;
 
@@ -42,10 +43,11 @@ impl Shell {
                 }
             };
             self.live.insert(server.id, (server.token.clone(), watcher));
+            let server = server.id;
             cx.spawn(async move |this, cx| {
                 while let Some(change) = changes.next().await {
                     if this
-                        .update(cx, |this, cx| this.server_changed(change, cx))
+                        .update(cx, |this, cx| this.server_changed(server, change, cx))
                         .is_err()
                     {
                         break;
@@ -56,13 +58,29 @@ impl Shell {
         }
     }
 
-    fn server_changed(&mut self, change: Change, cx: &mut Context<Self>) {
-        // While a video plays, its own progress reports come back as
-        // changes; the library is fetched when it stops anyway.
-        if self.player.is_some() || self.live_refresh_pending {
+    fn server_changed(&mut self, server: i64, change: Change, cx: &mut Context<Self>) {
+        match change {
+            Change::UserData(items) => self.apply_user_data(server, items, cx),
+            Change::Library => self.library_changed(cx),
+            Change::Reconnected => {
+                // Whatever was pushed while disconnected is lost.
+                self.catch_up(cx);
+                self.library_changed(cx);
+            }
+        }
+    }
+
+    /// Items were added or removed: the library is fetched again, once
+    /// things settle and not while a video plays (then when it stops).
+    fn library_changed(&mut self, cx: &mut Context<Self>) {
+        if self.player.is_some() {
+            self.library_stale = true;
             return;
         }
-        eprintln!("[jellyfin] server changed ({change:?}); fetching the library");
+        if self.live_refresh_pending {
+            return;
+        }
+        eprintln!("[jellyfin] library changed; fetching it");
         self.live_refresh_pending = true;
         let wait = self
             .remote_refreshed
@@ -76,6 +94,8 @@ impl Shell {
                 this.live_refresh_pending = false;
                 if this.player.is_none() {
                     this.refresh_remote(cx);
+                } else {
+                    this.library_stale = true;
                 }
             })
             .ok();
