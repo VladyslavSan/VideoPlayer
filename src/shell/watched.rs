@@ -1,5 +1,5 @@
-//! Marking things watched or unwatched by hand, from a card's right-click
-//! menu: a movie or episode, every episode up to one, a season, a show.
+//! Marking things watched or unwatched by hand, from a right-click menu: a
+//! movie or episode on its card, a season on its header, a show on its card.
 //! The cards change at once; the server is told in the background.
 
 use std::collections::HashMap;
@@ -66,37 +66,8 @@ impl Shell {
                     vec![key.clone()],
                     !unwatch,
                 ));
-                let (episodes, current) = self.episodes_around(item);
-                if let Some(current) = current {
-                    let before = &episodes[..current];
-                    if before.iter().any(|e| !e.watched) {
-                        let mut keys: Vec<String> = before.iter().map(|e| e.key.clone()).collect();
-                        keys.push(key.clone());
-                        choices.push(("Mark all up to here as watched".into(), keys, true));
-                    }
-                    let season = episodes[current].season;
-                    let in_season: Vec<String> = episodes
-                        .iter()
-                        .filter(|e| e.season == season)
-                        .map(|e| e.key.clone())
-                        .collect();
-                    let all_watched = episodes
-                        .iter()
-                        .filter(|e| e.season == season)
-                        .all(|e| e.watched);
-                    if in_season.len() > 1 {
-                        let name = if season == 0 {
-                            "specials".to_string()
-                        } else {
-                            format!("season {season}")
-                        };
-                        choices.push(if all_watched {
-                            (format!("Mark {name} as unwatched"), in_season, false)
-                        } else {
-                            (format!("Mark {name} as watched"), in_season, true)
-                        });
-                    }
-                }
+                // Only this one: a whole season (or more) goes from the
+                // season's header or the show, where it's meant.
             }
             MenuTarget::Show(name) | MenuTarget::Season(name, _) => {
                 let season = match target {
@@ -114,11 +85,26 @@ impl Shell {
                     Some(n) => format!("season {n}"),
                 };
                 let keys: Vec<String> = episodes.iter().map(|i| i.key()).collect();
-                if episodes.iter().any(|i| !i.watched) {
-                    choices.push((format!("Mark {what} as watched"), keys.clone(), true));
+                // Says how many, so a whole season isn't marked by surprise.
+                let count = |n: usize| {
+                    if n == 1 {
+                        "1 episode".to_string()
+                    } else {
+                        format!("{n} episodes")
+                    }
+                };
+                let to_watch = episodes.iter().filter(|i| !i.watched).count();
+                if to_watch > 0 {
+                    let label = format!("Mark {what} as watched ({})", count(to_watch));
+                    choices.push((label, keys.clone(), true));
                 }
-                if episodes.iter().any(|i| i.watched || i.progress().is_some()) {
-                    choices.push((format!("Mark {what} as unwatched"), keys, false));
+                let to_unwatch = episodes
+                    .iter()
+                    .filter(|i| i.watched || i.progress().is_some())
+                    .count();
+                if to_unwatch > 0 {
+                    let label = format!("Mark {what} as unwatched ({})", count(to_unwatch));
+                    choices.push((label, keys, false));
                 }
             }
         }
