@@ -406,6 +406,15 @@ impl Client {
             .with_context(|| format!("item {item_id} not found"))
     }
 
+    /// Marks items watched or unwatched, a few at a time (a whole show can
+    /// be hundreds of episodes).
+    pub fn set_played_many(&self, user_id: &str, item_ids: &[String], played: bool) -> Result<()> {
+        in_parallel(item_ids.len(), |i| {
+            self.set_played(user_id, &item_ids[i], played)
+        })?;
+        Ok(())
+    }
+
     /// Marks an item watched or unwatched for the user.
     pub fn set_played(&self, user_id: &str, item_id: &str, played: bool) -> Result<()> {
         let url = self.url(&format!("/UserPlayedItems/{item_id}"));

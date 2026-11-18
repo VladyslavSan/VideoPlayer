@@ -189,6 +189,11 @@ overview and a button for the episode to watch next, then a list of its seasons:
 shut with a click, and only the season being watched starts open (or the one of the episode the
 page was opened from), so the last season is never a long scroll away.
 
+**Right-click** a movie or episode to mark it watched or unwatched (which also clears a leftover
+resume point), to mark every episode up to it as watched, or its whole season; right-click a show
+or a season's header to mark all of it. The cards change at once and the server is told in the
+background.
+
 Add folders under **Settings → Library → Add Folder** (and take them out again with **Remove**). They are scanned in the background, and movie and
 episode names are parsed from file and folder names (`Title (Year)`, `Show.S01E02`,
 `Show - 1x02`, `Show/Season 1/...`). Thumbnails are taken from a frame of each video.

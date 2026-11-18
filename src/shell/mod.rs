@@ -11,9 +11,9 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use anyhow::{Context as _, Result, bail};
 use gpui::{
     Animation, AnimationExt as _, AnyElement, Bounds, ClickEvent, Context, ElementId, Entity,
-    FocusHandle, Focusable, FontWeight, KeyDownEvent, MouseDownEvent, ObjectFit, PathPromptOptions,
-    Pixels, ScrollHandle, ScrollStrategy, SharedString, Subscription, UniformListScrollHandle,
-    Window, canvas, div, img, point, prelude::*, px, rgb, rgba,
+    FocusHandle, Focusable, FontWeight, KeyDownEvent, MouseButton, MouseDownEvent, ObjectFit,
+    PathPromptOptions, Pixels, ScrollHandle, ScrollStrategy, SharedString, Subscription,
+    UniformListScrollHandle, Window, canvas, div, img, point, prelude::*, px, rgb, rgba,
 };
 
 use crate::introdb;
@@ -40,6 +40,7 @@ mod reports;
 mod settings;
 mod sonarr;
 mod sync;
+mod watched;
 use browse::{Grid, Sort};
 use details::Details;
 use settings::SettingsPage;
@@ -162,6 +163,8 @@ struct Card {
     watched: bool,
     /// Ringed: the episode a show page was opened at.
     highlight: bool,
+    /// What its right-click menu acts on.
+    menu: Option<watched::MenuTarget>,
 }
 
 /// Cards drawn in a frame: element id and where.
@@ -288,6 +291,8 @@ pub struct Shell {
     cache_write_pending: bool,
     /// When the app last caught up on what was played lately.
     caught_up: Option<Instant>,
+    /// A card's right-click menu, when open.
+    card_menu: Option<watched::CardMenu>,
     /// The scrolling page (everything but the virtualized grids).
     content_scroll: ScrollHandle,
     /// The screen the page was last drawn for; a new one starts at the top.
@@ -384,6 +389,7 @@ impl Shell {
             cache_updates: HashMap::new(),
             cache_write_pending: false,
             caught_up: None,
+            card_menu: None,
             content_scroll: ScrollHandle::new(),
             scrolled_screen: None,
             open_seasons: HashMap::new(),
@@ -1568,6 +1574,9 @@ impl Shell {
 
     fn on_key(&mut self, event: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
         let key = event.keystroke.key.as_str();
+        if key == "escape" && self.close_card_menu(cx) {
+            return cx.stop_propagation();
+        }
         let browsing = !matches!(self.screen, Screen::Settings);
         let modifiers = &event.keystroke.modifiers;
         let plain = !(modifiers.control || modifiers.alt || modifiers.platform || modifiers.shift);
@@ -1781,6 +1790,7 @@ impl Shell {
             progress,
             watched,
             highlight,
+            menu,
         } = card;
         let text_id = ElementId::NamedChild(Box::new(id.clone().into()), "text".into());
         let selected = self.cursor.as_ref() == Some(&id);
@@ -1913,6 +1923,15 @@ impl Shell {
             .on_click(
                 cx.listener(move |this, _: &ClickEvent, window, cx| on_click(this, window, cx)),
             )
+            .when_some(menu, |d, target| {
+                d.on_mouse_down(
+                    MouseButton::Right,
+                    cx.listener(move |this, event: &MouseDownEvent, _, cx| {
+                        cx.stop_propagation();
+                        this.open_card_menu(target.clone(), event.position, cx);
+                    }),
+                )
+            })
             .into_any_element()
     }
 
@@ -2086,6 +2105,7 @@ impl Shell {
             progress: item.progress(),
             watched: item.watched,
             highlight: !show_context && self.focus_episode.as_ref() == Some(&key),
+            menu: Some(watched::MenuTarget::Item(key.clone())),
         };
         // An episode shown with its show's name (Continue Watching, search):
         // the name leads to the show, at this episode.
@@ -2358,8 +2378,18 @@ impl Shell {
             None => (None, Vec::new()),
         };
         let toggle_show = show.to_string();
+        let menu_target = watched::MenuTarget::Season(show.to_string(), number);
         let label = div()
             .id(SharedString::from(format!("season-{number}")))
+            .when(have, |d| {
+                d.on_mouse_down(
+                    MouseButton::Right,
+                    cx.listener(move |this, event: &MouseDownEvent, _, cx| {
+                        cx.stop_propagation();
+                        this.open_card_menu(menu_target.clone(), event.position, cx);
+                    }),
+                )
+            })
             .flex()
             .items_center()
             .gap_3()
@@ -2680,6 +2710,7 @@ impl Render for Shell {
             .on_key_down(cx.listener(Self::on_key))
             .child(self.header(cx))
             .child(main)
+            .children(self.card_menu_view(window, cx))
             .into_any_element()
     }
 }

@@ -2,8 +2,9 @@
 //! choices that pops up over everything else when it's clicked.
 
 use gpui::{
-    AnyElement, App, Corner, Div, ElementId, FontWeight, MouseButton, MouseDownEvent, SharedString,
-    Stateful, Window, anchored, deferred, div, point, prelude::*, px, rgb, rgba,
+    AnchoredPositionMode, AnyElement, App, Corner, Div, ElementId, FontWeight, MouseButton,
+    MouseDownEvent, Pixels, Point, SharedString, Stateful, Window, anchored, deferred, div, point,
+    prelude::*, px, rgb, rgba,
 };
 
 use super::icons::{Icon, icon};
@@ -69,6 +70,62 @@ pub fn item(
         .child(label.into())
 }
 
+/// A menu opened by a right-click, at `at` in the window. It opens down
+/// and to the right of the point, or the other way where there's no room.
+/// Clicking anywhere outside it calls `dismiss`.
+pub fn context(
+    at: Point<Pixels>,
+    items: Vec<AnyElement>,
+    window: &Window,
+    dismiss: impl Fn(&MouseDownEvent, &mut Window, &mut App) + 'static,
+) -> AnyElement {
+    let viewport = window.viewport_size();
+    let dismiss = std::rc::Rc::new(dismiss);
+    let close = || {
+        let dismiss = dismiss.clone();
+        move |event: &MouseDownEvent, window: &mut Window, cx: &mut App| {
+            cx.stop_propagation();
+            dismiss(event, window, cx);
+        }
+    };
+    let backdrop = anchored().position(point(px(0.0), px(0.0))).child(
+        div()
+            .id("menu-backdrop")
+            .occlude()
+            .w(viewport.width)
+            .h(viewport.height)
+            .on_mouse_down(MouseButton::Left, close())
+            .on_mouse_down(MouseButton::Right, close()),
+    );
+    let menu = anchored()
+        .position_mode(AnchoredPositionMode::Window)
+        .position(at)
+        .anchor(Corner::TopLeft)
+        .child(surface(items));
+    deferred(div().child(backdrop).child(menu))
+        .with_priority(1)
+        .into_any_element()
+}
+
+fn surface(items: Vec<AnyElement>) -> Stateful<Div> {
+    div()
+        .id("menu")
+        .occlude()
+        .flex()
+        .flex_col()
+        .gap_0p5()
+        .p_1()
+        .rounded_lg()
+        .bg(rgb(SURFACE))
+        .border_1()
+        .border_color(rgba(BORDER))
+        .text_color(rgb(TEXT))
+        .shadow_lg()
+        .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+        .on_mouse_down(MouseButton::Right, |_, _, cx| cx.stop_propagation())
+        .children(items)
+}
+
 /// The open menu, drawn on top of everything, below (or, with `up`, above)
 /// the trigger. Place it in a `relative()` element that wraps the trigger.
 /// If the menu doesn't fit on that side of the trigger it opens on the
@@ -98,21 +155,7 @@ pub fn popup(
             .on_mouse_down(MouseButton::Left, close())
             .on_mouse_down(MouseButton::Right, close()),
     );
-    let card = div()
-        .id("menu")
-        .occlude()
-        .flex()
-        .flex_col()
-        .gap_0p5()
-        .p_1()
-        .rounded_lg()
-        .bg(rgb(SURFACE))
-        .border_1()
-        .border_color(rgba(BORDER))
-        .text_color(rgb(TEXT))
-        .shadow_lg()
-        .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
-        .children(items);
+    let card = surface(items);
     // Anchored at the trigger's top-left corner. GPUI flips an anchored
     // element to the other side of that point when it doesn't fit, so the
     // card is padded (with empty space that doesn't take clicks) by the

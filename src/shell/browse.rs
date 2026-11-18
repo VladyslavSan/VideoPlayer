@@ -363,6 +363,7 @@ impl Shell {
             progress: None,
             watched: show.unwatched == 0,
             highlight: false,
+            menu: Some(super::watched::MenuTarget::Show(show.name.clone())),
         };
         self.card(card, None, cx, move |this, _, cx| {
             this.open_show(name.clone(), cx)

@@ -157,46 +157,6 @@ impl Shell {
         .detach();
     }
 
-    /// Marks an item watched or unwatched, locally and on its server.
-    fn set_watched(&mut self, key: &str, watched: bool, cx: &mut Context<Self>) {
-        let Some(item) = self.items().find(|i| i.key() == key).cloned() else {
-            return;
-        };
-        match &item.source {
-            Source::Local { id, .. } => {
-                if let Err(e) = self.db.set_watched(*id, watched) {
-                    self.error = Some(format!("Couldn't update {}: {e}", item.title).into());
-                }
-                self.reload();
-            }
-            Source::Jellyfin { server, id } => {
-                if let Some(remote) = self.remote.iter_mut().find(|i| i.key() == key) {
-                    remote.watched = watched;
-                    remote.position = 0.0;
-                    if watched {
-                        remote.last_played = Some(super::now());
-                    }
-                }
-                let user_id = self
-                    .servers
-                    .iter()
-                    .find(|s| s.id == *server)
-                    .map(|s| s.user_id.clone());
-                if let (Some(client), Some(user_id)) = (self.client(*server), user_id) {
-                    let id = id.clone();
-                    cx.background_executor()
-                        .spawn(async move {
-                            if let Err(e) = client.set_played(&user_id, &id, watched) {
-                                eprintln!("[jellyfin] marking watched: {e:#}");
-                            }
-                        })
-                        .detach();
-                }
-            }
-        }
-        cx.notify();
-    }
-
     fn action_button(
         id: impl Into<gpui::ElementId>,
         label: impl Into<SharedString>,
@@ -403,7 +363,9 @@ impl Shell {
                     },
                     false,
                     cx,
-                    move |this, _, cx| this.set_watched(&watched_key, !watched, cx),
+                    move |this, _, cx| {
+                        this.mark_watched(std::slice::from_ref(&watched_key), !watched, cx)
+                    },
                 ))
                 .into_any_element(),
         );
