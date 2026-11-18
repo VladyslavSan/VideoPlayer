@@ -46,13 +46,15 @@ pub fn show(hwnd: isize) {
     use windows::Win32::Graphics::Dwm::{DWMWA_CLOAK, DwmSetWindowAttribute};
     use windows::Win32::UI::HiDpi::GetDpiForWindow;
     use windows::Win32::UI::WindowsAndMessaging::{
-        GWL_EXSTYLE, GetClientRect, GetSystemMetrics, GetWindowLongPtrW, GetWindowRect,
-        HWND_BOTTOM, SM_XVIRTUALSCREEN, SM_YVIRTUALSCREEN, SW_SHOWNOACTIVATE, SWP_NOACTIVATE,
-        SWP_NOMOVE, SetWindowLongPtrW, SetWindowPos, ShowWindow, WS_EX_APPWINDOW, WS_EX_NOACTIVATE,
-        WS_EX_TOOLWINDOW,
+        GWL_EXSTYLE, GetClientRect, GetForegroundWindow, GetSystemMetrics, GetWindowLongPtrW,
+        GetWindowRect, HWND_BOTTOM, SM_XVIRTUALSCREEN, SM_YVIRTUALSCREEN, SW_SHOWNOACTIVATE,
+        SWP_NOACTIVATE, SWP_NOMOVE, SetWindowLongPtrW, SetWindowPos, ShowWindow, WS_EX_APPWINDOW,
+        WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW,
     };
 
     let hwnd = HWND(hwnd as *mut _);
+    let before = unsafe { GetForegroundWindow() };
+    give_focus_back(hwnd.0 as isize, before.0 as isize);
     unsafe {
         let style = GetWindowLongPtrW(hwnd, GWL_EXSTYLE);
         let style = (style & !(WS_EX_APPWINDOW.0 as isize))
@@ -86,6 +88,32 @@ pub fn show(hwnd: isize) {
         }
         let _ = ShowWindow(hwnd, SW_SHOWNOACTIVATE);
     }
+}
+
+/// Windows lets a program started from the one in front (the terminal a
+/// test runs in) take the foreground with its first window, even one that
+/// never asks to be activated: keys typed into the terminal would then go
+/// to the hidden test window. For its first seconds, whenever the test
+/// window is in front, the window that was is put back (the program in
+/// front may do that).
+#[cfg(windows)]
+fn give_focus_back(hwnd: isize, before: isize) {
+    use windows::Win32::Foundation::HWND;
+    use windows::Win32::UI::WindowsAndMessaging::{GetForegroundWindow, SetForegroundWindow};
+    if before == 0 || before == hwnd {
+        return;
+    }
+    std::thread::spawn(move || {
+        for _ in 0..40 {
+            std::thread::sleep(std::time::Duration::from_millis(50));
+            unsafe {
+                if GetForegroundWindow().0 as isize == hwnd {
+                    let _ = SetForegroundWindow(HWND(before as *mut _));
+                    eprintln!("[test] gave the foreground back");
+                }
+            }
+        }
+    });
 }
 
 #[cfg(not(windows))]
