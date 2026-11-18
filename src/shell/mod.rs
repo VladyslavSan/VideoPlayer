@@ -50,6 +50,11 @@ const TEXT: u32 = 0xf4f5f7;
 const MUTED: u32 = 0x8f98a8;
 const ACCENT: u32 = 0x4c8dff;
 const ERROR: u32 = 0xff7a7a;
+/// The bar at the top (search, Refresh, Settings). It floats over the page,
+/// which scrolls on underneath it, seen through the bar.
+const HEADER_HEIGHT: f32 = 80.0;
+/// How much of the page shows through the bar (its background's opacity).
+const HEADER_BG: u32 = (BG << 8) | 0xb8;
 const CARD_WIDTH: f32 = 256.0;
 const CARD_HEIGHT: f32 = 144.0;
 const CONTINUE_LIMIT: usize = 12;
@@ -98,6 +103,17 @@ impl Paths {
     pub fn library_cache(&self, server: i64) -> PathBuf {
         self.db.with_file_name(format!("jellyfin-{server}.json"))
     }
+}
+
+/// A control on the see-through bar, on a solid backing of the page's
+/// colour so it looks the same whatever passes underneath.
+fn solid(control: AnyElement) -> AnyElement {
+    div()
+        .flex_none()
+        .rounded_md()
+        .bg(rgb(BG))
+        .child(control)
+        .into_any_element()
 }
 
 /// A fresh id for a Jellyfin play session.
@@ -1692,18 +1708,18 @@ impl Shell {
         let heading =
             |text: SharedString| div().text_2xl().font_weight(FontWeight::BOLD).child(text);
         let back = |this: &Self, cx: &mut Context<Self>| {
-            this.button("home", "‹ Library", cx, |this, window, cx| {
+            solid(this.button("home", "‹ Library", cx, |this, window, cx| {
                 this.screen = this.tab.clone();
                 window.focus(&this.focus);
                 cx.notify();
-            })
+            }))
         };
         let title: AnyElement = match &self.screen {
             Screen::Home
             | Screen::Source(_)
             | Screen::Movies(_)
             | Screen::Shows(_)
-            | Screen::Downloads => self.search_field(),
+            | Screen::Downloads => solid(self.search_field()),
             Screen::Show(_) | Screen::Details(_) => back(self, cx),
             Screen::Settings => div()
                 .flex()
@@ -1726,13 +1742,20 @@ impl Shell {
         };
         let can_refresh = !self.roots.is_empty() || !self.servers.is_empty();
         div()
+            .id("header")
+            .absolute()
+            .top_0()
+            .left_0()
+            .right_0()
+            .h(px(HEADER_HEIGHT))
+            .bg(rgba(HEADER_BG))
+            // Clicks on the bar itself don't reach the page under it.
+            .occlude()
             .flex()
-            .flex_none()
             .items_center()
             .justify_between()
             .gap_4()
             .px_8()
-            .py_5()
             .child(div().flex_none().child(title))
             .child(
                 // Status and error text give way (truncated) before the
@@ -1761,12 +1784,12 @@ impl Shell {
                             .child(e)
                     }))
                     .children(can_refresh.then(|| {
-                        self.button("refresh", "Refresh", cx, |this, _, cx| this.refresh(cx))
+                        solid(self.button("refresh", "Refresh", cx, |this, _, cx| this.refresh(cx)))
                     }))
                     .children((self.screen != Screen::Settings).then(|| {
-                        self.button("settings", "Settings", cx, |this, window, cx| {
+                        solid(self.button("settings", "Settings", cx, |this, window, cx| {
                             this.open_settings(this.settings_page, window, cx)
-                        })
+                        }))
                     })),
             )
             .into_any_element()
@@ -2017,7 +2040,7 @@ impl Shell {
             .borrow()
             .iter()
             .filter(|(_, b)| {
-                b.bottom() > view.top()
+                b.bottom() > view.top() + px(HEADER_HEIGHT)
                     && b.top() < view.bottom()
                     && b.left() >= view.left() - px(1.0)
             })
@@ -2035,8 +2058,9 @@ impl Shell {
         let handle = &self.content_scroll;
         let (view, offset, max) = (handle.bounds(), handle.offset(), handle.max_offset());
         let mut y = offset.y;
-        if card.top() < view.top() + margin {
-            y += view.top() + margin - card.top();
+        let top = view.top() + px(HEADER_HEIGHT) + margin;
+        if card.top() < top {
+            y += top - card.top();
         } else if card.bottom() > view.bottom() - margin {
             y -= card.bottom() - (view.bottom() - margin);
         }
@@ -2256,7 +2280,8 @@ impl Shell {
         // Room above the card for its season's heading.
         const ABOVE: f32 = 64.0;
         let in_content = card.top() - offset.y;
-        let y = (viewport.top() + px(ABOVE) - in_content).clamp(-max.height, px(0.0));
+        let y =
+            (viewport.top() + px(HEADER_HEIGHT + ABOVE) - in_content).clamp(-max.height, px(0.0));
         if y != offset.y {
             handle.set_offset(point(offset.x, y));
         }
@@ -2650,12 +2675,22 @@ impl Render for Shell {
                     .overflow_y_scroll()
                     .track_scroll(&self.content_scroll)
                     .px_8()
+                    .pt(px(HEADER_HEIGHT))
                     .pb_10()
                     .children(sections);
                 // Sideways scrolling (shift+wheel, trackpad) is for the rows.
                 page.style().restrict_scroll_to_axis = Some(true);
                 page.into_any_element()
             }
+            // Settings doesn't scroll as a whole: it just starts below the bar.
+            Err(view) if self.screen == Screen::Settings => div()
+                .flex()
+                .flex_col()
+                .flex_1()
+                .min_h(px(0.0))
+                .pt(px(HEADER_HEIGHT))
+                .child(view)
+                .into_any_element(),
             Err(grid) => grid,
         };
         // Each new page fades in, rising a little.
@@ -2702,14 +2737,16 @@ impl Render for Shell {
         };
         div()
             .size_full()
+            .relative()
             .flex()
             .flex_col()
             .bg(rgb(BG))
             .text_color(rgb(TEXT))
             .track_focus(&self.focus)
             .on_key_down(cx.listener(Self::on_key))
-            .child(self.header(cx))
             .child(main)
+            // Last, so it's drawn over the page.
+            .child(self.header(cx))
             .children(self.card_menu_view(window, cx))
             .into_any_element()
     }

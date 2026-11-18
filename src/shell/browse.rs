@@ -17,6 +17,8 @@ use crate::library::{self, Item, Library};
 /// Horizontal padding of the content area and the gap between cards.
 const PAGE_PADDING: f32 = 32.0;
 const CARD_GAP: f32 = 20.0;
+/// The sort choices over a library grid, see-through like the top bar.
+const SORT_BAR_HEIGHT: f32 = 56.0;
 /// Cards in each Home row.
 const ROW_LIMIT: usize = 20;
 /// Episode matches shown in search results.
@@ -561,13 +563,19 @@ impl Shell {
             (self.movie_sort, &MOVIE_SORTS[..], "movies")
         };
         div()
+            .id("sort-bar")
+            .absolute()
+            .top(px(super::HEADER_HEIGHT))
+            .left_0()
+            .right_0()
+            .h(px(SORT_BAR_HEIGHT))
+            .bg(rgba(super::HEADER_BG))
+            .occlude()
             .flex()
-            .flex_none()
             .items_center()
             .gap_2()
             .px_8()
-            .pt_2()
-            .pb_4()
+            .pb_2()
             .child(
                 div()
                     .text_sm()
@@ -665,14 +673,16 @@ impl Shell {
         )
         .track_scroll(self.grid_scroll.clone())
         .flex_1()
-        .min_h(px(0.0));
+        .min_h(px(0.0))
+        .pt(px(super::HEADER_HEIGHT + SORT_BAR_HEIGHT));
         div()
+            .relative()
             .flex_1()
             .min_h(px(0.0))
             .flex()
             .flex_col()
-            .child(bar)
             .child(list)
+            .child(bar)
             .into_any_element()
     }
 
@@ -854,7 +864,7 @@ impl Shell {
             .gap_0p5()
             .pl_6()
             .pr_2()
-            .pt_2()
+            .pt(px(super::HEADER_HEIGHT + 8.0))
             .pb_6()
             .overflow_y_scroll()
             .children(children);

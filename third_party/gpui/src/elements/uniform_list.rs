@@ -418,7 +418,9 @@ impl Element for UniformList {
                         {
                             match deferred_scroll.strategy {
                                 ScrollStrategy::Top => {
-                                    updated_scroll_offset.y = -(item_top - offset_pixels)
+                                    // Below the top padding, like the nearest
+                                    // scroll above (patched).
+                                    updated_scroll_offset.y = -(item_top - padding.top - offset_pixels)
                                         .max(Pixels::ZERO)
                                         .min(content_height - list_height)
                                         .max(Pixels::ZERO);
@@ -476,7 +478,9 @@ impl Element for UniformList {
                                     } else {
                                         scroll_offset.x
                                     },
-                                    item_height * ix + scroll_offset.y + padding.top,
+                                    // `padded_bounds` already starts below the top
+                                    // padding (patched: it was added twice).
+                                    item_height * ix + scroll_offset.y,
                                 );
                             let available_width = if can_scroll_horizontally {
                                 padded_bounds.size.width + scroll_offset.x.abs()
@@ -500,7 +504,7 @@ impl Element for UniformList {
                                     } else {
                                         scroll_offset.x
                                     },
-                                    scroll_offset.y + padding.top,
+                                    scroll_offset.y,
                                 ),
                             padded_bounds.size,
                         );
