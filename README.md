@@ -151,12 +151,19 @@ flyout's timeline seeks. To keep headphone skip buttons from changing episodes, 
 
 The Jellyfin library is cached on disk, so it shows instantly at start and stays browsable when
 the server is offline.
-Press **F1** (or `?`) in the player to see all shortcuts.
+Press **F1** (or `?`) in the player to see all shortcuts. Every key can be changed in
+**Settings → Controls**: click **+** next to an action and press any key, with Ctrl, Alt or Shift
+if you like (Ctrl+→ for the skip, say), or click a key to take it off; **Reset to defaults** puts
+them back. The same page sets how far back and forward jump (5 to 85 seconds) and how much the
+volume keys change it. A key does one thing, except the skip: it acts only while a skip button or
+"Up next" shows, and otherwise the key does its other job (that's how → both skips the intro and
+jumps 10 seconds). Esc and `?` can't be changed. The defaults:
 
 | Key | Action |
 | --- | --- |
 | Space / K | Play or pause |
 | ← → / J L | Back or forward 10 seconds |
+| Ctrl+← / Ctrl+→ | Back to the previous, or on to the next, intro, recap, credits or chapter (after skipping an intro, Ctrl+← goes back to its start) |
 | ↑ ↓ | Volume |
 | M | Mute |
 | S / A | Next subtitle track (including off) / next audio track |
@@ -166,7 +173,8 @@ Press **F1** (or `?`) in the player to see all shortcuts.
 | F, double-click | Fullscreen |
 | Click | Show or hide the controls (clicking never pauses) |
 | N / E | Next episode / episode list |
-| Enter | Skip intro, or play the next episode now |
+| Enter | Skip the intro, recap or preview, or play the next episode now |
+| → / L while a skip button shows | Skip the intro, recap or preview |
 | → / L during "Up next" | Play the next episode now |
 | F1, ? | Keyboard shortcuts |
 | Esc | Close the panel, leave fullscreen, or go back to the library |

@@ -418,8 +418,13 @@ impl Player {
                     this.toggle_pause()
                 }),
             )
-            .child(self.skip_button("skip-back", Icon::SkipBack, -super::SKIP_SECONDS, cx))
-            .child(self.skip_button("skip-forward", Icon::SkipForward, super::SKIP_SECONDS, cx))
+            .child(self.skip_button("skip-back", Icon::SkipBack, -self.controls.back_seconds, cx))
+            .child(self.skip_button(
+                "skip-forward",
+                Icon::SkipForward,
+                self.controls.forward_seconds,
+                cx,
+            ))
             .when(self.next_episode().is_some(), |bar| {
                 bar.child(self.icon_button(
                     "next-episode",
@@ -1044,27 +1049,33 @@ impl Player {
 
     /// Keyboard shortcuts, opened with F1 or `?`.
     fn shortcuts_overlay(&self, cx: &mut Context<Self>) -> AnyElement {
-        let mut rows: Vec<(&str, &str)> = vec![
-            ("Space / K", "Play or pause"),
-            ("← → / J L", "Back or forward 10 seconds"),
-            ("↑ ↓", "Volume"),
-            ("M", "Mute"),
-            ("S", "Next subtitle track (or off)"),
-            ("A", "Next audio track"),
-            ("C", "Audio and subtitles panel"),
-            ("[ ]", "Slower / faster"),
-            ("Z X", "Subtitles earlier / later"),
-            ("F / double-click", "Fullscreen"),
-            ("Click", "Show or hide the controls"),
-        ];
-        if !self.episodes.is_empty() {
-            rows.push(("N", "Next episode"));
-            rows.push(("E", "Episodes"));
-            rows.push(("→ / L in Up next", "Play the next episode now"));
+        use super::controls::{Action, key_label};
+        // As set in Settings → Controls.
+        let mut rows: Vec<(String, String)> = Vec::new();
+        for action in Action::ALL {
+            if matches!(action, Action::NextEpisode | Action::EpisodesPanel)
+                && self.episodes.is_empty()
+            {
+                continue;
+            }
+            let keys = self.controls.keys(action);
+            if keys.is_empty() {
+                continue;
+            }
+            let keys: Vec<String> = keys.iter().map(|k| key_label(k)).collect();
+            let label = match action {
+                Action::Back => format!("Back {:.0} seconds", self.controls.back_seconds),
+                Action::Forward => {
+                    format!("Forward {:.0} seconds", self.controls.forward_seconds)
+                }
+                other => other.label().to_string(),
+            };
+            rows.push((keys.join(" / "), label));
         }
-        rows.push(("Enter", "Skip intro, or play the next episode now"));
-        rows.push(("F1 / ?", "This list"));
-        rows.push(("Esc", "Close, leave fullscreen, or go back"));
+        rows.push(("Double-click".into(), "Fullscreen".into()));
+        rows.push(("Click".into(), "Show or hide the controls".into()));
+        rows.push(("?".into(), "This list of keys".into()));
+        rows.push(("Esc".into(), "Close, leave fullscreen, or go back".into()));
 
         div()
             .absolute()
@@ -1075,7 +1086,10 @@ impl Player {
             .child(
                 div()
                     .id("shortcuts")
-                    .w(px(460.0))
+                    // Two columns: the list is long once every action has
+                    // its keys.
+                    .w(px(980.0))
+                    .max_w(relative(0.94))
                     .p_5()
                     .rounded_2xl()
                     .bg(rgba(0x15171df5))
@@ -1107,25 +1121,50 @@ impl Player {
                                 |this, _, _| this.panel = None,
                             )),
                     )
-                    .children(rows.into_iter().map(|(keys, action)| {
+                    .child({
+                        let half = rows.len().div_ceil(2);
+                        let mut rows = rows.into_iter();
+                        let column = |rows: Vec<(String, String)>| {
+                            div()
+                                .flex_1()
+                                .min_w(px(0.0))
+                                .flex()
+                                .flex_col()
+                                .gap_2()
+                                .children(rows.into_iter().map(|(keys, action)| {
+                                    div()
+                                        .flex()
+                                        .items_center()
+                                        .gap_3()
+                                        .child(
+                                            div().w(px(130.0)).flex_none().child(
+                                                div()
+                                                    .px_2()
+                                                    .py_0p5()
+                                                    .rounded_md()
+                                                    .bg(rgba(0xffffff1a))
+                                                    .text_sm()
+                                                    .font_weight(FontWeight::SEMIBOLD)
+                                                    .child(keys),
+                                            ),
+                                        )
+                                        .child(
+                                            div()
+                                                .min_w(px(0.0))
+                                                .text_sm()
+                                                .text_color(rgb(MUTED))
+                                                .child(action),
+                                        )
+                                }))
+                        };
+                        let left: Vec<_> = rows.by_ref().take(half).collect();
+                        let right: Vec<_> = rows.collect();
                         div()
                             .flex()
-                            .items_center()
-                            .gap_4()
-                            .child(
-                                div().w(px(150.0)).flex_none().child(
-                                    div()
-                                        .px_2()
-                                        .py_0p5()
-                                        .rounded_md()
-                                        .bg(rgba(0xffffff1a))
-                                        .text_sm()
-                                        .font_weight(FontWeight::SEMIBOLD)
-                                        .child(keys),
-                                ),
-                            )
-                            .child(div().text_sm().text_color(rgb(MUTED)).child(action))
-                    })),
+                            .gap_6()
+                            .child(column(left))
+                            .child(column(right))
+                    }),
             )
             .into_any_element()
     }

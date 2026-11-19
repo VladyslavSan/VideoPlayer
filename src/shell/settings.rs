@@ -17,15 +17,21 @@ pub(super) enum SettingsPage {
     #[default]
     Library,
     Playback,
+    Controls,
 }
 
 impl SettingsPage {
-    const ALL: [SettingsPage; 2] = [SettingsPage::Library, SettingsPage::Playback];
+    const ALL: [SettingsPage; 3] = [
+        SettingsPage::Library,
+        SettingsPage::Playback,
+        SettingsPage::Controls,
+    ];
 
     fn label(self) -> &'static str {
         match self {
             SettingsPage::Library => "Library",
             SettingsPage::Playback => "Playback",
+            SettingsPage::Controls => "Controls",
         }
     }
 }
@@ -68,6 +74,7 @@ impl Shell {
         }
         self.screen = Screen::Settings;
         self.settings_page = page;
+        self.key_capture = Default::default();
         self.quality_menu = None;
         window.focus(&self.focus);
         cx.notify();
@@ -130,6 +137,7 @@ impl Shell {
         let sections = match self.settings_page {
             SettingsPage::Library => self.library_settings(window, cx),
             SettingsPage::Playback => self.playback_settings(cx),
+            SettingsPage::Controls => self.controls_settings(cx),
         };
         let mut page = div()
             .id(SharedString::from(format!(
@@ -386,6 +394,11 @@ impl Shell {
             ),
         )]
     }
+}
+
+/// A muted explanation, for other Settings pages.
+pub(super) fn note_text(text: &'static str) -> gpui::Div {
+    note(text)
 }
 
 /// A muted explanation under a section title.

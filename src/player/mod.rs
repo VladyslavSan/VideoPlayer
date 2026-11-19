@@ -1,5 +1,6 @@
 //! Playback screen: the mpv video layer plus GPUI controls drawn above it.
 
+pub mod controls;
 mod previews;
 mod segments;
 mod tracks;
@@ -52,8 +53,6 @@ const TOAST_DURATION: Duration = Duration::from_millis(1200);
 const VIDEO_SETTLE: Duration = Duration::from_millis(150);
 /// How often the track list is re-read while the track panel is open.
 const TRACKS_REFRESH: Duration = Duration::from_secs(1);
-const SKIP_SECONDS: f64 = 10.0;
-const VOLUME_STEP: f64 = 5.0;
 pub const SPEEDS: [f64; 7] = [0.5, 0.75, 1.0, 1.25, 1.5, 1.75, 2.0];
 
 /// Seconds the "Up next" card counts down before playing the next episode.
@@ -125,6 +124,15 @@ enum Panel {
 enum Drag {
     Seek,
     Volume,
+}
+
+/// What became of a key's action.
+enum Ran {
+    /// Didn't apply now: try the key's next action.
+    No,
+    Yes,
+    /// The player is leaving (for another episode, or back).
+    Left,
 }
 
 /// A network stream that broke off.
@@ -200,6 +208,8 @@ pub struct Player {
     added_subtitles: Vec<ExternalSubtitle>,
     /// Where it last played fine.
     last_good: Option<f64>,
+    /// The viewer's keys and skip lengths.
+    controls: controls::Controls,
     opened: Instant,
     /// The stream broke off; trying to open it again.
     stall: Option<Stall>,
@@ -351,6 +361,7 @@ impl Player {
             pending_subtitles: Vec::new(),
             added_subtitles: Vec::new(),
             opened: Instant::now(),
+            controls: controls::Controls::default(),
             last_good: None,
             stall: None,
             panel: None,
@@ -389,6 +400,10 @@ impl Player {
             eprintln!("[player] segments: {merged:?}");
             self.segments = merged;
         }
+    }
+
+    pub fn set_controls(&mut self, controls: controls::Controls) {
+        self.controls = controls;
     }
 
     pub fn add_external_subtitles(&mut self, subtitles: Vec<ExternalSubtitle>) {
@@ -1077,25 +1092,67 @@ impl Player {
             self.toggle_panel(Panel::Shortcuts);
             return self.poke(cx);
         }
-        match event.keystroke.key.as_str() {
-            "f1" => self.toggle_panel(Panel::Shortcuts),
-            "n" if !self.episodes.is_empty() => return self.play_next(cx),
-            "e" if !self.episodes.is_empty() => self.toggle_panel(Panel::Episodes),
-            // While "Up next" counts down, forward means the next episode.
-            "enter" | "right" | "l" if self.up_next.is_some() => return self.play_next(cx),
-            "enter" if self.skip_target().is_some() => self.skip_segment(),
-            "space" | "k" => self.toggle_pause(),
-            "left" | "j" => self.skip(-SKIP_SECONDS),
-            "right" | "l" => self.skip(SKIP_SECONDS),
-            "up" => {
-                self.set_volume(self.status.volume + VOLUME_STEP);
+        let key = event.keystroke.unparse();
+        if key == "escape" {
+            if self.quality_menu {
+                self.quality_menu = false;
+            } else if self.panel.is_some() {
+                self.panel = None;
+            } else if window.is_fullscreen() {
+                window.toggle_fullscreen();
+            } else {
+                return self.exit(cx);
+            }
+            return self.poke(cx);
+        }
+        // Each action on the key in turn, until one applies (the skip only
+        // does while offered).
+        for action in self.controls.actions_for(&key) {
+            match self.run(action, window, cx) {
+                Ran::No => continue,
+                Ran::Yes => return self.poke(cx),
+                Ran::Left => return,
+            }
+        }
+    }
+
+    fn run(
+        &mut self,
+        action: controls::Action,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Ran {
+        use controls::Action;
+        let has_episodes = !self.episodes.is_empty();
+        match action {
+            Action::Skip if self.up_next.is_some() => {
+                self.play_next(cx);
+                return Ran::Left;
+            }
+            Action::Skip if self.skip_target().is_some() => self.skip_segment(),
+            Action::Skip => return Ran::No,
+            Action::PlayPause => self.toggle_pause(),
+            Action::Back => self.skip(-self.controls.back_seconds),
+            Action::Forward => self.skip(self.controls.forward_seconds),
+            Action::PreviousMark => {
+                if !self.jump_to_mark(false) {
+                    return Ran::No;
+                }
+            }
+            Action::NextMark => {
+                if !self.jump_to_mark(true) {
+                    return Ran::No;
+                }
+            }
+            Action::VolumeUp => {
+                self.set_volume(self.status.volume + self.controls.volume_step);
                 self.toast(format!("Volume {:.0}%", self.status.volume));
             }
-            "down" => {
-                self.set_volume(self.status.volume - VOLUME_STEP);
+            Action::VolumeDown => {
+                self.set_volume(self.status.volume - self.controls.volume_step);
                 self.toast(format!("Volume {:.0}%", self.status.volume));
             }
-            "m" => {
+            Action::Mute => {
                 self.toggle_mute();
                 self.toast(if self.status.muted {
                     "Muted"
@@ -1103,21 +1160,85 @@ impl Player {
                     "Sound on"
                 });
             }
-            "s" => self.cycle(TrackKind::Subtitle, cx),
-            "a" => self.cycle(TrackKind::Audio, cx),
-            "c" => self.toggle_panel(Panel::Tracks),
-            "[" => self.step_speed(-1),
-            "]" => self.step_speed(1),
-            "z" => self.step_subtitle_delay(-0.1),
-            "x" => self.step_subtitle_delay(0.1),
-            "f" => window.toggle_fullscreen(),
-            "escape" if self.quality_menu => self.quality_menu = false,
-            "escape" if self.panel.is_some() => self.panel = None,
-            "escape" if window.is_fullscreen() => window.toggle_fullscreen(),
-            "escape" | "backspace" => return self.exit(cx),
-            _ => return,
+            Action::NextSubtitle => self.cycle(TrackKind::Subtitle, cx),
+            Action::NextAudio => self.cycle(TrackKind::Audio, cx),
+            Action::TracksPanel => self.toggle_panel(Panel::Tracks),
+            Action::Slower => self.step_speed(-1),
+            Action::Faster => self.step_speed(1),
+            Action::SubtitlesEarlier => self.step_subtitle_delay(-0.1),
+            Action::SubtitlesLater => self.step_subtitle_delay(0.1),
+            Action::Fullscreen => window.toggle_fullscreen(),
+            Action::NextEpisode if has_episodes => {
+                self.play_next(cx);
+                return Ran::Left;
+            }
+            Action::EpisodesPanel if has_episodes => self.toggle_panel(Panel::Episodes),
+            Action::NextEpisode | Action::EpisodesPanel => return Ran::No,
+            Action::Shortcuts => self.toggle_panel(Panel::Shortcuts),
+            Action::Leave => {
+                self.exit(cx);
+                return Ran::Left;
+            }
         }
-        self.poke(cx);
+        Ran::Yes
+    }
+
+    /// Where the previous / next intro, recap, credits or chapter starts
+    /// (or a skipped part ends), with what it is.
+    fn marks(&self) -> Vec<(f64, String)> {
+        let mut marks: Vec<(f64, String)> = vec![(0.0, "The beginning".to_string())];
+        for segment in &self.segments {
+            let name = match segment.kind {
+                SegmentKind::Intro => "intro",
+                SegmentKind::Recap => "recap",
+                SegmentKind::Preview => "preview",
+                SegmentKind::Credits => "credits",
+            };
+            let mut capital = name.to_string();
+            capital[..1].make_ascii_uppercase();
+            marks.push((segment.start, capital));
+            if segment.kind != SegmentKind::Credits {
+                marks.push((segment.end, format!("After the {name}")));
+            }
+        }
+        for (title, start) in &self.chapters {
+            let title = if title.trim().is_empty() {
+                "Chapter".to_string()
+            } else {
+                title.clone()
+            };
+            marks.push((*start, title));
+        }
+        marks.retain(|(at, _)| self.status.duration <= 0.0 || *at < self.status.duration - 1.0);
+        marks.sort_by(|a, b| a.0.total_cmp(&b.0));
+        marks.dedup_by(|a, b| (a.0 - b.0).abs() < 1.0);
+        marks
+    }
+
+    /// Jumps to the next mark, or back to the previous one (a moment into
+    /// a part, back goes to its start; right at it, to the one before).
+    /// False if there's none that way.
+    fn jump_to_mark(&mut self, forward: bool) -> bool {
+        let position = self.status.position;
+        let marks = self.marks();
+        let target = if forward {
+            marks.into_iter().find(|(at, _)| *at > position + 1.0)
+        } else {
+            marks.into_iter().rev().find(|(at, _)| *at < position - 3.0)
+        };
+        let Some((at, name)) = target else {
+            eprintln!(
+                "[player] no mark {} {position:.1} s",
+                if forward { "after" } else { "before" }
+            );
+            return false;
+        };
+        eprintln!("[player] mark: {position:.1} s -> {at:.1} s ({name})");
+        self.video.seek_to(at);
+        self.status.position = at;
+        self.up_next = None;
+        self.toast(format!("{name} · {}", format_time(at)));
+        true
     }
 
     fn on_stage_down(

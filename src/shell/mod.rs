@@ -30,6 +30,7 @@ use crate::ui::text_input::TextInput;
 
 mod arr_settings;
 mod browse;
+mod controls_page;
 mod details;
 mod downloads;
 mod finder;
@@ -310,6 +311,8 @@ pub struct Shell {
     caught_up: Option<Instant>,
     /// A card's right-click menu, when open.
     card_menu: Option<watched::CardMenu>,
+    /// Settings → Controls waiting for a key.
+    key_capture: controls_page::KeyCapture,
     /// Changes the server hasn't got yet (see `offline`).
     undelivered: Vec<offline::Undelivered>,
     undelivered_seq: u64,
@@ -412,6 +415,7 @@ impl Shell {
             cache_write_pending: false,
             caught_up: None,
             card_menu: None,
+            key_capture: Default::default(),
             undelivered: Vec::new(),
             undelivered_seq: 0,
             delivering: false,
@@ -1424,6 +1428,7 @@ impl Shell {
         };
         self.error = None;
         let volume = self.saved_volume();
+        let controls = self.controls();
         if self.media.is_none() && crate::test_window::media_controls() {
             match MediaSession::new(window) {
                 Ok(media) => {
@@ -1442,6 +1447,7 @@ impl Shell {
             .then(|| player::Previews::start(&url, http_header.as_deref(), self.paths.previews()));
         let view = cx.new(|cx| {
             let mut player = Player::new(video, playback, volume, media, window, cx);
+            player.set_controls(controls);
             if let Some(previews) = previews {
                 player.set_previews(previews);
             }
@@ -1607,6 +1613,9 @@ impl Shell {
     }
 
     fn on_key(&mut self, event: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
+        if self.capture_key(event, cx) {
+            return cx.stop_propagation();
+        }
         let key = event.keystroke.key.as_str();
         if key == "escape" && self.close_card_menu(cx) {
             return cx.stop_propagation();

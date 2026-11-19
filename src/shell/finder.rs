@@ -87,7 +87,7 @@ fn free(bytes: u64) -> String {
 }
 
 /// A row of choices, one picked.
-fn chips(
+pub(super) fn chips(
     id: &str,
     title: &str,
     options: Vec<(String, bool)>,
