@@ -26,6 +26,12 @@ struct Job {
     /// Read this item's play state back afterwards (server, item id), so
     /// what the server made of it shows.
     confirm: Option<(i64, String)>,
+    /// The change it carries, written down until the server has it (see
+    /// `offline`).
+    remembered: Option<u64>,
+    /// A playback report (other tasks may not need the server at all), so
+    /// whether it got through says whether the server can be reached.
+    report: bool,
 }
 
 #[derive(Default)]
@@ -34,9 +40,16 @@ pub struct Reports {
     running: bool,
     /// The window is closing once the queue is empty.
     closing: bool,
+    /// The last report failed for want of a connection (further failures
+    /// aren't logged one by one).
+    failing: bool,
 }
 
 impl Reports {
+    pub(super) fn is_failing(&self) -> bool {
+        self.failing
+    }
+
     fn busy(&self) -> bool {
         self.running || !self.jobs.is_empty()
     }
@@ -82,6 +95,11 @@ impl Shell {
             return;
         };
         let confirm = confirm.then(|| (*server, id.clone()));
+        // Where it stopped mustn't be lost if the server can't be reached.
+        let remembered = (kind == PlaybackReport::Stopped && confirm.is_some()).then(|| {
+            self.remember(*server, id, super::offline::Change::StoppedAt(position))
+                .seq
+        });
         let id = id.clone();
         let send: Send = Box::new(move || {
             let reported = client.report(kind, &id, position, paused, &session);
@@ -109,6 +127,8 @@ impl Shell {
                 progress,
                 send,
                 confirm,
+                remembered,
+                report: true,
             },
             cx,
         );
@@ -128,25 +148,32 @@ impl Shell {
                 progress: false,
                 send: Box::new(send),
                 confirm: None,
+                remembered: None,
+                report: false,
             },
             cx,
         );
     }
 
-    /// Like `queue_task`, then reads the item's play state back.
+    /// Like `queue_task`, then reads the item's play state back. `change`
+    /// is written down until the server has it.
     pub(super) fn queue_checked(
         &mut self,
         label: &'static str,
         send: impl FnOnce() -> Result<()> + std::marker::Send + 'static,
         item: (i64, String),
+        change: super::offline::Change,
         cx: &mut Context<Self>,
     ) {
+        let remembered = Some(self.remember(item.0, &item.1, change).seq);
         self.enqueue(
             Job {
                 label,
                 progress: false,
                 send: Box::new(send),
                 confirm: Some(item),
+                remembered,
+                report: true,
             },
             cx,
         );
@@ -169,8 +196,35 @@ impl Shell {
                     break;
                 };
                 let send = job.send;
-                if let Err(e) = cx.background_executor().spawn(async move { send() }).await {
-                    eprintln!("[jellyfin] {}: {e:#}", job.label);
+                let result = cx.background_executor().spawn(async move { send() }).await;
+                let failed = result.is_err();
+                let _ = this.update(cx, |this, cx| match &result {
+                    Ok(()) => {
+                        if let Some(seq) = job.remembered {
+                            this.forget(seq);
+                        }
+                        if job.report && std::mem::take(&mut this.reports.failing) {
+                            eprintln!("[jellyfin] the server answers again");
+                            this.server_back(cx);
+                        }
+                    }
+                    Err(e) => {
+                        let offline = crate::jellyfin::is_offline(e);
+                        // While offline, a progress report fails every few
+                        // seconds: say so once.
+                        if !(offline && job.progress && this.reports.failing) {
+                            eprintln!("[jellyfin] {}: {e:#}", job.label);
+                        }
+                        if job.report {
+                            this.reports.failing = offline;
+                        }
+                        if let Some(seq) = job.remembered {
+                            this.sending_failed(seq, e, cx);
+                        }
+                    }
+                });
+                if failed {
+                    continue;
                 }
                 if let Some((server, id)) = job.confirm {
                     let _ = this.update(cx, |this, cx| {

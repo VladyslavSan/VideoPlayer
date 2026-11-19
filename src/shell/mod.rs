@@ -35,6 +35,7 @@ mod downloads;
 mod finder;
 mod keynav;
 mod live;
+mod offline;
 mod releases;
 mod reports;
 mod settings;
@@ -309,6 +310,10 @@ pub struct Shell {
     caught_up: Option<Instant>,
     /// A card's right-click menu, when open.
     card_menu: Option<watched::CardMenu>,
+    /// Changes the server hasn't got yet (see `offline`).
+    undelivered: Vec<offline::Undelivered>,
+    undelivered_seq: u64,
+    delivering: bool,
     /// The scrolling page (everything but the virtualized grids).
     content_scroll: ScrollHandle,
     /// The screen the page was last drawn for; a new one starts at the top.
@@ -406,6 +411,9 @@ impl Shell {
             cache_write_pending: false,
             caught_up: None,
             card_menu: None,
+            undelivered: Vec::new(),
+            undelivered_seq: 0,
+            delivering: false,
             content_scroll: ScrollHandle::new(),
             scrolled_screen: None,
             open_seasons: HashMap::new(),
@@ -471,6 +479,7 @@ impl Shell {
         }
         shell.reload();
         shell.load_cached_remote();
+        shell.load_undelivered(cx);
         shell.refresh(cx);
         shell.generate_thumbs(cx);
         if let Some(source) = source {
@@ -735,6 +744,14 @@ impl Shell {
                     this.loading_servers.remove(&server.id);
                     match fetched {
                         Ok(entries) => {
+                            // Back online: the "offline" notice goes.
+                            if this
+                                .error
+                                .as_ref()
+                                .is_some_and(|e| e.starts_with(&format!("{} ", server.name)) || e.starts_with(&format!("{}:", server.name)))
+                            {
+                                this.error = None;
+                            }
                             let kept = this.fresher_than(server.id, started);
                             this.remote.retain(|i| {
                                 !matches!(&i.source, Source::Jellyfin { server: s, .. } if *s == server.id)
@@ -1737,6 +1754,15 @@ impl Shell {
             Some(format!("Downloading artwork ({} left)", self.artwork_left).into())
         } else if self.thumbs_left > 0 {
             Some(format!("Generating thumbnails ({} left)", self.thumbs_left).into())
+        } else if !self.undelivered.is_empty() && self.reports.is_failing() {
+            let n = self.undelivered.len();
+            Some(
+                format!(
+                    "Offline: {n} change{} to send when the server answers",
+                    if n == 1 { "" } else { "s" }
+                )
+                .into(),
+            )
         } else {
             None
         };

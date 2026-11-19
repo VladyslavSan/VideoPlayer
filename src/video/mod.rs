@@ -69,6 +69,8 @@ pub struct VideoSurface {
     mpv: Mpv,
     #[cfg(windows)]
     host: Host,
+    last_start: std::cell::Cell<f64>,
+    source: std::cell::RefCell<String>,
 }
 
 impl VideoSurface {
@@ -100,6 +102,12 @@ impl VideoSurface {
             if let Some(header) = http_header {
                 init.set_option("http-header-fields", header)?;
             }
+            // A connection that drops for a moment is picked up again by
+            // itself, from where it was, before the buffer runs out.
+            init.set_option(
+                "stream-lavf-o",
+                "reconnect=1,reconnect_streamed=1,reconnect_on_network_error=1,reconnect_delay_max=10",
+            )?;
             if let Ok(path) = std::env::var("VIDEO_PLAYER_MPV_LOG") {
                 init.set_option("log-file", path.as_str())?;
             }
@@ -114,13 +122,20 @@ impl VideoSurface {
         .map_err(|e| anyhow!("initialising mpv: {e}"))?;
         #[cfg(target_os = "macos")]
         let host = Host::new(window, &mpv)?;
-        let surface = Self { host, mpv };
+        let surface = Self {
+            host,
+            mpv,
+            last_start: std::cell::Cell::new(start),
+            source: Default::default(),
+        };
         surface.load(source, start)?;
         Ok(surface)
     }
 
     /// Replaces what's playing with `source`, starting at `start` seconds.
     pub fn load(&self, source: &str, start: f64) -> Result<()> {
+        self.last_start.set(start);
+        *self.source.borrow_mut() = source.to_string();
         let start = format!("start={start:.3}");
         self.mpv
             .command("loadfile", &[source, "replace", "-1", &start])
@@ -148,6 +163,27 @@ impl VideoSurface {
     /// True once playback reaches the end (mpv holds the last frame).
     pub fn ended(&self) -> bool {
         self.mpv.get_property("eof-reached").unwrap_or(false)
+    }
+
+    /// Nothing open: the last `load` failed (the server couldn't be
+    /// reached, say).
+    pub fn idle(&self) -> bool {
+        self.mpv.get_property("idle-active").unwrap_or(false)
+    }
+
+    /// What the last `load` opened (mpv's own `path` is gone when that
+    /// failed).
+    pub fn source(&self) -> String {
+        self.source.borrow().clone()
+    }
+
+    /// Where the last `load` started.
+    pub fn last_start(&self) -> f64 {
+        self.last_start.get()
+    }
+
+    pub fn set_pause(&self, paused: bool) {
+        let _ = self.mpv.set_property("pause", paused);
     }
 
     pub fn paused(&self) -> bool {

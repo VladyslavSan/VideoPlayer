@@ -632,6 +632,23 @@ impl Client {
     }
 }
 
+/// Whether `error` means the server couldn't be reached (no network, the
+/// name doesn't resolve, nothing answers), as opposed to it refusing.
+pub fn is_offline(error: &anyhow::Error) -> bool {
+    error.chain().any(|cause| {
+        cause.downcast_ref::<std::io::Error>().is_some()
+            || cause.downcast_ref::<ureq::Error>().is_some_and(|e| {
+                matches!(
+                    e,
+                    ureq::Error::Io(_)
+                        | ureq::Error::Timeout(_)
+                        | ureq::Error::HostNotFound
+                        | ureq::Error::ConnectionFailed
+                )
+            })
+    })
+}
+
 /// Runs `count` requests, a few at a time; the results keep their order.
 fn in_parallel<T: Send>(count: usize, job: impl Fn(usize) -> Result<T> + Sync) -> Result<Vec<T>> {
     let next = Mutex::new(0usize);
@@ -718,6 +735,20 @@ mod tests {
             base_from_final("https://x/other", "/System/Info/Public"),
             None
         );
+    }
+
+    #[test]
+    fn tells_unreachable_from_refused() {
+        let unreachable = anyhow::Error::from(ureq::Error::HostNotFound).context("connecting");
+        assert!(is_offline(&unreachable));
+        let io = anyhow::Error::from(ureq::Error::Io(std::io::Error::other("reset")));
+        assert!(is_offline(&io));
+        assert!(!is_offline(&anyhow::anyhow!(
+            "Sign in: wrong username or password"
+        )));
+        assert!(!is_offline(&anyhow::Error::from(ureq::Error::StatusCode(
+            500
+        ))));
     }
 
     #[test]

@@ -63,7 +63,9 @@ impl Shell {
             Change::UserData(items) => self.apply_user_data(server, items, cx),
             Change::Library => self.library_changed(cx),
             Change::Reconnected => {
-                // Whatever was pushed while disconnected is lost.
+                // Whatever was pushed while disconnected is lost, and what
+                // couldn't be sent can go now.
+                self.deliver_now(cx);
                 self.catch_up(cx);
                 self.library_changed(cx);
             }

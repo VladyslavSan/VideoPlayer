@@ -29,7 +29,8 @@ const KEEP_ALIVE: Duration = Duration::from_secs(30);
 const READ_POLL: Duration = Duration::from_secs(1);
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 const RETRY_FIRST: Duration = Duration::from_secs(2);
-const RETRY_MAX: Duration = Duration::from_secs(60);
+/// Kept short, so a server that's back is noticed soon.
+const RETRY_MAX: Duration = Duration::from_secs(15);
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum Change {
@@ -82,11 +83,13 @@ fn socket_url(base: &str) -> Result<String> {
 fn run(url: &str, auth: &str, stop: &AtomicBool, sender: &UnboundedSender<Change>) {
     let stopped = || stop.load(Ordering::Relaxed) || sender.is_closed();
     let mut retry = RETRY_FIRST;
-    let mut connected_before = false;
+    // Connecting after any failed attempt means changes may have been
+    // missed (the app may even have started while the server was away).
+    let mut missed = false;
     let mut last_error = String::new();
     while !stopped() {
         let mut connected = false;
-        let result = listen(url, auth, &stopped, connected_before, |change| {
+        let result = listen(url, auth, &stopped, missed, |change| {
             connected = true;
             sender.unbounded_send(change).is_ok()
         });
@@ -100,8 +103,8 @@ fn run(url: &str, auth: &str, stop: &AtomicBool, sender: &UnboundedSender<Change
                 }
             }
         }
+        missed = true;
         if connected {
-            connected_before = true;
             retry = RETRY_FIRST;
         }
         let until = Instant::now() + retry;

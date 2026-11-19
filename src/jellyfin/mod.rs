@@ -11,7 +11,7 @@ use std::path::{Path, PathBuf};
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
 
-pub use client::{Client, PlaySession, PlaybackReport};
+pub use client::{Client, PlaySession, PlaybackReport, is_offline};
 
 use crate::library::{Item, Library, Source};
 use crate::video::{ExternalSubtitle, Segment, SegmentKind};

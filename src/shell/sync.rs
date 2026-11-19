@@ -138,6 +138,7 @@ impl Shell {
                     .await;
                 this.update(cx, |this, cx| match recent {
                     Ok(items) => {
+                        this.deliver_now(cx);
                         let updates = items
                             .into_iter()
                             .map(|i| ItemUserData {
@@ -343,6 +344,7 @@ impl Shell {
                 )
             },
             (server, id),
+            super::offline::Change::StoppedAt(position),
             cx,
         );
     }

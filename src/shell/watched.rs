@@ -188,14 +188,36 @@ impl Shell {
                 "[jellyfin] marking {count} item(s) {}",
                 if watched { "watched" } else { "unwatched" }
             );
+            // Written down until the server has them.
+            let seqs: Vec<u64> = ids
+                .iter()
+                .map(|id| {
+                    self.remember(server, id, super::offline::Change::Watched(watched))
+                        .seq
+                })
+                .collect();
             cx.spawn(async move |this, cx| {
-                let failed = cx
+                let result = cx
                     .background_executor()
                     .spawn(async move { client.set_played_many(&user_id, &ids, watched) })
                     .await;
-                if let Err(e) = failed {
-                    eprintln!("[jellyfin] marking watched: {e:#}");
-                    this.update(cx, |this, cx| {
+                this.update(cx, |this, cx| match result {
+                    Ok(()) => {
+                        for seq in seqs {
+                            this.forget(seq);
+                        }
+                    }
+                    Err(e) if crate::jellyfin::is_offline(&e) => {
+                        eprintln!("[jellyfin] marking watched: {e:#}; will send it when the server answers");
+                        for seq in seqs {
+                            this.sending_failed(seq, &e, cx);
+                        }
+                    }
+                    Err(e) => {
+                        eprintln!("[jellyfin] marking watched: {e:#}");
+                        for seq in seqs {
+                            this.forget(seq);
+                        }
                         this.error = Some(
                             format!("Couldn't tell the server about {count} item(s): {e:#}").into(),
                         );
@@ -203,9 +225,9 @@ impl Shell {
                         this.fresh.retain(|key, _| !keys.contains(key));
                         this.refresh_remote(cx);
                         cx.notify();
-                    })
-                    .ok();
-                }
+                    }
+                })
+                .ok();
             })
             .detach();
         }

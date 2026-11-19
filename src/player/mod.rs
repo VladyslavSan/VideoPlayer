@@ -41,6 +41,11 @@ const CONTROLS_TIMEOUT: Duration = Duration::from_millis(2500);
 const REVEAL_DISTANCE: f32 = 40.0;
 const REVEAL_WINDOW: Duration = Duration::from_millis(500);
 const PROGRESS_INTERVAL: Duration = Duration::from_secs(5);
+/// A network stream that "ends" this far before its end broke off: the
+/// connection went and what was buffered ran out.
+const BROKE_OFF_BEFORE_END: f64 = 20.0;
+/// Waits between attempts to open a broken-off stream again.
+const REOPEN_WAITS: [u64; 5] = [2, 3, 5, 8, 10];
 const TOAST_DURATION: Duration = Duration::from_millis(1200);
 /// How long mpv's video output must be up before the black backdrop is
 /// lifted, so its first frame is on screen first.
@@ -122,6 +127,17 @@ enum Drag {
     Volume,
 }
 
+/// A network stream that broke off.
+struct Stall {
+    /// Where it stopped; it carries on from here.
+    at: f64,
+    since: Instant,
+    next_try: Instant,
+    tries: usize,
+    /// Play once it's back (false if the viewer paused meanwhile).
+    play: bool,
+}
+
 /// Values mpv owns, re-read every tick so the controls never drift from it.
 #[derive(Debug, Clone, Copy)]
 struct Status {
@@ -179,6 +195,14 @@ pub struct Player {
     tracks: Vec<Track>,
     tracks_read: Instant,
     pending_subtitles: Vec<ExternalSubtitle>,
+    /// Subtitle files added to the stream so far, to add again if it has
+    /// to be opened again.
+    added_subtitles: Vec<ExternalSubtitle>,
+    /// Where it last played fine.
+    last_good: Option<f64>,
+    opened: Instant,
+    /// The stream broke off; trying to open it again.
+    stall: Option<Stall>,
     panel: Option<Panel>,
     drag: Option<Drag>,
     /// Where the seek bar is being dragged to, shown instead of the position.
@@ -325,6 +349,10 @@ impl Player {
             tracks: Vec::new(),
             tracks_read: Instant::now(),
             pending_subtitles: Vec::new(),
+            added_subtitles: Vec::new(),
+            opened: Instant::now(),
+            last_good: None,
+            stall: None,
             panel: None,
             quality_menu: false,
             drag: None,
@@ -422,6 +450,8 @@ impl Player {
             return cx.notify();
         }
         self.expected_path = Some(url.to_string());
+        self.stall = None;
+        self.added_subtitles.clear();
         self.video_ready_since = None;
         self.status.video_shown = false;
         self.tracks.clear();
@@ -469,6 +499,10 @@ impl Player {
         if self.handle_media_commands(cx) {
             return;
         }
+        if self.check_stall(cx) {
+            cx.notify();
+            return;
+        }
         self.report_media();
         let pipeline = self.video.pipeline();
         if pipeline != self.pipeline {
@@ -495,6 +529,7 @@ impl Player {
                     if let Err(e) = self.video.add_subtitle(&subtitle) {
                         eprintln!("[video] {e:#}");
                     }
+                    self.added_subtitles.push(subtitle);
                 }
                 added = true;
             }
@@ -693,10 +728,93 @@ impl Player {
         self.tracks.iter().filter(move |t| t.kind == kind)
     }
 
-    /// Paused by the viewer. At the end mpv also pauses, but that's the
-    /// video finishing, not someone stepping away.
+    /// Paused by the viewer, or held up by a lost connection. At the end
+    /// mpv also pauses, but that's the video finishing, not someone
+    /// stepping away.
     fn reporting_paused(&self) -> bool {
-        self.status.paused && !self.status.ended
+        self.stall.is_some() || (self.status.paused && !self.status.ended)
+    }
+
+    /// Notices a network stream breaking off (an "end" well before the
+    /// end, or a stream that couldn't be opened) and opens it again where
+    /// it stopped, every few seconds, until the server answers. Meanwhile
+    /// the video holds its place: it isn't finished, nothing comes up
+    /// next. True while that goes on.
+    fn check_stall(&mut self, cx: &mut Context<Self>) -> bool {
+        let url = self.video.source();
+        if !(url.starts_with("http://") || url.starts_with("https://")) {
+            return false; // a local file
+        }
+        let duration = self.status.duration;
+        let open = self.video.loaded() && !self.video.idle();
+        if let Some(stall) = &mut self.stall {
+            let at = stall.at;
+            if open && !self.video.ended() && duration > 0.0 {
+                eprintln!(
+                    "[player] connection back after {:.0} s; carrying on at {at:.0} s",
+                    stall.since.elapsed().as_secs_f64()
+                );
+                let play = stall.play;
+                self.stall = None;
+                self.video.set_pause(!play);
+                self.toast("Connected again");
+                return false;
+            }
+            self.status.position = at;
+            self.status.paused = !stall.play;
+            self.status.ended = false;
+            self.status.buffering = false;
+            if Instant::now() >= stall.next_try {
+                let wait = REOPEN_WAITS[stall.tries.min(REOPEN_WAITS.len() - 1)];
+                stall.tries += 1;
+                stall.next_try = Instant::now() + Duration::from_secs(wait);
+                self.reopen(&url, at);
+            }
+            return true;
+        }
+        let position = self.status.position;
+        // Idle: opening failed (while it opens, mpv isn't idle, but give it
+        // a moment at the very start).
+        let failed_to_open = self.video.idle()
+            && (self.last_good.is_some() || self.opened.elapsed() >= Duration::from_secs(3));
+        let broke_off = failed_to_open
+            || (self.video.ended() && duration > 0.0 && position < duration - BROKE_OFF_BEFORE_END);
+        if !broke_off {
+            if open && !self.video.ended() && position > 0.0 {
+                self.last_good = Some(position);
+            }
+            return false;
+        }
+        let at = self.last_good.unwrap_or_else(|| self.video.last_start());
+        eprintln!("[player] the stream broke off at {at:.0} s; reconnecting");
+        self.stall = Some(Stall {
+            at,
+            since: Instant::now(),
+            next_try: Instant::now() + Duration::from_secs(REOPEN_WAITS[0]),
+            tries: 0,
+            // Keep playing once it's back, unless the viewer had paused.
+            play: !self.reported_paused,
+        });
+        self.up_next = None;
+        self.status.position = at;
+        self.status.ended = false;
+        // Tells the server it's held up here (not finished).
+        self.report(cx);
+        true
+    }
+
+    fn reopen(&mut self, url: &str, at: f64) {
+        if let Err(e) = self.video.load(url, at) {
+            eprintln!("[player] reopening the stream: {e:#}");
+            return;
+        }
+        self.expected_path = Some(url.to_string());
+        self.video_ready_since = None;
+        self.status.video_shown = false;
+        self.tracks.clear();
+        self.pending_subtitles = std::mem::take(&mut self.added_subtitles);
+        self.audio_settled = false;
+        self.subtitle_settled = false;
     }
 
     fn report(&mut self, cx: &mut Context<Self>) {
@@ -742,6 +860,12 @@ impl Player {
     // ---- actions shared by buttons and keys ----
 
     fn toggle_pause(&mut self) {
+        if let Some(stall) = &mut self.stall {
+            // Applied once the stream is back.
+            stall.play = !stall.play;
+            self.status.paused = !stall.play;
+            return;
+        }
         self.video.toggle_pause();
         self.status.paused = !self.status.paused;
     }

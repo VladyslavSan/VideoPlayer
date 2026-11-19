@@ -66,8 +66,12 @@ Each server's **Sign Out** (in Settings → Library) revokes the token on the se
   elsewhere arrive from the server as they happen and show at once; after playing something here,
   only that item is read back. New or removed items (a season imported) make the app fetch the
   library a few seconds later, several pages at a time. Switching back to the app catches up on
-  what was played lately, in case a change was missed. It reconnects by itself after the server
-  restarts.
+  what was played lately, in case a change was missed.
+- Losing the connection: a video plays on from what it has buffered, and if that runs out it stops
+  where it was ("Reconnecting…") instead of skipping to the end, and carries on from there by
+  itself once the server answers. Where you stopped and what you marked watched while the server
+  was away are kept, even across closing the app, and sent when it's back, unless the item has
+  been played elsewhere since. The library catches up a few seconds after the server returns.
 
 `cargo test -- --ignored` runs a round trip against Jellyfin's public demo server.
 

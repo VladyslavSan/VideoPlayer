@@ -1189,7 +1189,13 @@ impl Render for Player {
             overlay.push(self.top_bar(cx));
             overlay.push(self.bottom(window, cx));
         }
-        if self.status.buffering && !self.status.paused {
+        if self.stall.is_some() {
+            let middle = f32::from(window.viewport_size().height) / 2.0 - 20.0;
+            overlay.push(Self::centered_message(
+                middle,
+                "Lost the connection to the server. Reconnecting…".into(),
+            ));
+        } else if self.status.buffering && !self.status.paused {
             let middle = f32::from(window.viewport_size().height) / 2.0 - 20.0;
             overlay.push(Self::centered_message(middle, "Loading…".into()));
         }
