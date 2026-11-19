@@ -55,7 +55,7 @@ impl Previews {
         let (requests, receiver) = channel();
         let state = Arc::new(Mutex::new(State::default()));
         let worker = Worker {
-            source: source.to_string(),
+            source: crate::net::direct_url(source),
             http_header: http_header.map(str::to_string),
             dir: dir.clone(),
             state: state.clone(),

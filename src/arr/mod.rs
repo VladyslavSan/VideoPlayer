@@ -244,11 +244,12 @@ pub fn guess_url(kind: Kind, other: &str) -> Option<String> {
 
 impl Client {
     pub fn new(kind: Kind, base: &str, key: &str) -> Self {
-        let agent = Agent::config_builder()
-            .timeout_global(Some(Duration::from_secs(15)))
-            .http_status_as_error(false)
-            .build()
-            .into();
+        let agent = crate::net::agent(
+            Agent::config_builder()
+                .timeout_global(Some(Duration::from_secs(15)))
+                .http_status_as_error(false)
+                .build(),
+        );
         Self {
             kind,
             agent,
@@ -320,11 +321,12 @@ impl Client {
     /// For calls that reach out to metadata sites or list everything.
     fn slow(&self) -> Self {
         Self {
-            agent: Agent::config_builder()
-                .timeout_global(Some(Duration::from_secs(45)))
-                .http_status_as_error(false)
-                .build()
-                .into(),
+            agent: crate::net::agent(
+                Agent::config_builder()
+                    .timeout_global(Some(Duration::from_secs(45)))
+                    .http_status_as_error(false)
+                    .build(),
+            ),
             ..self.clone()
         }
     }
@@ -332,11 +334,12 @@ impl Client {
     /// The same, with a longer wait: searching indexers takes a while.
     fn patient(&self) -> Self {
         Self {
-            agent: Agent::config_builder()
-                .timeout_global(Some(Duration::from_secs(180)))
-                .http_status_as_error(false)
-                .build()
-                .into(),
+            agent: crate::net::agent(
+                Agent::config_builder()
+                    .timeout_global(Some(Duration::from_secs(180)))
+                    .http_status_as_error(false)
+                    .build(),
+            ),
             ..self.clone()
         }
     }

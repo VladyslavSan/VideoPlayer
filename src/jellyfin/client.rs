@@ -105,11 +105,12 @@ pub struct PlaySession {
 
 impl Client {
     pub fn new(base: &str, device_id: &str) -> Self {
-        let agent = Agent::config_builder()
-            .timeout_global(Some(Duration::from_secs(30)))
-            .http_status_as_error(false)
-            .build()
-            .into();
+        let agent = crate::net::agent(
+            Agent::config_builder()
+                .timeout_global(Some(Duration::from_secs(30)))
+                .http_status_as_error(false)
+                .build(),
+        );
         Self {
             agent,
             base: base.trim_end_matches('/').to_string(),

@@ -7,7 +7,7 @@
 //! never in the address.
 
 use std::io::ErrorKind;
-use std::net::{TcpStream, ToSocketAddrs};
+use std::net::TcpStream;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
@@ -178,7 +178,7 @@ fn connect(url: &str, auth: &str) -> Result<WebSocket<MaybeTlsStream<TcpStream>>
     let port = uri.port_u16().unwrap_or(if secure { 443 } else { 80 });
     let mut stream = None;
     let mut last_error = None;
-    for address in (host.as_str(), port).to_socket_addrs()? {
+    for address in crate::net::resolve(&host, port)? {
         match TcpStream::connect_timeout(&address, CONNECT_TIMEOUT) {
             Ok(s) => {
                 stream = Some(s);

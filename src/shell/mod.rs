@@ -362,6 +362,7 @@ impl Shell {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Result<Self> {
+        crate::net::init(paths.db.with_file_name("addresses.json"));
         let db = Db::open(&paths.db)?;
         let device_id = db.device_id()?;
         let focus = cx.focus_handle();

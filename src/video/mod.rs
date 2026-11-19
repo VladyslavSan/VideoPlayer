@@ -137,8 +137,9 @@ impl VideoSurface {
         self.last_start.set(start);
         *self.source.borrow_mut() = source.to_string();
         let start = format!("start={start:.3}");
+        let direct = crate::net::direct_url(source);
         self.mpv
-            .command("loadfile", &[source, "replace", "-1", &start])
+            .command("loadfile", &[&direct, "replace", "-1", &start])
             .map_err(|e| anyhow!("loading {source}: {e}"))
     }
 
@@ -310,8 +311,9 @@ impl VideoSurface {
     pub fn add_subtitle(&self, subtitle: &ExternalSubtitle) -> Result<()> {
         let title = subtitle.title.as_deref().unwrap_or("");
         let lang = subtitle.lang.as_deref().unwrap_or("");
+        let url = crate::net::direct_url(&subtitle.url);
         self.mpv
-            .command("sub-add", &[&subtitle.url, "auto", title, lang])
+            .command("sub-add", &[&url, "auto", title, lang])
             .map_err(|e| anyhow!("adding subtitle {}: {e}", subtitle.url))
     }
 

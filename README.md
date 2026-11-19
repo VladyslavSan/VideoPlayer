@@ -72,6 +72,9 @@ Each server's **Sign Out** (in Settings → Library) revokes the token on the se
   itself once the server answers. Where you stopped and what you marked watched while the server
   was away are kept, even across closing the app, and sent when it's back, unless the item has
   been played elsewhere since. The library catches up a few seconds after the server returns.
+- A server on a `.local` name (which Windows sometimes fails to look up for minutes at a time,
+  "No such host is known") is reached at the address the name last resolved to when a lookup
+  fails; the addresses are remembered across restarts (`addresses.json` beside the library).
 
 `cargo test -- --ignored` runs a round trip against Jellyfin's public demo server.
 
