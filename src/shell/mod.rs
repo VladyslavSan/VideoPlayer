@@ -63,6 +63,25 @@ const BAR_FADE_START: f32 = 0.3;
 /// The opacity where the header meets a sort bar below it.
 const BAR_JOIN_OPACITY: f32 = 0.6;
 
+/// Frosted glass: the page is blurred under the bars, under a light tint.
+/// Only GPUI's Windows renderer blurs so far; elsewhere the bars fade.
+const FROSTED: bool = cfg!(target_os = "windows");
+/// How soft the page under the bars gets (the blur's standard deviation).
+const FROST_BLUR: f32 = 20.0;
+/// The tint over the blur.
+const FROST_TINT: f32 = 0.4;
+/// The faint line under frosted bars.
+const FROST_EDGE: u32 = 0xffffff12;
+
+/// The bars' own background: a light tint over the frost, or a fade.
+fn bar_background(start: f32, from: f32, to: f32) -> gpui::Background {
+    if FROSTED {
+        bar_tint(FROST_TINT).into()
+    } else {
+        bar_fade(start, from, to)
+    }
+}
+
 /// The page colour at `opacity`, for the fading bar.
 fn bar_tint(opacity: f32) -> gpui::Hsla {
     let mut color: gpui::Hsla = rgb(BG).into();
@@ -1753,6 +1772,70 @@ impl Shell {
             .into_any_element()
     }
 
+    /// Whether a library grid's sort bar sits under the header.
+    fn sort_bar_below(&self, cx: &Context<Self>) -> bool {
+        Grid::of(&self.screen).is_some() && self.search_query(cx).is_empty()
+    }
+
+    /// The blur under the header (and the sort bar, if there is one): one
+    /// layer, drawn after the page and before either bar, so each bar's
+    /// buttons stay out of the other's blur.
+    fn frost(&self, cx: &Context<Self>) -> Option<AnyElement> {
+        if !FROSTED {
+            return None;
+        }
+        let sort_bar = self.sort_bar_below(cx);
+        let height = HEADER_HEIGHT
+            + if sort_bar {
+                browse::SORT_BAR_HEIGHT
+            } else {
+                0.0
+            };
+        let frost = gpui::canvas(
+            |_, _, _| (),
+            move |bounds, _, window, _| {
+                let blur = |rect| {
+                    gpui::quad(
+                        rect,
+                        px(0.0),
+                        gpui::backdrop_blur(px(FROST_BLUR)),
+                        px(0.0),
+                        gpui::transparent_black(),
+                        gpui::BorderStyle::default(),
+                    )
+                };
+                let header = Bounds::new(
+                    bounds.origin,
+                    gpui::size(bounds.size.width, px(HEADER_HEIGHT)),
+                );
+                // One layer: both blurs are drawn together, from the page
+                // as it was, so there's no seam where they meet. It reaches
+                // as far as the blur reads, so it comes after all of that.
+                window.paint_layer(bounds.dilate(px(FROST_BLUR * 3.0)), |window| {
+                    window.paint_quad(blur(header));
+                    if sort_bar {
+                        // The sort bar spans the grid, beside the sidebar.
+                        let left = px(browse::SIDEBAR_WIDTH);
+                        window.paint_quad(blur(Bounds::new(
+                            point(bounds.origin.x + left, bounds.origin.y + px(HEADER_HEIGHT)),
+                            gpui::size(bounds.size.width - left, px(browse::SORT_BAR_HEIGHT)),
+                        )));
+                    }
+                });
+            },
+        );
+        Some(
+            div()
+                .absolute()
+                .top_0()
+                .left_0()
+                .right_0()
+                .h(px(height))
+                .child(frost.size_full())
+                .into_any_element(),
+        )
+    }
+
     fn header(&self, cx: &mut Context<Self>) -> AnyElement {
         let heading =
             |text: SharedString| div().text_2xl().font_weight(FontWeight::BOLD).child(text);
@@ -1800,7 +1883,7 @@ impl Shell {
         };
         let can_refresh = !self.roots.is_empty() || !self.servers.is_empty();
         // On a library grid the sort bar carries the fade on below.
-        let sort_bar_below = Grid::of(&self.screen).is_some() && self.search_query(cx).is_empty();
+        let sort_bar_below = self.sort_bar_below(cx);
         let fades_to = if sort_bar_below {
             BAR_JOIN_OPACITY
         } else {
@@ -1813,7 +1896,10 @@ impl Shell {
             .left_0()
             .right_0()
             .h(px(HEADER_HEIGHT))
-            .bg(bar_fade(BAR_FADE_START, BAR_TOP_OPACITY, fades_to))
+            .bg(bar_background(BAR_FADE_START, BAR_TOP_OPACITY, fades_to))
+            .when(FROSTED && !sort_bar_below, |bar| {
+                bar.border_b_1().border_color(rgba(FROST_EDGE))
+            })
             // Clicks on the bar itself don't reach the page under it.
             .occlude()
             .flex()
@@ -2811,6 +2897,7 @@ impl Render for Shell {
             .on_key_down(cx.listener(Self::on_key))
             .child(main)
             // Last, so it's drawn over the page.
+            .children(self.frost(cx))
             .child(self.header(cx))
             .children(self.card_menu_view(window, cx))
             .into_any_element()

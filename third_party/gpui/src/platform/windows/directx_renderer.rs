@@ -69,10 +69,23 @@ struct DirectXResources {
     path_intermediate_msaa_texture: ID3D11Texture2D,
     path_intermediate_msaa_view: [Option<ID3D11RenderTargetView>; 1],
 
+    // Made the first time something asks for a backdrop blur.
+    blur_targets: Option<BlurTargets>,
+
     // Cached window size and viewport
     width: u32,
     height: u32,
     viewport: [D3D11_VIEWPORT; 1],
+}
+
+/// Window-sized scratch textures for backdrop blurs: a copy of the frame so
+/// far, and the first (horizontal) pass.
+struct BlurTargets {
+    source: ID3D11Texture2D,
+    source_view: [Option<ID3D11ShaderResourceView>; 1],
+    _first_pass: ID3D11Texture2D,
+    first_pass_view: [Option<ID3D11ShaderResourceView>; 1],
+    first_pass_target: [Option<ID3D11RenderTargetView>; 1],
 }
 
 struct DirectXRenderPipelines {
@@ -83,11 +96,15 @@ struct DirectXRenderPipelines {
     underline_pipeline: PipelineState<Underline>,
     mono_sprites: PipelineState<MonochromeSprite>,
     poly_sprites: PipelineState<PolychromeSprite>,
+    blur_first_pass: PipelineState<BackdropBlurSprite>,
+    blur_second_pass: PipelineState<BackdropBlurSprite>,
 }
 
 struct DirectXGlobalElements {
     global_params_buffer: [Option<ID3D11Buffer>; 1],
     sampler: [Option<ID3D11SamplerState>; 1],
+    /// Clamps at the edges, for blurs (wrapping would bleed the other side in).
+    clamp_sampler: [Option<ID3D11SamplerState>; 1],
 }
 
 struct DirectComposition {
@@ -443,7 +460,131 @@ impl DirectXRenderer {
         )
     }
 
+    /// Quads in order; a backdrop blur has to see everything before it, so
+    /// the batch is drawn in runs between blurs.
     fn draw_quads(&mut self, quads: &[Quad]) -> Result<()> {
+        let is_blur = |q: &Quad| q.background.is_backdrop_blur();
+        let mut rest = quads;
+        while let Some(start) = rest.iter().position(is_blur) {
+            self.draw_plain_quads(&rest[..start])?;
+            let count = rest[start..].iter().take_while(|q| is_blur(q)).count();
+            self.draw_backdrop_blurs(&rest[start..start + count])?;
+            rest = &rest[start + count..];
+        }
+        self.draw_plain_quads(rest)
+    }
+
+    /// Blurs side by side (one after another) all read the frame as it was
+    /// before any of them, so where they meet there's no seam.
+    fn draw_backdrop_blurs(&mut self, blurs: &[Quad]) -> Result<()> {
+        if self.resources.blur_targets.is_none() {
+            self.resources.blur_targets = Some(create_blur_targets(
+                &self.devices.device,
+                self.resources.width,
+                self.resources.height,
+            )?);
+        }
+        if let Some(targets) = &self.resources.blur_targets {
+            unsafe {
+                self.devices
+                    .device_context
+                    .CopyResource(&targets.source, &*self.resources.render_target);
+            }
+        }
+        for quad in blurs {
+            self.draw_backdrop_blur(quad)?;
+        }
+        unsafe {
+            // Unbound, so the next blurs can draw into them again.
+            self.devices
+                .device_context
+                .VSSetShaderResources(0, Some(&[None]));
+            self.devices
+                .device_context
+                .PSSetShaderResources(0, Some(&[None]));
+        }
+        Ok(())
+    }
+
+    /// One blur, from the copy of the frame that `draw_backdrop_blurs` made.
+    fn draw_backdrop_blur(&mut self, quad: &Quad) -> Result<()> {
+        let sigma = quad.background.gradient_angle_or_pattern_height;
+        let strength = quad.background.solid.a;
+        let clip = quad.bounds.intersect(&quad.content_mask.bounds);
+        if sigma <= 0.0 || strength <= 0.0 || clip.is_empty() {
+            return Ok(());
+        }
+        let Some(targets) = self.resources.blur_targets.as_ref() else {
+            return Ok(());
+        };
+        let context = &self.devices.device_context;
+        let (width, height) = (self.resources.width as f32, self.resources.height as f32);
+
+        // The first pass covers what the second will read: the clipped
+        // bounds, and the blur's reach above and below.
+        let reach = sigma * 3.0 + 2.0;
+        let left = clip.origin.x.0.max(0.0);
+        let right = (clip.origin.x.0 + clip.size.width.0).min(width);
+        let top = (clip.origin.y.0 - reach).max(0.0);
+        let bottom = (clip.origin.y.0 + clip.size.height.0 + reach).min(height);
+        if right <= left || bottom <= top {
+            return Ok(());
+        }
+        let first_bounds = Bounds {
+            origin: point(ScaledPixels(left), ScaledPixels(top)),
+            size: size(ScaledPixels(right - left), ScaledPixels(bottom - top)),
+        };
+        let first = BackdropBlurSprite {
+            bounds: first_bounds,
+            clip: first_bounds,
+            corner_radii: Corners::default(),
+            sigma,
+            strength,
+            direction: [1.0, 0.0],
+        };
+        let second = BackdropBlurSprite {
+            bounds: quad.bounds,
+            clip,
+            corner_radii: quad.corner_radii,
+            sigma,
+            strength,
+            direction: [0.0, 1.0],
+        };
+
+        unsafe {
+            // The first pass's output was the second's input last time.
+            context.PSSetShaderResources(0, Some(&[None]));
+            context.OMSetRenderTargets(Some(&targets.first_pass_target), None);
+        }
+        self.pipelines
+            .blur_first_pass
+            .update_buffer(&self.devices.device, context, &[first])?;
+        self.pipelines.blur_first_pass.draw_with_texture(
+            context,
+            &targets.source_view,
+            &self.resources.viewport,
+            &self.globals.global_params_buffer,
+            &self.globals.clamp_sampler,
+            1,
+        )?;
+        unsafe {
+            context.OMSetRenderTargets(Some(&self.resources.render_target_view), None);
+        }
+        self.pipelines
+            .blur_second_pass
+            .update_buffer(&self.devices.device, context, &[second])?;
+        self.pipelines.blur_second_pass.draw_with_texture(
+            context,
+            &targets.first_pass_view,
+            &self.resources.viewport,
+            &self.globals.global_params_buffer,
+            &self.globals.clamp_sampler,
+            1,
+        )?;
+        Ok(())
+    }
+
+    fn draw_plain_quads(&mut self, quads: &[Quad]) -> Result<()> {
         if quads.is_empty() {
             return Ok(());
         }
@@ -757,6 +898,7 @@ impl DirectXResources {
             path_intermediate_msaa_texture,
             path_intermediate_msaa_view,
             path_intermediate_srv,
+            blur_targets: None,
             viewport,
             width,
             height,
@@ -785,6 +927,8 @@ impl DirectXResources {
         self.path_intermediate_msaa_texture = path_intermediate_msaa_texture;
         self.path_intermediate_msaa_view = path_intermediate_msaa_view;
         self.path_intermediate_srv = path_intermediate_srv;
+        // Remade at the new size when next needed.
+        self.blur_targets = None;
         self.viewport = viewport;
         Ok(())
     }
@@ -842,6 +986,21 @@ impl DirectXRenderPipelines {
             create_blend_state(device)?,
         )?;
 
+        let blur_first_pass = PipelineState::new(
+            device,
+            "backdrop_blur_first_pass",
+            ShaderModule::BackdropBlur,
+            1,
+            create_blend_state_replacing(device)?,
+        )?;
+        let blur_second_pass = PipelineState::new(
+            device,
+            "backdrop_blur_second_pass",
+            ShaderModule::BackdropBlur,
+            1,
+            create_blend_state_for_path_sprite(device)?,
+        )?;
+
         Ok(Self {
             shadow_pipeline,
             quad_pipeline,
@@ -850,6 +1009,8 @@ impl DirectXRenderPipelines {
             underline_pipeline,
             mono_sprites,
             poly_sprites,
+            blur_first_pass,
+            blur_second_pass,
         })
     }
 }
@@ -910,9 +1071,28 @@ impl DirectXGlobalElements {
             [output]
         };
 
+        let clamp_sampler = unsafe {
+            let desc = D3D11_SAMPLER_DESC {
+                Filter: D3D11_FILTER_MIN_MAG_MIP_LINEAR,
+                AddressU: D3D11_TEXTURE_ADDRESS_CLAMP,
+                AddressV: D3D11_TEXTURE_ADDRESS_CLAMP,
+                AddressW: D3D11_TEXTURE_ADDRESS_CLAMP,
+                MipLODBias: 0.0,
+                MaxAnisotropy: 1,
+                ComparisonFunc: D3D11_COMPARISON_ALWAYS,
+                BorderColor: [0.0; 4],
+                MinLOD: 0.0,
+                MaxLOD: D3D11_FLOAT32_MAX,
+            };
+            let mut output = None;
+            device.CreateSamplerState(&desc, Some(&mut output))?;
+            [output]
+        };
+
         Ok(Self {
             global_params_buffer,
             sampler,
+            clamp_sampler,
         })
     }
 }
@@ -1059,6 +1239,19 @@ struct PathRasterizationSprite {
 #[repr(C)]
 struct PathSprite {
     bounds: Bounds<ScaledPixels>,
+}
+
+/// One pass of a backdrop blur (`BackdropBlur` in shaders.hlsl).
+#[derive(Clone, Copy)]
+#[repr(C)]
+struct BackdropBlurSprite {
+    bounds: Bounds<ScaledPixels>,
+    clip: Bounds<ScaledPixels>,
+    corner_radii: Corners<ScaledPixels>,
+    sigma: f32,
+    strength: f32,
+    /// (1, 0) for the first pass, (0, 1) for the second.
+    direction: [f32; 2],
 }
 
 impl Drop for DirectXRenderer {
@@ -1225,6 +1418,20 @@ fn create_path_intermediate_texture(
     Ok((texture, [Some(shader_resource_view.unwrap())]))
 }
 
+fn create_blur_targets(device: &ID3D11Device, width: u32, height: u32) -> Result<BlurTargets> {
+    let (source, source_view) = create_path_intermediate_texture(device, width, height)?;
+    let (first_pass, first_pass_view) = create_path_intermediate_texture(device, width, height)?;
+    let mut first_pass_target = None;
+    unsafe { device.CreateRenderTargetView(&first_pass, None, Some(&mut first_pass_target))? };
+    Ok(BlurTargets {
+        source,
+        source_view,
+        _first_pass: first_pass,
+        first_pass_view,
+        first_pass_target: [first_pass_target],
+    })
+}
+
 #[inline]
 fn create_path_intermediate_msaa_texture_and_view(
     device: &ID3D11Device,
@@ -1330,6 +1537,18 @@ fn create_blend_state_for_path_rasterization(device: &ID3D11Device) -> Result<ID
     desc.RenderTarget[0].SrcBlendAlpha = D3D11_BLEND_ONE;
     desc.RenderTarget[0].DestBlend = D3D11_BLEND_INV_SRC_ALPHA;
     desc.RenderTarget[0].DestBlendAlpha = D3D11_BLEND_INV_SRC_ALPHA;
+    desc.RenderTarget[0].RenderTargetWriteMask = D3D11_COLOR_WRITE_ENABLE_ALL.0 as u8;
+    unsafe {
+        let mut state = None;
+        device.CreateBlendState(&desc, Some(&mut state))?;
+        Ok(state.unwrap())
+    }
+}
+
+/// Writes the shader's output as it is (no blending).
+fn create_blend_state_replacing(device: &ID3D11Device) -> Result<ID3D11BlendState> {
+    let mut desc = D3D11_BLEND_DESC::default();
+    desc.RenderTarget[0].BlendEnable = false.into();
     desc.RenderTarget[0].RenderTargetWriteMask = D3D11_COLOR_WRITE_ENABLE_ALL.0 as u8;
     unsafe {
         let mut state = None;
@@ -1477,6 +1696,7 @@ pub(crate) mod shader_resources {
         MonochromeSprite,
         PolychromeSprite,
         EmojiRasterization,
+        BackdropBlur,
     }
 
     #[derive(Copy, Clone, Debug, Eq, PartialEq)]
@@ -1549,6 +1769,10 @@ pub(crate) mod shader_resources {
                 ShaderModule::EmojiRasterization => match target {
                     ShaderTarget::Vertex => EMOJI_RASTERIZATION_VERTEX_BYTES,
                     ShaderTarget::Fragment => EMOJI_RASTERIZATION_FRAGMENT_BYTES,
+                },
+                ShaderModule::BackdropBlur => match target {
+                    ShaderTarget::Vertex => BACKDROP_BLUR_VERTEX_BYTES,
+                    ShaderTarget::Fragment => BACKDROP_BLUR_FRAGMENT_BYTES,
                 },
             };
             Self { inner: bytes }
@@ -1636,6 +1860,7 @@ pub(crate) mod shader_resources {
                 ShaderModule::MonochromeSprite => "monochrome_sprite",
                 ShaderModule::PolychromeSprite => "polychrome_sprite",
                 ShaderModule::EmojiRasterization => "emoji_rasterization",
+                ShaderModule::BackdropBlur => "backdrop_blur",
             }
         }
     }

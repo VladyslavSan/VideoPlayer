@@ -2842,11 +2842,16 @@ impl Window {
         let scale_factor = self.scale_factor();
         let content_mask = self.content_mask();
         let opacity = self.element_opacity();
+        let mut background = quad.background.opacity(opacity);
+        if background.is_backdrop_blur() {
+            // The blur radius, in device pixels like the bounds.
+            background.gradient_angle_or_pattern_height *= scale_factor;
+        }
         self.next_frame.scene.insert_primitive(Quad {
             order: 0,
             bounds: quad.bounds.scale(scale_factor),
             content_mask: content_mask.scale(scale_factor),
-            background: quad.background.opacity(opacity),
+            background,
             border_color: quad.border_color.opacity(opacity),
             corner_radii: quad.corner_radii.scale(scale_factor),
             border_widths: quad.border_widths.scale(scale_factor),

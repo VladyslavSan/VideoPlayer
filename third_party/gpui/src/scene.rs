@@ -74,11 +74,20 @@ impl Scene {
             return;
         }
 
+        // A backdrop blur reads the pixels around it too, so it goes after
+        // everything painted within reach of the blur, not only under it.
+        let order_bounds = match &primitive {
+            Primitive::Quad(quad) if quad.background.is_backdrop_blur() => clipped_bounds
+                .dilate(ScaledPixels(
+                    quad.background.gradient_angle_or_pattern_height * 3.0,
+                )),
+            _ => clipped_bounds,
+        };
         let order = self
             .layer_stack
             .last()
             .copied()
-            .unwrap_or_else(|| self.primitive_bounds.insert(clipped_bounds));
+            .unwrap_or_else(|| self.primitive_bounds.insert(order_bounds));
         match &mut primitive {
             Primitive::Shadow(shadow) => {
                 shadow.order = order;

@@ -14,5 +14,23 @@ targets are left out. Changes:
   screen, so the screen can't be captured.
 - `src/taffy.rs`: `0.0_f32` / `1.0_f32` literals, so the build has no float-fallback warnings
   with newer Rust.
+- `src/elements/uniform_list.rs`: items and decorations no longer add the list's top padding
+  twice, and `ScrollStrategy::Top` scrolls an item to just below the padding (the app's grid
+  scrolls under a see-through bar).
+- Backdrop blur (frosted glass), Windows only: `gpui::backdrop_blur(radius)` is a background
+  that blurs whatever was painted under the element.
+  - `src/color.rs`: `BackgroundTag::BackdropBlur` (radius in `gradient_angle_or_pattern_height`,
+    strength in `solid.a`) and `backdrop_blur()`.
+  - `src/window.rs` (`paint_quad`): scales the radius to device pixels.
+  - `src/scene.rs` (`insert_primitive`): a blur's draw order covers everything within its reach
+    (3 × radius), not only under it.
+  - `src/style.rs`: the new tag in the border-colour match.
+  - `src/platform/windows/directx_renderer.rs`: quad batches are drawn in runs between blurs.
+    A run of blurs copies the frame once, then each draws a horizontal pass into a scratch
+    texture and a vertical pass back into the frame (clipped to its rounded bounds). The
+    textures are made on first use and dropped on resize.
+  - `src/platform/windows/shaders.hlsl` (`backdrop_blur_*`) and `build.rs` (module list).
+  - The other renderers (Metal, Linux) don't know the tag, so the app only uses it on
+    Windows.
 
 To update GPUI, copy the new release over this folder and apply the same changes again.

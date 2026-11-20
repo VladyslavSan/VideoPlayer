@@ -658,6 +658,9 @@ pub(crate) enum BackgroundTag {
     Solid = 0,
     LinearGradient = 1,
     PatternSlash = 2,
+    /// Blurs what was painted under it (`gradient_angle_or_pattern_height`
+    /// is the blur radius, `solid.a` its strength).
+    BackdropBlur = 3,
 }
 
 /// A color space for color interpolation.
@@ -715,6 +718,9 @@ impl std::fmt::Debug for Background {
                     self.solid, self.gradient_angle_or_pattern_height
                 )
             }
+            BackgroundTag::BackdropBlur => {
+                write!(f, "BackdropBlur({})", self.gradient_angle_or_pattern_height)
+            }
         }
     }
 }
@@ -744,6 +750,33 @@ pub fn pattern_slash(color: Hsla, width: f32, interval: f32) -> Background {
         solid: color,
         gradient_angle_or_pattern_height: height,
         ..Default::default()
+    }
+}
+
+/// Blurs whatever was painted under the element (frosted glass), by
+/// `radius` (the blur's standard deviation). Put a translucent background on
+/// a child to tint it.
+///
+/// Only the Windows (DirectX) renderer draws it so far; elsewhere it draws
+/// nothing, so pair it with a tint that reads well on its own.
+pub fn backdrop_blur(radius: crate::Pixels) -> Background {
+    Background {
+        tag: BackgroundTag::BackdropBlur,
+        solid: Hsla {
+            h: 0.,
+            s: 0.,
+            l: 0.,
+            a: 1.,
+        },
+        gradient_angle_or_pattern_height: radius.0,
+        ..Default::default()
+    }
+}
+
+impl Background {
+    /// Whether this is a [`backdrop_blur`].
+    pub(crate) fn is_backdrop_blur(&self) -> bool {
+        self.tag == BackgroundTag::BackdropBlur
     }
 }
 
@@ -833,6 +866,9 @@ impl Background {
             BackgroundTag::Solid => self.solid.is_transparent(),
             BackgroundTag::LinearGradient => self.colors.iter().all(|c| c.color.is_transparent()),
             BackgroundTag::PatternSlash => self.solid.is_transparent(),
+            BackgroundTag::BackdropBlur => {
+                self.solid.is_transparent() || self.gradient_angle_or_pattern_height <= 0.0
+            }
         }
     }
 }

@@ -1180,3 +1180,70 @@ float4 polychrome_sprite_fragment(PolychromeSpriteFragmentInput input): SV_Targe
     color.a *= sprite.opacity * saturate(0.5 - distance);
     return color;
 }
+
+/*
+**
+**              Backdrop blur
+**
+*/
+
+// One pass of a two-pass gaussian blur of what was drawn so far. The first
+// (horizontal) pass writes the backdrop's surroundings into a scratch
+// texture; the second (vertical) one draws the result into the frame,
+// clipped to the element's rounded bounds.
+struct BackdropBlur {
+    Bounds bounds;
+    Bounds clip;
+    Corners corner_radii;
+    float sigma;
+    float strength;
+    float2 direction;
+};
+
+struct BackdropBlurVertexOutput {
+    float4 position: SV_Position;
+    nointerpolation uint blur_id: TEXCOORD0;
+};
+
+StructuredBuffer<BackdropBlur> backdrop_blurs: register(t1);
+
+BackdropBlurVertexOutput backdrop_blur_vertex(uint vertex_id: SV_VertexID, uint blur_id: SV_InstanceID) {
+    float2 unit_vertex = float2(float(vertex_id & 1u), 0.5 * float(vertex_id & 2u));
+    BackdropBlur blur = backdrop_blurs[blur_id];
+    BackdropBlurVertexOutput output;
+    output.position = to_device_position(unit_vertex, blur.bounds);
+    output.blur_id = blur_id;
+    return output;
+}
+
+float4 backdrop_blur_fragment(BackdropBlurVertexOutput input): SV_Target {
+    BackdropBlur blur = backdrop_blurs[input.blur_id];
+    float2 position = input.position.xy;
+    float sigma = max(blur.sigma, 0.5);
+    float reach = 3.0 * sigma;
+    // Bilinear sampling smooths between taps, so ~1.5px apart is plenty.
+    int taps = (int)clamp(ceil(reach / 1.5), 1.0, 64.0);
+    float spacing = reach / float(taps);
+    float4 sum = float4(0.0, 0.0, 0.0, 0.0);
+    float total = 0.0;
+    [loop]
+    for (int i = -taps; i <= taps; i++) {
+        float offset = float(i) * spacing;
+        float weight = exp(-0.5 * offset * offset / (sigma * sigma));
+        float2 uv = (position + blur.direction * offset) / global_viewport_size;
+        sum += weight * t_sprite.SampleLevel(s_sprite, uv, 0.0);
+        total += weight;
+    }
+    float4 color = sum / total;
+    if (blur.direction.y == 0.0) {
+        return color;
+    }
+    float2 clip_min = blur.clip.origin;
+    float2 clip_max = blur.clip.origin + blur.clip.size;
+    if (any(position < clip_min) || any(position > clip_max)) {
+        discard;
+    }
+    float coverage = saturate(0.5 - quad_sdf(position, blur.bounds, blur.corner_radii));
+    // Premultiplied, over what's there.
+    return color * (coverage * blur.strength);
+}

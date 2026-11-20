@@ -18,7 +18,7 @@ use crate::library::{self, Item, Library};
 const PAGE_PADDING: f32 = 32.0;
 const CARD_GAP: f32 = 20.0;
 /// The sort choices over a library grid, see-through like the top bar.
-const SORT_BAR_HEIGHT: f32 = 56.0;
+pub(super) const SORT_BAR_HEIGHT: f32 = 56.0;
 /// Cards in each Home row.
 const ROW_LIMIT: usize = 20;
 /// Episode matches shown in search results.
@@ -569,7 +569,10 @@ impl Shell {
             .left_0()
             .right_0()
             .h(px(SORT_BAR_HEIGHT))
-            .bg(super::bar_fade(0.0, super::BAR_JOIN_OPACITY, 0.0))
+            .bg(super::bar_background(0.0, super::BAR_JOIN_OPACITY, 0.0))
+            .when(super::FROSTED, |bar| {
+                bar.border_b_1().border_color(rgba(super::FROST_EDGE))
+            })
             .occlude()
             .flex()
             .items_center()
@@ -682,7 +685,13 @@ impl Shell {
             .flex()
             .flex_col()
             .child(list)
-            .child(bar)
+            // With frosted bars, drawn after the frost (which comes after
+            // the page), like the header.
+            .child(if super::FROSTED {
+                gpui::deferred(bar).into_any_element()
+            } else {
+                bar
+            })
             .into_any_element()
     }
 
