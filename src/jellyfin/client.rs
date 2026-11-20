@@ -126,7 +126,11 @@ impl Client {
     }
 
     pub(super) fn authorization(&self) -> String {
-        let device = device_name();
+        self.authorization_for(device_name())
+    }
+
+    fn authorization_for(&self, device: &str) -> String {
+        let device = encode_value(device);
         let mut value = format!(
             r#"MediaBrowser Client="{CLIENT_NAME}", Device="{device}", DeviceId="{}", Version="{}""#,
             self.device_id,
@@ -688,6 +692,22 @@ fn in_parallel<T: Send>(count: usize, job: impl Fn(usize) -> Result<T> + Sync) -
     Ok(out)
 }
 
+/// Percent-encodes what a header value can't carry as is: non-ASCII bytes,
+/// control characters and the characters the server's parser reads as
+/// syntax (`%`, `"`, `,`, `+`, `=`). The server decodes the result.
+fn encode_value(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    for &byte in text.as_bytes() {
+        match byte {
+            b'%' | b'"' | b',' | b'+' | b'=' | 0..=0x1F | 0x7F..=0xFF => {
+                out.push_str(&format!("%{byte:02X}"));
+            }
+            _ => out.push(byte as char),
+        }
+    }
+    out
+}
+
 /// This computer's name, shown in Jellyfin's device list.
 fn device_name() -> &'static str {
     static NAME: std::sync::OnceLock<String> = std::sync::OnceLock::new();
@@ -698,7 +718,7 @@ fn device_name() -> &'static str {
             .output()
             .ok()
             .and_then(|out| String::from_utf8(out.stdout).ok())
-            .map(|name| name.trim().replace('"', ""))
+            .map(|name| name.trim().to_string())
             .filter(|name| !name.is_empty());
         #[cfg(not(target_os = "macos"))]
         let name = std::env::var("COMPUTERNAME").ok();
@@ -722,6 +742,18 @@ fn base_from_final(uri: &str, path: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn authorization_header_is_visible_ascii() {
+        let mut client = Client::new("http://host", "dev-1");
+        client.token = Some("tok".into());
+        let value = client.authorization_for("Alex\u{2019}s MacBook Pro");
+        assert!(value.contains(r#"Device="Alex%E2%80%99s MacBook Pro""#));
+        let header = ureq::http::HeaderValue::from_str(&value).unwrap();
+        assert!(header.to_str().is_ok());
+        assert_eq!(encode_value(r#"a"b,c+d=e%f"#), "a%22b%2Cc%2Bd%3De%25f");
+        assert_eq!(encode_value("tab\there"), "tab%09here");
+    }
 
     #[test]
     fn base_follows_redirect() {
