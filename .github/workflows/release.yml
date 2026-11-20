@@ -27,8 +27,26 @@ jobs:
         run: bash scripts/ci-version.sh
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
+      - name: ffmpeg
+        shell: bash
+        # The clip tests make their video with ffmpeg.
+        run: |
+          choco install ffmpeg -y --no-progress
+          # test_clip needs both encoders; without them the clip tests skip.
+          encoders=$(ffmpeg -hide_banner -encoders)
+          for encoder in libx264 aac; do
+            grep -qw "$encoder" <<<"$encoders" || { echo "ffmpeg has no $encoder encoder"; exit 1; }
+          done
       - name: Test
-        run: cargo test --release
+        shell: bash
+        # A clip test that can't make its clip prints "skipped:" and passes,
+        # so CI would be green without playing anything: fail on that.
+        run: |
+          cargo test --release -- --show-output 2>&1 | tee test.log
+          if grep -n 'skipped: ' test.log; then
+            echo "a test was skipped"
+            exit 1
+          fi
       - name: Build
         run: cargo build --release
       - name: Package
@@ -61,8 +79,25 @@ jobs:
         # GPUI compiles its shaders with Xcode's Metal compiler, which newer
         # Xcode versions download separately.
         run: xcrun -sdk macosx metal --version || xcodebuild -downloadComponent MetalToolchain
+      - name: ffmpeg
+        # The clip tests make their video with ffmpeg.
+        run: |
+          brew install ffmpeg
+          # test_clip needs both encoders; without them the clip tests skip.
+          encoders=$(ffmpeg -hide_banner -encoders)
+          for encoder in libx264 aac; do
+            grep -qw "$encoder" <<<"$encoders" || { echo "ffmpeg has no $encoder encoder"; exit 1; }
+          done
       - name: Test
-        run: cargo test --release --target aarch64-apple-darwin
+        shell: bash
+        # A clip test that can't make its clip prints "skipped:" and passes,
+        # so CI would be green without playing anything: fail on that.
+        run: |
+          cargo test --release --target aarch64-apple-darwin -- --show-output 2>&1 | tee test.log
+          if grep -n 'skipped: ' test.log; then
+            echo "a test was skipped"
+            exit 1
+          fi
       - name: Build and bundle
         run: bash scripts/bundle-macos.sh "$VERSION"
       - uses: actions/upload-artifact@v4
