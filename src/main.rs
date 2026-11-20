@@ -2,6 +2,9 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod arr;
+#[cfg(test)]
+#[path = "../build/layout.rs"]
+mod build_layout;
 mod introdb;
 mod jellyfin;
 mod library;

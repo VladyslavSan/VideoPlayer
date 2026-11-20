@@ -1,5 +1,7 @@
 use std::{env, fs, path::Path, path::PathBuf};
 
+#[path = "build/layout.rs"]
+mod layout;
 #[path = "build/libmpv.rs"]
 mod libmpv;
 
@@ -7,6 +9,7 @@ fn main() {
     let root = PathBuf::from(env::var("CARGO_MANIFEST_DIR").unwrap());
     let out = PathBuf::from(env::var("OUT_DIR").unwrap());
     println!("cargo:rerun-if-changed=build/libmpv.rs");
+    println!("cargo:rerun-if-changed=build/layout.rs");
     let mpv = |pinned| {
         libmpv::find_or_fetch(pinned, &root.join("third_party/mpv"))
             .unwrap_or_else(|e| panic!("{e}"))
@@ -48,14 +51,16 @@ fn windows(root: &Path, mpv: &Path, out: &Path) {
         .manifest_optional()
         .expect("compiling Windows resources");
 
-    // Cargo puts a link-search path inside OUT_DIR on PATH when it runs
-    // tests and `cargo run`; the DLL has to be there, as newer rustc keeps
-    // test binaries under OUT_DIR, not next to the profile dir.
+    // Cargo puts link-search paths inside OUT_DIR on PATH for `cargo test`
+    // and `cargo run`, so the DLL is found wherever cargo runs the binaries.
     fs::copy(&dll, out.join("libmpv-2.dll")).unwrap();
     println!("cargo:rustc-link-search=native={}", out.display());
 
-    // OUT_DIR is target/<profile>/build/<crate>/out.
-    let profile_dir = out.ancestors().nth(3).unwrap();
+    // The DLL also goes next to the .exe, which release.yml packages.
+    // OUT_DIR is <profile>/build/<crate>-<hash>/out or
+    // <profile>/build/<crate>/<hash>/out, depending on the cargo version.
+    let profile_dir = layout::profile_dir(out)
+        .unwrap_or_else(|| panic!("no `build` folder above OUT_DIR ({})", out.display()));
     for dir in [profile_dir.to_path_buf(), profile_dir.join("examples")] {
         fs::create_dir_all(&dir).unwrap();
         fs::copy(&dll, dir.join("libmpv-2.dll")).unwrap();
