@@ -5,7 +5,8 @@
 //!
 //! `MPV_LIB_DIR` points at a libmpv of your own instead (nothing is
 //! downloaded): `libmpv-2.dll` and `mpv.lib` on Windows, `libmpv.dylib` and
-//! the dylibs it needs on macOS.
+//! the dylibs it needs on macOS. A Windows download also leaves
+//! `LICENSE.LGPL` in the folder, to ship next to the DLL.
 
 use std::fs;
 use std::io::{self, Cursor};
@@ -21,10 +22,10 @@ pub struct Pinned {
     unpack: fn(&[u8], &Path) -> Result<(), String>,
 }
 
-/// shinchiro's mpv-winbuild-cmake: libmpv-2.dll (x64).
+/// mpv's own LGPL build of libmpv (LGPLv3, no GPL parts), x64.
 pub const WINDOWS: Pinned = Pinned {
-    url: "https://github.com/shinchiro/mpv-winbuild-cmake/releases/download/20261106/mpv-dev-x86_64-20261106-git-9028187538.7z",
-    sha256: "b5a3cc91b5dabf88ad5bb21d000834da4fd0bbda30f4584d39c082127bd62414",
+    url: "https://github.com/mpv-player/mpv/releases/download/v0.42.0/libmpv-v0.42.0-x86_64-w64-mingw32-lgpl.zip",
+    sha256: "8e5f77430efc53ef175804ba6618527e3af0448a0dcabf04d3cc72659d1a6fce",
     unpack: unpack_windows,
 };
 
@@ -110,17 +111,29 @@ fn download(pinned: &Pinned) -> Result<Vec<u8>, String> {
     Ok(bytes)
 }
 
-/// The .7z has libmpv-2.dll but no import library, which the MSVC linker
-/// needs: that's made from the DLL's exports with Visual Studio's lib.exe.
+/// The .zip has libmpv-2.dll and the license at its top level, but no
+/// import library the MSVC linker can use (libmpv.dll.a is for MinGW):
+/// that's made from the DLL's exports with Visual Studio's lib.exe.
 fn unpack_windows(archive: &[u8], dir: &Path) -> Result<(), String> {
-    let all = dir.join("archive");
-    sevenz_rust2::decompress(Cursor::new(archive), &all)
-        .map_err(|e| format!("unpacking libmpv: {e}"))?;
-    let dll = dir.join("libmpv-2.dll");
-    fs::rename(all.join("libmpv-2.dll"), &dll)
-        .map_err(|e| format!("libmpv-2.dll isn't in the archive: {e}"))?;
-    fs::remove_dir_all(&all).map_err(|e| format!("cleaning up: {e}"))?;
-    import_library(&dll, &dir.join("mpv.lib"))
+    extract_zip(archive, dir, &["libmpv-2.dll", "LICENSE.LGPL"])?;
+    import_library(&dir.join("libmpv-2.dll"), &dir.join("mpv.lib"))
+}
+
+/// Writes the top-level entries `names` of the .zip into `dir`. A missing
+/// entry, or one that doesn't unpack (its checksum is verified), is an error.
+pub fn extract_zip(archive: &[u8], dir: &Path, names: &[&str]) -> Result<(), String> {
+    let mut zip = zip::ZipArchive::new(Cursor::new(archive))
+        .map_err(|e| format!("libmpv's .zip can't be read: {e}"))?;
+    for name in names {
+        let mut entry = zip
+            .by_name(name)
+            .map_err(|e| format!("{name} isn't in libmpv's .zip: {e}"))?;
+        let path = dir.join(name);
+        let mut file =
+            fs::File::create(&path).map_err(|e| format!("creating {}: {e}", path.display()))?;
+        io::copy(&mut entry, &mut file).map_err(|e| format!("unpacking {name}: {e}"))?;
+    }
+    Ok(())
 }
 
 /// Writes `lib`, the import library for `dll`'s `mpv_*` functions.

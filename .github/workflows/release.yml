@@ -37,6 +37,8 @@ jobs:
           $name = "VideoPlayer-$env:VERSION-windows-x64"
           New-Item -ItemType Directory "dist/$name" | Out-Null
           Copy-Item target/release/video-player.exe, target/release/libmpv-2.dll "dist/$name"
+          # libmpv's license goes with it (the build fetched it with the DLL).
+          Copy-Item third_party/mpv/LICENSE.LGPL "dist/$name"
           Compress-Archive "dist/$name" "dist/$name.zip"
       - uses: actions/upload-artifact@v4
         with:

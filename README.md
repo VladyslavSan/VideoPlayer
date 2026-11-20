@@ -261,5 +261,7 @@ settings stay).
 
 ## Licensing
 
-The prebuilt libmpv the build downloads for Windows (shinchiro's mpv-winbuild-cmake) is a GPL
-build; the macOS one from media-kit is LGPL.
+The prebuilt libmpv the build downloads for Windows is mpv's official LGPL build (LGPLv3) from the
+[mpv v0.42.0 release](https://github.com/mpv-player/mpv/releases/tag/v0.42.0), which is built
+with FFmpeg from [BtbN's FFmpeg-Builds](https://github.com/BtbN/FFmpeg-Builds). Its `LICENSE.LGPL`
+ships next to `libmpv-2.dll` in the Windows download. The macOS one from media-kit is LGPL.
