@@ -48,6 +48,12 @@ fn windows(root: &Path, mpv: &Path, out: &Path) {
         .manifest_optional()
         .expect("compiling Windows resources");
 
+    // Cargo puts a link-search path inside OUT_DIR on PATH when it runs
+    // tests and `cargo run`; the DLL has to be there, as newer rustc keeps
+    // test binaries under OUT_DIR, not next to the profile dir.
+    fs::copy(&dll, out.join("libmpv-2.dll")).unwrap();
+    println!("cargo:rustc-link-search=native={}", out.display());
+
     // OUT_DIR is target/<profile>/build/<crate>/out.
     let profile_dir = out.ancestors().nth(3).unwrap();
     for dir in [profile_dir.to_path_buf(), profile_dir.join("examples")] {
