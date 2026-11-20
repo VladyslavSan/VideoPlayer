@@ -11,6 +11,8 @@ mod net;
 mod player;
 mod secrets;
 mod shell;
+#[cfg(test)]
+mod test_clip;
 mod test_window;
 mod ui;
 mod video;

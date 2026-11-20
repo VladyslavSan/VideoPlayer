@@ -8,12 +8,62 @@ mod win;
 
 use anyhow::{Result, anyhow};
 use gpui::Window;
-use libmpv2::Mpv;
+use libmpv2::{Mpv, MpvInitializer};
 
 #[cfg(target_os = "macos")]
 use mac::Host;
 #[cfg(windows)]
 use win::Host;
+
+/// The options every player instance gets, whatever draws its video.
+fn player_options(init: &MpvInitializer, http_header: Option<&str>) -> libmpv2::Result<()> {
+    init.set_option("hwdec", "auto-safe")?;
+    init.set_option("keep-open", "yes")?;
+    // Arrow-key skips land exactly, not on the next keyframe.
+    init.set_option("hr-seek", "yes")?;
+    set_lua_option(init, "osc", "no")?;
+    init.set_option("osd-level", 0i64)?;
+    init.set_option("input-default-bindings", "no")?;
+    init.set_option("input-vo-keyboard", "no")?;
+    init.set_option("input-cursor", "no")?;
+    if let Some(header) = http_header {
+        init.set_option("http-header-fields", header)?;
+    }
+    // A connection that drops for a moment is picked up again by
+    // itself, from where it was, before the buffer runs out.
+    init.set_option(
+        "stream-lavf-o",
+        "reconnect=1,reconnect_streamed=1,reconnect_on_network_error=1,reconnect_delay_max=10",
+    )?;
+    if let Ok(path) = std::env::var("VIDEO_PLAYER_MPV_LOG") {
+        init.set_option("log-file", path.as_str())?;
+    }
+    Ok(())
+}
+
+/// Opens `source` at `start` seconds. The start goes in as a property, not
+/// as an argument of `loadfile`: that command's arguments differ between
+/// mpv versions (0.38 added `index` before the options).
+fn load_file(mpv: &Mpv, source: &str, start: f64) -> Result<()> {
+    let direct = crate::net::direct_url(source);
+    mpv.set_property("start", format!("{start:.3}").as_str())
+        .and_then(|()| mpv.command("loadfile", &[&direct, "replace"]))
+        .map_err(|e| anyhow!("loading {source}: {e}"))
+}
+
+/// Sets an option that only exists in an mpv built with Lua (`osc`,
+/// `load-scripts`, `ytdl`). Some libmpv builds have no Lua; the option is
+/// then moot, so "option not found" is not an error. Any other error is.
+pub fn set_lua_option(init: &MpvInitializer, name: &str, value: &str) -> libmpv2::Result<()> {
+    ignore_missing_option(init.set_option(name, value))
+}
+
+fn ignore_missing_option(result: libmpv2::Result<()>) -> libmpv2::Result<()> {
+    match result {
+        Err(libmpv2::Error::Raw(code)) if code == libmpv2::mpv_error::OptionNotFound => Ok(()),
+        other => other,
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TrackKind {
@@ -90,27 +140,7 @@ impl VideoSurface {
             host.configure(&init)?;
             #[cfg(target_os = "macos")]
             Host::configure(&init)?;
-            init.set_option("hwdec", "auto-safe")?;
-            init.set_option("keep-open", "yes")?;
-            // Arrow-key skips land exactly, not on the next keyframe.
-            init.set_option("hr-seek", "yes")?;
-            init.set_option("osc", "no")?;
-            init.set_option("osd-level", 0i64)?;
-            init.set_option("input-default-bindings", "no")?;
-            init.set_option("input-vo-keyboard", "no")?;
-            init.set_option("input-cursor", "no")?;
-            if let Some(header) = http_header {
-                init.set_option("http-header-fields", header)?;
-            }
-            // A connection that drops for a moment is picked up again by
-            // itself, from where it was, before the buffer runs out.
-            init.set_option(
-                "stream-lavf-o",
-                "reconnect=1,reconnect_streamed=1,reconnect_on_network_error=1,reconnect_delay_max=10",
-            )?;
-            if let Ok(path) = std::env::var("VIDEO_PLAYER_MPV_LOG") {
-                init.set_option("log-file", path.as_str())?;
-            }
+            player_options(&init, http_header)?;
             // Developer override, e.g. `ao=null` to keep test runs silent.
             if let Ok(options) = std::env::var("VIDEO_PLAYER_MPV_OPTIONS") {
                 for (key, value) in options.split_whitespace().filter_map(|o| o.split_once('=')) {
@@ -136,11 +166,7 @@ impl VideoSurface {
     pub fn load(&self, source: &str, start: f64) -> Result<()> {
         self.last_start.set(start);
         *self.source.borrow_mut() = source.to_string();
-        let start = format!("start={start:.3}");
-        let direct = crate::net::direct_url(source);
-        self.mpv
-            .command("loadfile", &[&direct, "replace", "-1", &start])
-            .map_err(|e| anyhow!("loading {source}: {e}"))
+        load_file(&self.mpv, source, start)
     }
 
     /// The source being played, as passed to `load`.
@@ -393,5 +419,86 @@ impl VideoSurface {
             prop("video-target-params/primaries"),
             prop("video-target-params/gamma"),
         )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use libmpv2::{Error, mpv_error};
+
+    /// A player without a window or sound, with the app's own options.
+    fn headless(http_header: Option<&str>) -> Mpv {
+        Mpv::with_initializer(|init| {
+            init.set_option("vo", "null")?;
+            init.set_option("ao", "null")?;
+            player_options(&init, http_header)
+        })
+        .expect("mpv starts")
+    }
+
+    /// Waits until `source` plays past `start`, and returns the position.
+    fn play_from(mpv: &Mpv, source: &str, start: f64, timeout_secs: u64) -> f64 {
+        load_file(mpv, source, start).expect("loadfile is accepted");
+        let until = std::time::Instant::now() + std::time::Duration::from_secs(timeout_secs);
+        while std::time::Instant::now() < until {
+            let position: f64 = mpv.get_property("time-pos").unwrap_or(0.0);
+            let tracks: i64 = mpv.get_property("track-list/count").unwrap_or(0);
+            if tracks > 0 && position >= start {
+                return position;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        panic!("{source} did not reach {start}s within {timeout_secs}s");
+    }
+
+    #[test]
+    fn local_clip_plays_from_its_start() {
+        let Some((_dir, clip)) = crate::test_clip::make() else {
+            return;
+        };
+        let mpv = headless(None);
+        let position = play_from(&mpv, &clip.to_string_lossy(), 2.0, 10);
+        assert!((2.0..4.0).contains(&position), "position {position}");
+        let duration: f64 = mpv.get_property("duration").unwrap();
+        assert!((4.9..5.1).contains(&duration), "duration {duration}");
+        // One video track and one audio track.
+        assert_eq!(mpv.get_property::<i64>("track-list/count").unwrap(), 2);
+    }
+
+    /// Streams from Jellyfin's public demo server, so the HTTP and
+    /// `Authorization` header path is covered: `cargo test -- --ignored`.
+    #[test]
+    #[ignore]
+    fn demo_server_stream_plays_from_its_start() -> Result<()> {
+        let mut client =
+            crate::jellyfin::Client::new("https://demo.jellyfin.org/stable", "videoplayer-test");
+        let auth = client.login("demo", "")?;
+        let items = client.library(&auth.user.id)?;
+        let movie = items
+            .iter()
+            .find(|i| i.kind == "Movie")
+            .expect("a movie in the demo library");
+        let mpv = headless(client.stream_header().as_deref());
+        let position = play_from(&mpv, &client.stream_url(&movie.id), 5.0, 90);
+        client.logout()?;
+        assert!(position >= 5.0, "position {position}");
+        Ok(())
+    }
+
+    #[test]
+    fn only_a_missing_option_is_ignored() {
+        assert!(ignore_missing_option(Ok(())).is_ok());
+        assert!(ignore_missing_option(Err(Error::Raw(mpv_error::OptionNotFound))).is_ok());
+        for code in [mpv_error::OptionError, mpv_error::OptionFormat] {
+            assert!(matches!(
+                ignore_missing_option(Err(Error::Raw(code))),
+                Err(Error::Raw(c)) if c == code
+            ));
+        }
+        assert!(matches!(
+            ignore_missing_option(Err(Error::Null)),
+            Err(Error::Null)
+        ));
     }
 }

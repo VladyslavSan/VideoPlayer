@@ -35,15 +35,15 @@ fn render_frame(video: &Path, outdir: &Path) -> Result<()> {
         init.set_option("vo-image-format", "jpg")?;
         init.set_option("vo-image-jpeg-quality", 85i64)?;
         init.set_option("vo-image-outdir", outdir.to_string_lossy().as_ref())?;
-        init.set_option("vf", format!("scale=w={WIDTH}:h=-2").as_str())?;
+        init.set_option("vf", format!("lavfi=[scale=w={WIDTH}:h=-2]").as_str())?;
         init.set_option("start", "20%")?;
         init.set_option("frames", 1i64)?;
         init.set_option("audio", "no")?;
         init.set_option("sub", "no")?;
         init.set_option("hwdec", "no")?;
-        init.set_option("idle", "no")?;
+        init.set_option("idle", "once")?;
         init.set_option("config", "no")?;
-        init.set_option("load-scripts", "no")?;
+        crate::video::set_lua_option(&init, "load-scripts", "no")?;
         Ok(())
     })
     .map_err(|e| anyhow!("initialising mpv: {e}"))?;
@@ -61,4 +61,26 @@ fn render_frame(video: &Path, outdir: &Path) -> Result<()> {
         }
     }
     bail!("timed out after {TIMEOUT_SECONDS}s")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    #[cfg_attr(
+        target_os = "macos",
+        ignore = "the pinned Mac libmpv has no scale filter and no image encoder"
+    )]
+    fn thumbnail_of_a_local_clip_has_the_thumbnail_width() {
+        let Some((dir, clip)) = crate::test_clip::make() else {
+            return;
+        };
+        let out = dir.path().join("thumb.jpg");
+        generate(&clip, &out).expect("a thumbnail is made");
+        assert_eq!(
+            crate::test_clip::jpeg_size(&out),
+            Some((WIDTH, WIDTH * 3 / 4))
+        );
+    }
 }

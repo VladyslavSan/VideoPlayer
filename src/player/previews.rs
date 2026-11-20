@@ -136,8 +136,8 @@ impl Worker {
             init.set_option("audio", "no")?;
             init.set_option("sid", "no")?;
             init.set_option("sub-auto", "no")?;
-            init.set_option("load-scripts", "no")?;
-            init.set_option("ytdl", "no")?;
+            crate::video::set_lua_option(&init, "load-scripts", "no")?;
+            crate::video::set_lua_option(&init, "ytdl", "no")?;
             init.set_option("input-default-bindings", "no")?;
             init.set_option("pause", "yes")?;
             init.set_option("keep-open", "always")?;
@@ -145,7 +145,7 @@ impl Worker {
             // Keyframes are enough for a preview; decode them cheaply.
             init.set_option("hr-seek", "no")?;
             init.set_option("vd-lavc-skiploopfilter", "all")?;
-            init.set_option("vf", format!("scale={WIDTH}:-2").as_str())?;
+            init.set_option("vf", format!("lavfi=[scale={WIDTH}:-2]").as_str())?;
             // Don't stream ahead while it waits for the next hover.
             init.set_option("cache", "no")?;
             init.set_option("demuxer-readahead-secs", "0")?;
@@ -200,7 +200,7 @@ fn wait_for(mpv: &Mpv, timeout: Duration, done: impl Fn(&Event) -> bool) -> Resu
 
 #[cfg(test)]
 mod tests {
-    use super::slot;
+    use super::*;
 
     #[test]
     fn times_round_to_the_nearest_slot() {
@@ -209,5 +209,29 @@ mod tests {
         assert_eq!(slot(5.0), 1);
         assert_eq!(slot(-3.0), 0);
         assert_eq!(slot(3600.0), 360);
+    }
+
+    #[test]
+    #[cfg_attr(
+        target_os = "macos",
+        ignore = "the pinned Mac libmpv has no scale filter and no image encoder"
+    )]
+    fn snapshot_of_a_local_clip_has_the_preview_width() {
+        let Some((dir, clip)) = crate::test_clip::make() else {
+            return;
+        };
+        let worker = Worker {
+            source: clip.to_string_lossy().into_owned(),
+            http_header: None,
+            dir: dir.path().to_path_buf(),
+            state: Arc::default(),
+        };
+        let mpv = worker.open().expect("the preview player opens the clip");
+        let out = slot_path(dir.path(), 0);
+        worker.snapshot(&mpv, 0, &out).expect("a snapshot is taken");
+        assert_eq!(
+            crate::test_clip::jpeg_size(&out),
+            Some((WIDTH, WIDTH * 3 / 4))
+        );
     }
 }
