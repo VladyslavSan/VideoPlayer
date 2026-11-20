@@ -1,13 +1,20 @@
 use std::{env, fs, path::Path, path::PathBuf};
 
+#[path = "build/libmpv.rs"]
+mod libmpv;
+
 fn main() {
     let root = PathBuf::from(env::var("CARGO_MANIFEST_DIR").unwrap());
-    let mpv = root.join("third_party/mpv");
     let out = PathBuf::from(env::var("OUT_DIR").unwrap());
+    println!("cargo:rerun-if-changed=build/libmpv.rs");
+    let mpv = |pinned| {
+        libmpv::find_or_fetch(pinned, &root.join("third_party/mpv"))
+            .unwrap_or_else(|e| panic!("{e}"))
+    };
 
     match env::var("CARGO_CFG_TARGET_OS").as_deref() {
-        Ok("windows") => windows(&root, &mpv, &out),
-        Ok("macos") => macos(&mpv),
+        Ok("windows") => windows(&root, &mpv(&libmpv::WINDOWS), &out),
+        Ok("macos") => macos(&mpv(&libmpv::MACOS)),
         _ => {}
     }
 }
@@ -15,10 +22,7 @@ fn main() {
 fn windows(root: &Path, mpv: &Path, out: &Path) {
     let dll = mpv.join("libmpv-2.dll");
     println!("cargo:rerun-if-changed={}", dll.display());
-    assert!(
-        dll.exists(),
-        "libmpv is missing: run `bash scripts/fetch-libmpv.sh` first"
-    );
+    assert!(dll.exists(), "libmpv-2.dll isn't in {}", mpv.display());
     println!("cargo:rustc-link-search=native={}", mpv.display());
 
     // App icon and version info (assets/app.ico is drawn by scripts/make_icon.py).
@@ -55,10 +59,7 @@ fn windows(root: &Path, mpv: &Path, out: &Path) {
 fn macos(mpv: &Path) {
     let dylib = mpv.join("libmpv.dylib");
     println!("cargo:rerun-if-changed={}", dylib.display());
-    assert!(
-        dylib.exists(),
-        "libmpv is missing: run `bash scripts/fetch-libmpv-macos.sh` first"
-    );
+    assert!(dylib.exists(), "libmpv.dylib isn't in {}", mpv.display());
     println!("cargo:rustc-link-search=native={}", mpv.display());
     // The app bundle keeps the dylibs in Contents/Frameworks; development
     // builds and tests load them from third_party/mpv. The bundle script

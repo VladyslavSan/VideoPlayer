@@ -30,6 +30,14 @@ souvlaki = { version = "0.9.3", default-features = false }
 
 [build-dependencies]
 embed-resource = "3.0.12"
+# Fetching libmpv (build/libmpv.rs).
+cc = "1.11.1"
+flate2 = "1.1.11"
+object = { version = "0.39.1", default-features = false, features = ["read", "std"] }
+sevenz-rust2 = { version = "0.24.2", default-features = false, features = ["util"] }
+sha2 = "0.10.9"
+tar = "0.4.46"
+ureq = "3.5.1"
 
 [dev-dependencies]
 tempfile = "3.27.0"

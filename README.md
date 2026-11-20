@@ -13,19 +13,16 @@ An Infuse-style video player for Windows and macOS, built with Rust, [GPUI](http
 
 ## Setup
 
-Windows (Git Bash, with Visual Studio's C++ tools):
+Windows needs Visual Studio's C++ build tools; macOS needs Xcode. Then:
 
 ```sh
-bash scripts/fetch-libmpv.sh   # downloads libmpv into third_party/mpv
-cargo run -- "D:\path\to\movie.mkv"
+cargo run -- "D:\path\to\movie.mkv"     # or ~/Movies/movie.mkv
 ```
 
-macOS (Xcode):
-
-```sh
-bash scripts/fetch-libmpv-macos.sh   # downloads libmpv into third_party/mpv
-cargo run -- ~/Movies/movie.mkv
-```
+mpv is a C library, which the `libmpv2` crate only declares. The first build downloads a pinned
+libmpv build into `third_party/mpv` (checked against its SHA-256; see `build/libmpv.rs`) and
+later builds reuse it. To use a libmpv of your own, or to build offline, set `MPV_LIB_DIR` to a
+folder with `libmpv-2.dll` and `mpv.lib` (Windows) or `libmpv.dylib` and its dylibs (macOS).
 
 ## Architecture
 
@@ -264,5 +261,5 @@ settings stay).
 
 ## Licensing
 
-The prebuilt libmpv in `scripts/fetch-libmpv.sh` (Windows) is a GPL build; the macOS one from
-media-kit is LGPL.
+The prebuilt libmpv the build downloads for Windows (shinchiro's mpv-winbuild-cmake) is a GPL
+build; the macOS one from media-kit is LGPL.

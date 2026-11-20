@@ -2,7 +2,7 @@
 # Builds "Video Player.app" (universal: Apple Silicon and Intel) into
 # target/bundle, with libmpv in Contents/Frameworks, and zips it.
 #   scripts/bundle-macos.sh [version]      version defaults to Cargo.toml's
-# Needs scripts/fetch-libmpv-macos.sh first, and both Rust targets:
+# Needs both Rust targets (the build fetches libmpv itself):
 #   rustup target add aarch64-apple-darwin x86_64-apple-darwin
 # The app is signed ad hoc (no Apple developer certificate), so the first
 # launch of a downloaded copy needs right-click > Open, or:
@@ -12,7 +12,7 @@ set -euo pipefail
 root="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$root"
 version="${1:-$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)}"
-mpv="$root/third_party/mpv"
+mpv="${MPV_LIB_DIR:-$root/third_party/mpv}"
 out="$root/target/bundle"
 app="$out/Video Player.app"
 
