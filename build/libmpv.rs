@@ -29,11 +29,12 @@ pub const WINDOWS: Pinned = Pinned {
     unpack: unpack_windows,
 };
 
-/// media-kit's libmpv-darwin-build: universal (arm64 + x86_64) dylibs with
-/// OpenGL rendering and VideoToolbox decoding, all using @rpath.
+/// libmpv for macOS, built by the VladyslavSan/mpv fork (mpv 0.42, LGPL):
+/// universal (arm64 + x86_64) dylibs with OpenGL rendering and
+/// VideoToolbox decoding, all using @rpath, plus the licenses.
 pub const MACOS: Pinned = Pinned {
-    url: "https://github.com/media-kit/libmpv-darwin-build/releases/download/v0.7.3/libmpv-libs_v0.7.3_macos-universal-video-full.tar.gz",
-    sha256: "f570695d8ba8534835dd4cba0b6e275579c1c22c01a9da0442748ca37e2daac1",
+    url: "https://github.com/VladyslavSan/mpv/releases/download/vp-v0.42.0-1/libmpv-vp-v0.42.0-1-macos-universal.tar.gz",
+    sha256: "0c2fd3572c9128c6629e7e82afd923cf2aa8f6e2d850d7385634ca28c5d32f4e",
     unpack: unpack_macos,
 };
 
@@ -174,38 +175,60 @@ fn import_library(dll: &Path, lib: &Path) -> Result<(), String> {
     Ok(())
 }
 
-/// The .tar.gz has one folder of dylibs; some are symlinks to others.
+/// The .tar.gz has one folder with the dylibs (real files, no symlinks) and
+/// `licenses/<component>/...`; the dylibs go into `dir`, the licenses into
+/// `dir/licenses`.
 fn unpack_macos(archive: &[u8], dir: &Path) -> Result<(), String> {
+    use std::path::Component;
     let failed = |e: io::Error| format!("unpacking libmpv: {e}");
     let mut tar = tar::Archive::new(flate2::read::GzDecoder::new(archive));
-    let mut links = Vec::new();
     for entry in tar.entries().map_err(failed)? {
         let mut entry = entry.map_err(failed)?;
         let path = entry.path().map_err(failed)?.into_owned();
-        let Some(name) = path.file_name().and_then(|n| n.to_str()).map(String::from) else {
-            continue;
-        };
-        // Only the dylibs in the top folder.
-        if !name.ends_with(".dylib") || path.components().count() != 2 {
+        let kind = entry.header().entry_type();
+        if matches!(kind, tar::EntryType::Symlink | tar::EntryType::Link) {
+            return Err(format!(
+                "libmpv's archive has a link ({}); it should hold only real files",
+                path.display()
+            ));
+        }
+        // macOS's tar stores extended attributes as `._name` files beside
+        // the real ones; they aren't libraries.
+        if path
+            .file_name()
+            .is_some_and(|name| name.to_string_lossy().starts_with("._"))
+        {
             continue;
         }
-        match entry.header().entry_type() {
-            tar::EntryType::Regular => {
-                let mut file = fs::File::create(dir.join(&name)).map_err(failed)?;
-                io::copy(&mut entry, &mut file).map_err(failed)?;
+        // Without the top folder.
+        let parts: Vec<_> = path.components().skip(1).collect();
+        let Some(Component::Normal(first)) = parts.first() else {
+            continue;
+        };
+        let target = if parts.len() == 1 && first.to_string_lossy().ends_with(".dylib") {
+            dir.join(first)
+        } else if *first == "licenses" {
+            if parts.iter().any(|c| !matches!(c, Component::Normal(_))) {
+                return Err(format!(
+                    "unexpected path in libmpv's archive: {}",
+                    path.display()
+                ));
             }
-            tar::EntryType::Symlink => {
-                if let Some(target) = entry.link_name().map_err(failed)? {
-                    links.push((name, target.into_owned()));
+            dir.join(parts.iter().collect::<PathBuf>())
+        } else {
+            continue;
+        };
+        match kind {
+            tar::EntryType::Directory => fs::create_dir_all(&target).map_err(failed)?,
+            tar::EntryType::Regular => {
+                if let Some(parent) = target.parent() {
+                    fs::create_dir_all(parent).map_err(failed)?;
                 }
+                let mut file = fs::File::create(&target).map_err(failed)?;
+                io::copy(&mut entry, &mut file).map_err(failed)?;
             }
             _ => {}
         }
-    }
-    for (name, target) in links {
-        let target = dir.join(target.file_name().unwrap_or_default());
-        fs::copy(&target, dir.join(&name))
-            .map_err(|e| format!("{name} points at {}: {e}", target.display()))?;
     }
     if !dir.join("libmpv.dylib").exists() {
         return Err("libmpv.dylib isn't in the archive".into());

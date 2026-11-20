@@ -34,7 +34,7 @@ The app uses a single window, with the video below GPUI's UI.
 - **macOS:** mpv's `--wid` embedding isn't available there, so mpv draws through its render API
   into an OpenGL layer in a view below GPUI's Metal view, which is transparent wherever the UI
   doesn't draw. Decoding still uses VideoToolbox. libmpv comes from
-  [media-kit's builds](https://github.com/media-kit/libmpv-darwin-build) (universal, with all its
+  [VladyslavSan/mpv's builds](https://github.com/VladyslavSan/mpv) (universal, with all its
   libraries in the app).
 
 ## Jellyfin
@@ -264,4 +264,6 @@ settings stay).
 The prebuilt libmpv the build downloads for Windows is mpv's official LGPL build (LGPLv3) from the
 [mpv v0.42.0 release](https://github.com/mpv-player/mpv/releases/tag/v0.42.0), which is built
 with FFmpeg from [BtbN's FFmpeg-Builds](https://github.com/BtbN/FFmpeg-Builds). Its `LICENSE.LGPL`
-ships next to `libmpv-2.dll` in the Windows download. The macOS one from media-kit is LGPL.
+ships next to `libmpv-2.dll` in the Windows download. The macOS one is built by
+[github.com/VladyslavSan/mpv](https://github.com/VladyslavSan/mpv) (branch `videoplayer/0.42`,
+release `vp-v0.42.0-1`) and is LGPL-2.1-or-later; its source is attached to that release.

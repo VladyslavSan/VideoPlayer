@@ -29,6 +29,10 @@ lipo -create -output "$exe" \
 # Development builds also look for libmpv in third_party/mpv; the app doesn't.
 install_name_tool -delete_rpath "$mpv" "$exe"
 cp "$mpv"/*.dylib "$app/Contents/Frameworks/"
+# libmpv's license texts (and its libraries') travel with the app.
+if [ -d "$mpv/licenses" ]; then
+  cp -R "$mpv/licenses" "$app/Contents/Resources/Licenses"
+fi
 
 # Icon: assets/app.png (1024 px) at every size macOS asks for.
 iconset="$out/AppIcon.iconset"

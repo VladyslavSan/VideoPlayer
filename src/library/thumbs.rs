@@ -68,10 +68,6 @@ mod tests {
     use super::*;
 
     #[test]
-    #[cfg_attr(
-        target_os = "macos",
-        ignore = "the pinned Mac libmpv has no scale filter and no image encoder"
-    )]
     fn thumbnail_of_a_local_clip_has_the_thumbnail_width() {
         let Some((dir, clip)) = crate::test_clip::make() else {
             return;
