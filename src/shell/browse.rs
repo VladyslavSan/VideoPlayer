@@ -569,7 +569,7 @@ impl Shell {
             .left_0()
             .right_0()
             .h(px(SORT_BAR_HEIGHT))
-            .bg(rgba(super::HEADER_BG))
+            .bg(super::bar_fade(0.0, super::BAR_JOIN_OPACITY, 0.0))
             .occlude()
             .flex()
             .items_center()

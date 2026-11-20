@@ -55,8 +55,30 @@ const ERROR: u32 = 0xff7a7a;
 /// The bar at the top (search, Refresh, Settings). It floats over the page,
 /// which scrolls on underneath it, seen through the bar.
 const HEADER_HEIGHT: f32 = 80.0;
-/// How much of the page shows through the bar (its background's opacity).
-const HEADER_BG: u32 = (BG << 8) | 0xb8;
+/// The bar is near solid at the top and fades out to nothing at its
+/// bottom edge (or at the sort bar's, on a library grid).
+const BAR_TOP_OPACITY: f32 = 0.97;
+/// Where the bar starts to fade, as a share of the header's height.
+const BAR_FADE_START: f32 = 0.3;
+/// The opacity where the header meets a sort bar below it.
+const BAR_JOIN_OPACITY: f32 = 0.6;
+
+/// The page colour at `opacity`, for the fading bar.
+fn bar_tint(opacity: f32) -> gpui::Hsla {
+    let mut color: gpui::Hsla = rgb(BG).into();
+    color.a = opacity;
+    color
+}
+
+/// A top-to-bottom fade of the page colour, `from` (solid until `start`,
+/// a share of the height) to `to`.
+fn bar_fade(start: f32, from: f32, to: f32) -> gpui::Background {
+    gpui::linear_gradient(
+        180.0,
+        gpui::linear_color_stop(bar_tint(from), start),
+        gpui::linear_color_stop(bar_tint(to), 1.0),
+    )
+}
 const CARD_WIDTH: f32 = 256.0;
 const CARD_HEIGHT: f32 = 144.0;
 const CONTINUE_LIMIT: usize = 12;
@@ -1777,6 +1799,13 @@ impl Shell {
             None
         };
         let can_refresh = !self.roots.is_empty() || !self.servers.is_empty();
+        // On a library grid the sort bar carries the fade on below.
+        let sort_bar_below = Grid::of(&self.screen).is_some() && self.search_query(cx).is_empty();
+        let fades_to = if sort_bar_below {
+            BAR_JOIN_OPACITY
+        } else {
+            0.0
+        };
         div()
             .id("header")
             .absolute()
@@ -1784,7 +1813,7 @@ impl Shell {
             .left_0()
             .right_0()
             .h(px(HEADER_HEIGHT))
-            .bg(rgba(HEADER_BG))
+            .bg(bar_fade(BAR_FADE_START, BAR_TOP_OPACITY, fades_to))
             // Clicks on the bar itself don't reach the page under it.
             .occlude()
             .flex()
