@@ -11,9 +11,9 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use anyhow::{Context as _, Result, bail};
 use gpui::{
     Animation, AnimationExt as _, AnyElement, Bounds, ClickEvent, Context, ElementId, Entity,
-    FocusHandle, Focusable, FontWeight, KeyDownEvent, MouseButton, MouseDownEvent, ObjectFit,
+    FocusHandle, Focusable, FontWeight, KeyDownEvent, MouseButton, MouseDownEvent,
     PathPromptOptions, Pixels, ScrollHandle, ScrollStrategy, SharedString, Subscription,
-    UniformListScrollHandle, Window, canvas, div, img, point, prelude::*, px, rgb, rgba,
+    UniformListScrollHandle, Window, canvas, div, point, prelude::*, px, rgb, rgba,
 };
 
 use crate::introdb;
@@ -39,9 +39,11 @@ mod finder;
 mod keynav;
 mod live;
 mod offline;
+mod pictures;
 mod posters;
 mod releases;
 mod reports;
+mod resize;
 mod settings;
 mod sonarr;
 mod sync;
@@ -426,6 +428,10 @@ pub struct Shell {
     page_generation: usize,
     /// What the page has shown so far, for fading in what comes later.
     revealed: RefCell<arriving::Revealed>,
+    /// Cards' pictures, for dissolving each in when it arrives.
+    pictures: RefCell<pictures::Pictures>,
+    /// Boxes easing to a new height.
+    heights: resize::Heights,
     leaving: Option<Leaving>,
     /// How bright posters are at rest and lit.
     poster_light: Cell<posters::Light>,
@@ -551,6 +557,8 @@ impl Shell {
             columns_hint: Cell::new(4),
             page_generation: 0,
             revealed: RefCell::default(),
+            pictures: RefCell::default(),
+            heights: resize::Heights::default(),
             leaving: None,
             poster_light: Cell::new(poster_light),
             card_hover: RefCell::default(),
@@ -2178,14 +2186,7 @@ impl Shell {
                 .child(initial.clone())
                 .into_any_element()
         };
-        let art: AnyElement = match thumb {
-            Some(path) => img(path)
-                .size_full()
-                .object_fit(ObjectFit::Cover)
-                .with_fallback(placeholder)
-                .into_any_element(),
-            None => placeholder(),
-        };
+        let art = self.card_picture(&id, thumb, placeholder, cx);
 
         div()
             .id(id)
@@ -2648,6 +2649,7 @@ impl Shell {
         if self.scrolled_screen.as_ref() != Some(&self.screen) {
             self.page_generation += 1;
             self.revealed.borrow_mut().page_opened();
+            self.heights.page_opened();
             self.start_leaving(cx);
             if let (Some(old), Some(cursor)) = (self.scrolled_screen.take(), self.cursor.take()) {
                 self.cursors.retain(|(screen, _)| *screen != old);

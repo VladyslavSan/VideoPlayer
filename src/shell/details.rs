@@ -203,6 +203,7 @@ impl Shell {
     /// it arrives (a small picture first, the full backdrop once fetched),
     /// so one never cuts to another.
     pub(super) fn hero(
+        &self,
         height: f32,
         images: Vec<PathBuf>,
         title: String,
@@ -250,18 +251,38 @@ impl Shell {
                     .bottom_8()
                     .flex()
                     .flex_col()
-                    .gap_2()
                     .child(div().text_3xl().font_weight(FontWeight::BOLD).child(title))
+                    // Details arriving add to the facts and bring a tagline:
+                    // the facts dissolve into the longer ones, and the room
+                    // for the tagline opens up (the title rising) as it
+                    // fades in.
                     .when(!facts.is_empty(), |d| {
                         d.child(
-                            div()
-                                .text_sm()
-                                .text_color(rgb(0xc9ceda))
-                                .child(facts.join("  ·  ")),
+                            self.changing_text("hero-facts", facts.join("  ·  "), |facts| {
+                                div()
+                                    .pt_2()
+                                    .text_sm()
+                                    .text_color(rgb(0xc9ceda))
+                                    .child(facts)
+                            }),
                         )
                     })
-                    .children(
-                        tagline.map(|t| div().text_sm().italic().text_color(rgb(MUTED)).child(t)),
+                    .child(
+                        self.resizing(
+                            "hero-tagline",
+                            match tagline {
+                                Some(tagline) => self.arriving(
+                                    "hero-tagline",
+                                    div()
+                                        .pt_2()
+                                        .text_sm()
+                                        .italic()
+                                        .text_color(rgb(MUTED))
+                                        .child(tagline),
+                                ),
+                                None => div().into_any_element(),
+                            },
+                        ),
                     ),
             )
             .into_any_element()
@@ -310,7 +331,8 @@ impl Shell {
                 .child(text)
         };
         let note = || paragraph("Loading details…".into(), MUTED);
-        Some(match details.and_then(|d| d.overview.clone()) {
+        // From one line to several: the box grows to fit, not in one jump.
+        let text = match details.and_then(|d| d.overview.clone()) {
             Some(text) => self.arriving_over(
                 "overview-loading",
                 note(),
@@ -319,7 +341,8 @@ impl Shell {
             ),
             None if loading => self.waiting("overview-loading", note()),
             None => return None,
-        })
+        };
+        Some(self.resizing("overview-box", text))
     }
 
     fn info_row(label: &str, values: Vec<String>) -> Option<AnyElement> {
@@ -368,7 +391,7 @@ impl Shell {
             .collect();
         images.dedup();
         let images = Self::ready_pictures(images, window, cx);
-        let mut page = vec![Self::hero(
+        let mut page = vec![self.hero(
             HERO_HEIGHT,
             images,
             item.title.clone(),
@@ -498,7 +521,7 @@ impl Shell {
         div()
             .flex()
             .flex_col()
-            .child(Self::hero(
+            .child(self.hero(
                 SHOW_HERO_HEIGHT,
                 Self::ready_pictures(image.into_iter().collect(), window, cx),
                 show.to_string(),

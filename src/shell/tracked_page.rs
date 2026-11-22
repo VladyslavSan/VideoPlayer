@@ -89,7 +89,7 @@ impl Shell {
                     .join(", "),
             );
         }
-        let hero = Self::hero(SHOW_HERO_HEIGHT, images, item.title.clone(), facts, None);
+        let hero = self.hero(SHOW_HERO_HEIGHT, images, item.title.clone(), facts, None);
 
         let mut actions = Vec::new();
         if kind == Kind::Radarr {

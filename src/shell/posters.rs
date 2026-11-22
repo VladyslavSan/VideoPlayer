@@ -438,7 +438,7 @@ impl Shell {
 }
 
 /// The timings' sliders' ids, one per `motion::TIMINGS`.
-const TIMING_SLIDERS: [&str; 7] = [
+const TIMING_SLIDERS: [&str; 8] = [
     "setting-timing-0",
     "setting-timing-1",
     "setting-timing-2",
@@ -446,6 +446,7 @@ const TIMING_SLIDERS: [&str; 7] = [
     "setting-timing-4",
     "setting-timing-5",
     "setting-timing-6",
+    "setting-timing-7",
 ];
 
 /// Reads the saved timings (Settings > Appearance > Animation).

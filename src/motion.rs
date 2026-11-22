@@ -104,7 +104,18 @@ pub static WAIT: Timing = Timing::new(
     400,
 );
 
-pub static TIMINGS: [&Timing; 7] = [&PAGE, &PICTURE, &APPEAR, &WAIT, &FOLD, &HOVER, &WHEEL];
+/// Something on a page growing or shrinking to its new size (a loading
+/// note turning into a long description).
+pub static RESIZE: Timing = Timing::new(
+    "motion_resize_ms",
+    "Size change",
+    "Something on a page growing or shrinking when what it shows changes.",
+    350,
+);
+
+pub static TIMINGS: [&Timing; 8] = [
+    &PAGE, &PICTURE, &APPEAR, &RESIZE, &WAIT, &FOLD, &HOVER, &WHEEL,
+];
 
 /// `base`, stretched by `VIDEO_PLAYER_MOTION_SCALE` (tests slow animations
 /// down to see them midway).

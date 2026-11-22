@@ -27,6 +27,8 @@ pub(super) struct Revealed {
     waits: HashMap<SharedString, Instant>,
     /// How visible a note was when what it waited for arrived.
     replaced: HashMap<SharedString, f32>,
+    /// Text that changes in place: what it says, what it said, since when.
+    texts: HashMap<SharedString, (SharedString, Option<SharedString>, Instant)>,
 }
 
 impl Revealed {
@@ -36,6 +38,7 @@ impl Revealed {
         self.seen.clear();
         self.waits.clear();
         self.replaced.clear();
+        self.texts.clear();
     }
 
     /// How visible the loading note `id` is now (0 if it never showed).
@@ -70,6 +73,66 @@ fn note_opacity(elapsed: f32, delay: f32, fade: f32) -> f32 {
 }
 
 impl Shell {
+    /// Text that can change while it's on screen (a status, a label): when
+    /// it does, the old text fades out as the new fades in. `draw` styles
+    /// either.
+    pub(super) fn changing_text<E>(
+        &self,
+        id: impl Into<SharedString>,
+        text: impl Into<SharedString>,
+        draw: impl Fn(SharedString) -> E,
+    ) -> AnyElement
+    where
+        E: IntoElement + Styled + 'static,
+    {
+        let id = id.into();
+        let text = text.into();
+        if !crate::motion::enabled() || self.drawing_leaving.get() {
+            return draw(text).into_any_element();
+        }
+        let (before, at) = {
+            let mut revealed = self.revealed.borrow_mut();
+            let entry = revealed
+                .texts
+                .entry(id.clone())
+                .or_insert_with(|| (text.clone(), None, Instant::now()));
+            if entry.0 != text {
+                *entry = (text.clone(), Some(entry.0.clone()), Instant::now());
+            }
+            (entry.1.clone(), entry.2)
+        };
+        let Some(before) = before.filter(|_| at.elapsed() < APPEAR.time()) else {
+            return draw(text).into_any_element();
+        };
+        let key = |text: &SharedString| {
+            use std::hash::{Hash, Hasher};
+            let mut hasher = std::collections::hash_map::DefaultHasher::new();
+            text.hash(&mut hasher);
+            hasher.finish()
+        };
+        let fade = || Animation::new(APPEAR.time()).with_easing(crate::motion::ease_in_out);
+        div()
+            .relative()
+            .min_w(gpui::px(0.0))
+            .child(draw(text.clone()).with_animation(
+                SharedString::from(format!("text-in-{id}-{}", key(&text))),
+                fade(),
+                |text, t| text.opacity(t),
+            ))
+            .child(
+                draw(before.clone())
+                    .absolute()
+                    .top_0()
+                    .left_0()
+                    .with_animation(
+                        SharedString::from(format!("text-out-{id}-{}", key(&before))),
+                        fade(),
+                        |text, t| text.opacity(1.0 - t),
+                    ),
+            )
+            .into_any_element()
+    }
+
     /// `content`, fading in if it arrived after the page opened. `id` names
     /// it on the page (say which state it shows, if it changes).
     pub(super) fn arriving<E>(&self, id: impl Into<SharedString>, content: E) -> AnyElement
