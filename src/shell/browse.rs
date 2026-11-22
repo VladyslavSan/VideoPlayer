@@ -435,8 +435,10 @@ impl Shell {
     }
 
     pub(super) fn set_tab(&mut self, screen: Screen, cx: &mut Context<Self>) {
-        if screen == Screen::Downloads {
-            self.refresh_downloads(cx);
+        match screen {
+            Screen::Downloads => self.refresh_downloads(cx),
+            Screen::Arr(_, kind) => self.arr_page_opened(kind, cx),
+            _ => {}
         }
         self.tab = screen.clone();
         self.screen = screen;
@@ -861,6 +863,11 @@ impl Shell {
                     None => format!("side-{key}-{label}"),
                 };
                 children.push(entry(id.into(), label, screen, true, false, cx));
+            }
+            if let Some(server) = source.origin {
+                for (_, kind, _) in self.arr_apps().into_iter().filter(|(s, ..)| *s == server) {
+                    children.push(self.arr_entry(server, kind, cx));
+                }
             }
         }
         let mut sidebar = div()

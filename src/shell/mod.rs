@@ -28,6 +28,7 @@ use crate::secrets;
 use crate::ui::menu;
 use crate::ui::text_input::TextInput;
 
+mod arr_page;
 mod arr_settings;
 mod browse;
 mod controls_page;
@@ -202,6 +203,8 @@ enum Screen {
     Details(String),
     /// What Sonarr and Radarr are downloading.
     Downloads,
+    /// A server's Sonarr or Radarr: adding to it, and what it's doing.
+    Arr(i64, crate::arr::Kind),
     Settings,
 }
 
@@ -299,6 +302,10 @@ pub struct Shell {
     movie_sort: Sort,
     show_sort: Sort,
     search: Entity<TextInput>,
+    /// The name fields on the Sonarr and Radarr pages (in `Kind::ALL` order).
+    arr_search: [Entity<TextInput>; 2],
+    /// Library titles, for finding what a download is of.
+    title_index: RefCell<Option<Rc<downloads::TitleIndex>>>,
     /// Details pages' extra information, by item key or `show:<name>`.
     details: HashMap<String, Details>,
     details_loading: HashSet<String>,
@@ -427,6 +434,19 @@ impl Shell {
             cx.notify();
         })
         .detach();
+        let arr_search = crate::arr::Kind::ALL.map(|kind| {
+            let noun = match kind {
+                crate::arr::Kind::Sonarr => "show",
+                crate::arr::Kind::Radarr => "movie",
+            };
+            let input = cx.new(|cx| TextInput::new(format!("Name of the {noun}"), false, cx));
+            cx.observe(&input, |this, _, cx| {
+                this.search_changed(cx);
+                cx.notify();
+            })
+            .detach();
+            input
+        });
         let mut shell = Self {
             db,
             paths,
@@ -440,6 +460,8 @@ impl Shell {
             movie_sort: Sort::Title,
             show_sort: Sort::RecentlyWatched,
             search,
+            arr_search,
+            title_index: RefCell::new(None),
             details: HashMap::new(),
             details_loading: HashSet::new(),
             quality_menu: None,
@@ -1725,11 +1747,17 @@ impl Shell {
                 | Screen::Source(_)
                 | Screen::Movies(_)
                 | Screen::Shows(_)
-                | Screen::Downloads,
+                | Screen::Downloads
+                | Screen::Arr(..),
                 "escape",
             ) => {
                 // Clear the search and leave the field.
                 self.search.update(cx, |input, cx| input.set_text("", cx));
+                if let Screen::Arr(_, kind) = self.screen {
+                    self.arr_input(kind)
+                        .clone()
+                        .update(cx, |input, cx| input.set_text("", cx));
+                }
                 window.focus(&self.focus);
                 cx.notify();
             }
@@ -1738,7 +1766,8 @@ impl Shell {
                 | Screen::Source(_)
                 | Screen::Movies(_)
                 | Screen::Shows(_)
-                | Screen::Downloads,
+                | Screen::Downloads
+                | Screen::Arr(..),
                 "f",
             ) if event.keystroke.modifiers.secondary() => {
                 window.focus(&self.search.focus_handle(cx));
@@ -1851,7 +1880,8 @@ impl Shell {
             | Screen::Source(_)
             | Screen::Movies(_)
             | Screen::Shows(_)
-            | Screen::Downloads => solid(self.search_field()),
+            | Screen::Downloads
+            | Screen::Arr(..) => solid(self.search_field()),
             Screen::Show(_) | Screen::Details(_) => back(self, cx),
             Screen::Settings => div()
                 .flex()
@@ -2782,6 +2812,7 @@ impl Render for Shell {
             Screen::Movies(_) | Screen::Shows(_) => !self.library_screens().contains(&self.screen),
             Screen::Source(origin) => !self.sources().iter().any(|s| s.origin == *origin),
             Screen::Downloads => self.arr_apps().is_empty(),
+            Screen::Arr(server, kind) => self.arr_client(*server, *kind).is_none(),
             _ => false,
         };
         if gone {
@@ -2802,6 +2833,7 @@ impl Render for Shell {
                 | Screen::Movies(_)
                 | Screen::Shows(_)
                 | Screen::Downloads
+                | Screen::Arr(..)
         );
         let body: Result<Vec<AnyElement>, AnyElement> = match self.screen.clone() {
             _ if on_tab && !query.is_empty() => Ok(self.search_results(&query, cx)),
@@ -2814,6 +2846,7 @@ impl Render for Shell {
             Screen::Show(name) => Ok(self.show_page(&name, cx)),
             Screen::Details(key) => Ok(self.details_page(&key, cx)),
             Screen::Downloads => Ok(self.downloads_page(cx)),
+            Screen::Arr(server, kind) => Ok(self.arr_page(server, kind, cx)),
             Screen::Settings => Err(self.settings_view(window, cx)),
         };
         // Sections scroll as one page; the grids scroll (and virtualize) themselves.

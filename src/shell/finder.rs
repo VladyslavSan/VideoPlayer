@@ -14,7 +14,7 @@ use gpui::{
     rgb, rgba,
 };
 
-use super::{ACCENT, ERROR, MUTED, Shell, TEXT};
+use super::{ACCENT, ERROR, MUTED, Screen, Shell, TEXT};
 use crate::arr::{AddOptions, Candidate, Kind, Monitor, Setup, Subject};
 
 /// Typing stops for this long before the apps are asked.
@@ -27,7 +27,7 @@ const POSTER_W: f32 = 72.0;
 const POSTER_H: f32 = 108.0;
 const ADDED: u32 = 0x7ad89a;
 
-type AppKey = (i64, Kind);
+pub(super) type AppKey = (i64, Kind);
 type ResultKey = (i64, Kind, i64);
 
 enum Lookup {
@@ -61,6 +61,9 @@ enum Poster {
 pub(super) struct Finder {
     /// What was last typed (and is, or will be, looked up).
     query: String,
+    /// Which app it's looked up in: one (typed on its page) or all (None,
+    /// typed in the search field).
+    scope: Option<AppKey>,
     lookups: HashMap<AppKey, Lookup>,
     setups: HashMap<AppKey, SetupState>,
     form: Option<AddForm>,
@@ -132,14 +135,28 @@ pub(super) fn chips(
 }
 
 impl Shell {
-    /// After each change to the search field: looks the name up in the
-    /// apps once typing settles.
+    /// After each change to the search field: looks the name up in every
+    /// app once typing settles. With the field empty on an app's page, the
+    /// page's own field counts.
     pub(super) fn search_changed(&mut self, cx: &mut Context<Self>) {
         let query = self.search_query(cx);
-        if query == self.finder.query {
+        if query.is_empty()
+            && let Screen::Arr(server, kind) = self.screen
+        {
+            let own = self.arr_input(kind).read(cx).text().trim().to_string();
+            return self.find(own, Some((server, kind)), cx);
+        }
+        self.find(query, None, cx);
+    }
+
+    /// Looks `query` up in the apps (`scope`: in just that one) once typing
+    /// settles.
+    pub(super) fn find(&mut self, query: String, scope: Option<AppKey>, cx: &mut Context<Self>) {
+        if query == self.finder.query && scope == self.finder.scope {
             return;
         }
         self.finder.query = query.clone();
+        self.finder.scope = scope;
         self.finder.lookups.clear();
         self.finder.form = None;
         if query.chars().count() < MIN_QUERY || self.arr_apps().is_empty() {
@@ -148,7 +165,7 @@ impl Shell {
         cx.spawn(async move |this, cx| {
             cx.background_executor().timer(SETTLE).await;
             this.update(cx, |this, cx| {
-                if this.finder.query == query {
+                if this.finder.query == query && this.finder.scope == scope {
                     this.look_up(query, cx);
                 }
             })
@@ -158,7 +175,11 @@ impl Shell {
     }
 
     fn look_up(&mut self, query: String, cx: &mut Context<Self>) {
+        let scope = self.finder.scope;
         for (server, kind, client) in self.arr_apps() {
+            if scope.is_some_and(|key| key != (server, kind)) {
+                continue;
+            }
             let key = (server, kind);
             self.finder.lookups.insert(key, Lookup::Searching);
             self.load_setup(key, cx);
@@ -171,7 +192,7 @@ impl Shell {
                     .await;
                 this.update(cx, |this, cx| {
                     // Typed on since: no longer wanted.
-                    if this.finder.query != query {
+                    if this.finder.query != query || this.finder.scope != scope {
                         return;
                     }
                     let lookup = match result {
@@ -398,38 +419,15 @@ impl Shell {
 
     /// The end of the search results: what the apps found.
     pub(super) fn finder_sections(&self, cx: &mut Context<Self>) -> Vec<AnyElement> {
-        let query = &self.finder.query;
-        if query.chars().count() < MIN_QUERY {
+        if self.finder.scope.is_some() || self.finder.query.chars().count() < MIN_QUERY {
             return Vec::new();
         }
         let apps = self.arr_apps();
         let mut servers: Vec<i64> = apps.iter().map(|(s, ..)| *s).collect();
         servers.dedup();
-        let note = |text: String, color: u32| {
-            div()
-                .text_sm()
-                .text_color(rgb(color))
-                .child(text)
-                .into_any_element()
-        };
         let mut sections = Vec::new();
         for (server, kind, _) in apps {
-            let key = (server, kind);
-            let body: Vec<AnyElement> = match self.finder.lookups.get(&key) {
-                None | Some(Lookup::Searching) => {
-                    vec![note(format!("Searching {}…", kind.name()), MUTED)]
-                }
-                Some(Lookup::Failed(e)) => vec![note(e.to_string(), ERROR)],
-                Some(Lookup::Ready(found)) if found.is_empty() => vec![note(
-                    format!("{} found nothing called “{query}”.", kind.name()),
-                    MUTED,
-                )],
-                Some(Lookup::Ready(found)) => found
-                    .iter()
-                    .take(SHOWN)
-                    .map(|c| self.candidate_row(server, kind, c, cx))
-                    .collect(),
-            };
+            let body = self.finder_rows((server, kind), cx);
             let title = if servers.len() > 1 {
                 format!(
                     "Add a {} to {} ({})",
@@ -446,6 +444,41 @@ impl Shell {
             ));
         }
         sections
+    }
+
+    /// What one app found for the query: its results, or why there are none.
+    pub(super) fn finder_rows(&self, key: AppKey, cx: &mut Context<Self>) -> Vec<AnyElement> {
+        let (server, kind) = key;
+        let query = &self.finder.query;
+        let note = |text: String, color: u32| {
+            div()
+                .text_sm()
+                .text_color(rgb(color))
+                .child(text)
+                .into_any_element()
+        };
+        match self.finder.lookups.get(&key) {
+            None | Some(Lookup::Searching) => {
+                vec![note(format!("Searching {}…", kind.name()), MUTED)]
+            }
+            Some(Lookup::Failed(e)) => vec![note(e.to_string(), ERROR)],
+            Some(Lookup::Ready(found)) if found.is_empty() => vec![note(
+                format!("{} found nothing called “{query}”.", kind.name()),
+                MUTED,
+            )],
+            Some(Lookup::Ready(found)) => found
+                .iter()
+                .take(SHOWN)
+                .map(|c| self.candidate_row(server, kind, c, cx))
+                .collect(),
+        }
+    }
+
+    /// Whether the results are for this app's own field holding `query`.
+    pub(super) fn finder_shows(&self, key: AppKey, query: &str) -> bool {
+        self.finder.scope == Some(key)
+            && self.finder.query == query
+            && query.chars().count() >= MIN_QUERY
     }
 
     fn candidate_row(

@@ -25,7 +25,7 @@ const RECENT_LIMIT: usize = 20;
 const RECENT_SHOWN: usize = 15;
 const ADDED: u32 = 0x7ad89a;
 
-type AppKey = (i64, Kind);
+use super::finder::AppKey;
 
 #[derive(Default)]
 pub(super) struct Feed {
@@ -49,6 +49,117 @@ impl Downloads {
     pub(super) fn active(&self) -> usize {
         self.feeds.values().map(|f| f.downloads.len()).sum()
     }
+
+    /// One app's downloads in progress.
+    pub(super) fn active_for(&self, key: AppKey) -> usize {
+        self.feeds.get(&key).map_or(0, |f| f.downloads.len())
+    }
+}
+
+/// A title, as compared: letters and digits only, whole and without a
+/// trailing `(…)`.
+struct Title {
+    whole: String,
+    bare: String,
+}
+
+impl Title {
+    fn new(text: &str) -> Self {
+        Self {
+            whole: norm(text),
+            bare: norm(bare(text)),
+        }
+    }
+
+    /// 2 for the same title, 1 for the same but for a trailing `(…)`.
+    fn score(&self, other: &Title) -> u8 {
+        if self.whole == other.whole {
+            2
+        } else if self.bare == other.bare {
+            1
+        } else {
+            0
+        }
+    }
+}
+
+/// The library's show and movie titles by server, for finding what a
+/// download is of: made once per change to the library, not for every
+/// line on every frame (which made the Downloads page scroll slowly).
+pub(super) struct TitleIndex {
+    /// What it was made from: the item lists' lengths and addresses.
+    from: [usize; 4],
+    shows: HashMap<i64, Vec<(Title, String)>>,
+    /// Title, year and item key.
+    movies: HashMap<i64, Vec<(Title, Option<u16>, String)>>,
+}
+
+impl TitleIndex {
+    fn new<'a>(from: [usize; 4], items: impl Iterator<Item = &'a crate::library::Item>) -> Self {
+        let mut shows: HashMap<i64, Vec<(Title, String)>> = HashMap::new();
+        let mut seen: HashSet<(i64, &str)> = HashSet::new();
+        let mut movies: HashMap<i64, Vec<(Title, Option<u16>, String)>> = HashMap::new();
+        for item in items {
+            let Source::Jellyfin { server, .. } = item.source else {
+                continue;
+            };
+            match item.show.as_deref() {
+                Some(show) => {
+                    if seen.insert((server, show)) {
+                        shows
+                            .entry(server)
+                            .or_default()
+                            .push((Title::new(show), show.to_string()));
+                    }
+                }
+                None => movies.entry(server).or_default().push((
+                    Title::new(&item.title),
+                    item.year,
+                    item.key(),
+                )),
+            }
+        }
+        Self {
+            from,
+            shows,
+            movies,
+        }
+    }
+
+    fn target(&self, server: i64, subject: &Subject) -> Option<Target> {
+        match subject {
+            Subject::Episodes { show, episodes, .. } => {
+                let wanted = Title::new(show);
+                let name = self
+                    .shows
+                    .get(&server)?
+                    .iter()
+                    .map(|(title, name)| (title.score(&wanted), name))
+                    .filter(|(score, _)| *score > 0)
+                    .max_by_key(|(score, _)| *score)?
+                    .1
+                    .clone();
+                let first = episodes.first().map(|(s, ..)| *s);
+                let season = first.filter(|s| episodes.iter().all(|(n, ..)| n == s));
+                Some(Target::Show(name, season))
+            }
+            Subject::Movie { title, year } => {
+                let wanted = Title::new(title);
+                self.movies
+                    .get(&server)?
+                    .iter()
+                    .filter(|(_, y, _)| match (y, year) {
+                        (Some(a), Some(b)) => i32::from(*a) == *b,
+                        _ => true,
+                    })
+                    .map(|(t, _, key)| (t.score(&wanted), key))
+                    .filter(|(score, _)| *score > 0)
+                    .max_by_key(|(score, _)| *score)
+                    .map(|(_, key)| Target::Movie(key.clone()))
+            }
+            Subject::Unknown(_) => None,
+        }
+    }
 }
 
 /// Where a line on the page leads in the library.
@@ -71,17 +182,6 @@ fn bare(text: &str) -> &str {
     match text.rfind(" (") {
         Some(at) if text.ends_with(')') => text[..at].trim(),
         _ => text,
-    }
-}
-
-/// The same title, exactly or but for a trailing `(…)`.
-fn same_title(a: &str, b: &str) -> u8 {
-    if norm(a) == norm(b) {
-        2
-    } else if norm(bare(a)) == norm(bare(b)) {
-        1
-    } else {
-        0
     }
 }
 
@@ -129,7 +229,7 @@ impl Shell {
             loop {
                 cx.background_executor().timer(LOOKING).await;
                 let alive = this.update(cx, |this, cx| {
-                    let every = if this.screen == Screen::Downloads {
+                    let every = if matches!(this.screen, Screen::Downloads | Screen::Arr(..)) {
                         LOOKING
                     } else {
                         AWAY
@@ -217,34 +317,24 @@ impl Shell {
 
     /// The show or movie in the server's library a line is about.
     pub(super) fn library_target(&self, server: i64, subject: &Subject) -> Option<Target> {
-        let on_server = self
-            .items()
-            .filter(|i| matches!(i.source, Source::Jellyfin { server: s, .. } if s == server));
-        match subject {
-            Subject::Episodes { show, episodes, .. } => {
-                let name = on_server
-                    .filter_map(|i| i.show.as_deref())
-                    .map(|name| (same_title(name, show), name))
-                    .filter(|(score, _)| *score > 0)
-                    .max_by_key(|(score, _)| *score)?
-                    .1
-                    .to_string();
-                let first = episodes.first().map(|(s, ..)| *s);
-                let season = first.filter(|s| episodes.iter().all(|(n, ..)| n == s));
-                Some(Target::Show(name, season))
+        let from = [
+            self.local.len(),
+            self.remote.len(),
+            self.local.as_ptr() as usize,
+            self.remote.as_ptr() as usize,
+        ];
+        let index = {
+            let mut cached = self.title_index.borrow_mut();
+            match &*cached {
+                Some(index) if index.from == from => index.clone(),
+                _ => {
+                    let index = std::rc::Rc::new(TitleIndex::new(from, self.items()));
+                    *cached = Some(index.clone());
+                    index
+                }
             }
-            Subject::Movie { title, year } => on_server
-                .filter(|i| i.show.is_none())
-                .filter(|i| match (i.year, year) {
-                    (Some(a), Some(b)) => i32::from(a) == *b,
-                    _ => true,
-                })
-                .map(|i| (same_title(&i.title, title), i))
-                .filter(|(score, _)| *score > 0)
-                .max_by_key(|(score, _)| *score)
-                .map(|(_, i)| Target::Movie(i.key())),
-            Subject::Unknown(_) => None,
-        }
+        };
+        index.target(server, subject)
     }
 
     pub(super) fn open_target(&mut self, target: &Target, cx: &mut Context<Self>) {
@@ -460,6 +550,54 @@ impl Shell {
         )
     }
 
+    /// One app's Downloading and Recently, for its page.
+    pub(super) fn app_activity(&self, key: AppKey, cx: &mut Context<Self>) -> Vec<AnyElement> {
+        let (server, kind) = key;
+        let note = |text: String, color: u32| {
+            div()
+                .text_sm()
+                .text_color(rgb(color))
+                .child(text)
+                .into_any_element()
+        };
+        let feed = self.downloads.feeds.get(&key);
+        let mut downloading: Vec<AnyElement> = feed
+            .and_then(|f| f.error.as_ref())
+            .map(|e| note(e.to_string(), ERROR))
+            .into_iter()
+            .collect();
+        match feed {
+            None => downloading.push(note(format!("Asking {}…", kind.name()), MUTED)),
+            Some(feed) if feed.loaded && feed.downloads.is_empty() => {
+                downloading.push(note("Nothing is downloading right now.".into(), MUTED));
+            }
+            Some(feed) => {
+                for download in &feed.downloads {
+                    downloading.push(self.download_row(server, kind, download, cx));
+                }
+            }
+        }
+        let mut sections = vec![Self::section(
+            "Downloading",
+            div().flex().flex_col().gap_2().children(downloading),
+        )];
+        let now = super::now();
+        let recent: Vec<AnyElement> = feed
+            .map(|f| f.recent.as_slice())
+            .unwrap_or_default()
+            .iter()
+            .take(RECENT_SHOWN)
+            .map(|r| self.recent_row(server, kind, r, now, cx))
+            .collect();
+        if !recent.is_empty() {
+            sections.push(Self::section(
+                "Recently",
+                div().flex().flex_col().gap_2().children(recent),
+            ));
+        }
+        sections
+    }
+
     pub(super) fn downloads_page(&self, cx: &mut Context<Self>) -> Vec<AnyElement> {
         let note = |text: String, color: u32| {
             div()
@@ -552,10 +690,60 @@ mod tests {
 
     #[test]
     fn titles_match_with_or_without_a_country() {
-        assert_eq!(same_title("Shameless (US)", "Shameless (US)"), 2);
-        assert_eq!(same_title("Shameless", "Shameless (US)"), 1);
-        assert_eq!(same_title("Grey's Anatomy", "Greys Anatomy"), 2);
-        assert_eq!(same_title("Shameless", "Shadows"), 0);
+        let score = |a: &str, b: &str| Title::new(a).score(&Title::new(b));
+        assert_eq!(score("Shameless (US)", "Shameless (US)"), 2);
+        assert_eq!(score("Shameless", "Shameless (US)"), 1);
+        assert_eq!(score("Grey's Anatomy", "Greys Anatomy"), 2);
+        assert_eq!(score("Shameless", "Shadows"), 0);
+    }
+
+    #[test]
+    fn downloads_lead_to_the_show_or_movie() {
+        use crate::library::Item;
+        let item = |id: &str, title: &str, show: Option<&str>, year: Option<u16>| Item {
+            library: None,
+            source: Source::Jellyfin {
+                server: 1,
+                id: id.into(),
+            },
+            title: title.into(),
+            year,
+            show: show.map(String::from),
+            season: show.map(|_| 1),
+            episode: show.map(|_| 1),
+            duration: None,
+            position: 0.0,
+            watched: false,
+            last_played: None,
+            thumb: None,
+            added: None,
+        };
+        let items = [
+            item("e1", "Pilot", Some("Shameless (US)"), None),
+            item("e2", "Second", Some("Shameless (US)"), None),
+            item("m1", "Dune", None, Some(1984)),
+            item("m2", "Dune", None, Some(2021)),
+        ];
+        let index = TitleIndex::new([0; 4], items.iter());
+        let episodes = Subject::Episodes {
+            show: "Shameless".into(),
+            year: None,
+            episodes: vec![(11, 1, None), (11, 2, None)],
+        };
+        assert!(matches!(
+            index.target(1, &episodes),
+            Some(Target::Show(name, Some(11))) if name == "Shameless (US)"
+        ));
+        // Another server's library doesn't count.
+        assert!(index.target(2, &episodes).is_none());
+        let dune = Subject::Movie {
+            title: "Dune".into(),
+            year: Some(2021),
+        };
+        assert!(matches!(
+            index.target(1, &dune),
+            Some(Target::Movie(key)) if key == items[3].key()
+        ));
     }
 
     #[test]

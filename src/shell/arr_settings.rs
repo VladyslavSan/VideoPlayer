@@ -230,6 +230,9 @@ impl Shell {
                     form.saved = Some(saved);
                     form.editing = false;
                     this.start_downloads_poll(cx);
+                    // Already polling for another app: this one's count
+                    // shouldn't wait for the next round.
+                    this.refresh_downloads(cx);
                 }
                 cx.notify();
             })
