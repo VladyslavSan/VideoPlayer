@@ -23,7 +23,8 @@ targets are left out. Changes:
   eased out over about 150 ms (`clamp_scroll_position` steps it before clamping and asks for
   another frame). It stops at an end, and when something else moves the offset (a touchpad, the
   app). Touchpads (`ScrollDelta::Pixels`) scroll as before.
-  `gpui::set_smooth_wheel_scrolling(false)` turns it off (the app does, for reduced motion).
+  `gpui::set_smooth_wheel_scrolling(false)` turns it off (the app does, for reduced motion), and
+  `gpui::set_wheel_glide_time` changes how long a step takes (an app setting).
 - Deferred elements keep their parents' opacity: `src/window.rs` (`DeferredDraw.opacity`, set in
   `defer_draw`, applied in `prepaint_deferred_draws` and `paint_deferred_draws`) and
   `src/elements/div.rs` (`Interactivity::prepaint` applies the element's opacity while

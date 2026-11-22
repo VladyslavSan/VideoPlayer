@@ -470,6 +470,7 @@ impl Shell {
         crate::net::init(paths.db.with_file_name("addresses.json"));
         let db = Db::open(&paths.db)?;
         let poster_light = posters::Light::load(&db);
+        posters::load_timings(&db);
         let device_id = db.device_id()?;
         let focus = cx.focus_handle();
         focus.focus(window);
@@ -2598,7 +2599,7 @@ impl Shell {
         });
         // Gone once the new page has faded in.
         let generation = self.page_generation;
-        let page_time = crate::motion::duration(crate::motion::PAGE);
+        let page_time = crate::motion::PAGE.time();
         cx.spawn(async move |this, cx| {
             cx.background_executor().timer(page_time).await;
             this.update(cx, |this, cx| {
@@ -2615,7 +2616,7 @@ impl Shell {
     /// The page being left, drawn with its own scroll positions.
     fn leaving_page(&mut self, window: &mut Window, cx: &mut Context<Self>) -> Option<AnyElement> {
         let leaving = self.leaving.as_mut()?;
-        if leaving.started.elapsed() >= crate::motion::duration(crate::motion::PAGE) {
+        if leaving.started.elapsed() >= crate::motion::PAGE.time() {
             self.leaving = None;
             return None;
         }
@@ -2890,7 +2891,7 @@ impl Shell {
         // they're drawn); a closing season stays drawn until it's folded
         // away. All spacing is inside the folding part, so it ends at zero.
         let key = (show.to_string(), number);
-        let fold_time = crate::motion::duration(crate::motion::FOLD);
+        let fold_time = crate::motion::FOLD.time();
         let fold = self.folds.get(&key).filter(|_| crate::motion::enabled());
         let closing = fold.is_some_and(|f| !f.opening && f.started.elapsed() < fold_time);
         let height = self
@@ -3057,7 +3058,7 @@ impl Render for Shell {
         // fading out, so one turns into the other.
         let leaving = self.leaving_page(window, cx);
         let content = if crate::motion::enabled() {
-            let page_time = crate::motion::duration(crate::motion::PAGE);
+            let page_time = crate::motion::PAGE.time();
             let entering = div()
                 .id("entering")
                 .flex()

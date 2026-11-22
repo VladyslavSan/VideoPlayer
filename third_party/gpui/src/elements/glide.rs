@@ -14,7 +14,8 @@ use std::{
 
 use crate::{Pixels, Point, px};
 
-/// How quickly it gets there: about 95% of the way in three of these.
+/// How quickly it gets there by default: about 95% of the way in three of
+/// these.
 const TIME_CONSTANT: f32 = 0.05;
 /// Close enough to stop.
 const CLOSE: f32 = 0.5;
@@ -33,6 +34,12 @@ struct Glide {
 thread_local! {
     static GLIDES: RefCell<HashMap<usize, Glide>> = RefCell::new(HashMap::new());
     static ON: Cell<bool> = const { Cell::new(true) };
+    static TAU: Cell<f32> = const { Cell::new(TIME_CONSTANT) };
+}
+
+/// How long a wheel step takes to glide (about 95% of the way) to a stop.
+pub fn set_wheel_glide_time(time: Duration) {
+    TAU.set((time.as_secs_f32() / 3.).max(0.001));
 }
 
 /// Whether wheel steps glide (on by default); off, they jump as before.
@@ -94,7 +101,7 @@ pub(crate) fn step(offset: &Offset, current: &mut Point<Pixels>) -> bool {
             .as_secs_f32()
             .clamp(0.001, 0.1);
         glide.last_step = Some(now);
-        let part = 1. - (-dt / TIME_CONSTANT).exp();
+        let part = 1. - (-dt / TAU.get()).exp();
         let mut moved = glide.remaining * part;
         if (glide.remaining.x - moved.x).0.abs() < CLOSE
             && (glide.remaining.y - moved.y).0.abs() < CLOSE

@@ -2,17 +2,93 @@
 //! for less motion), and the app's standard timings.
 
 use std::sync::OnceLock;
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::Duration;
 
-/// A page appearing.
-pub const PAGE: Duration = Duration::from_millis(220);
-/// A season folding open or shut.
-pub const FOLD: Duration = Duration::from_millis(200);
-/// A poster lighting up under the mouse, or dimming after it.
-pub const HOVER: Duration = Duration::from_millis(160);
+/// One of the app's standard timings. Each is a setting in the library
+/// database (`key`), read at startup.
+pub struct Timing {
+    pub key: &'static str,
+    pub label: &'static str,
+    /// What it times, for its setting.
+    pub about: &'static str,
+    pub default_ms: u32,
+    ms: AtomicU32,
+}
+
+impl Timing {
+    const fn new(
+        key: &'static str,
+        label: &'static str,
+        about: &'static str,
+        default_ms: u32,
+    ) -> Self {
+        Self {
+            key,
+            label,
+            about,
+            default_ms,
+            ms: AtomicU32::new(default_ms),
+        }
+    }
+
+    pub fn ms(&self) -> u32 {
+        self.ms.load(Ordering::Relaxed)
+    }
+
+    pub fn set_ms(&self, ms: u32) {
+        self.ms
+            .store(ms.clamp(TIMING_MIN_MS, TIMING_MAX_MS), Ordering::Relaxed);
+    }
+
+    /// How long it takes (stretched by `VIDEO_PLAYER_MOTION_SCALE`).
+    pub fn time(&self) -> Duration {
+        duration(Duration::from_millis(self.ms() as u64))
+    }
+}
+
+/// The range a timing can be set to.
+pub const TIMING_MIN_MS: u32 = 40;
+pub const TIMING_MAX_MS: u32 = 1500;
+
+/// A page appearing, and the one it replaces fading out.
+pub static PAGE: Timing = Timing::new(
+    "motion_page_ms",
+    "Page change",
+    "A new page fading in over the one you left.",
+    220,
+);
 /// A picture fading in over another (a page header's full backdrop):
 /// slower than a page, so one image dissolves into the next.
-pub const PICTURE: Duration = Duration::from_millis(500);
+pub static PICTURE: Timing = Timing::new(
+    "motion_picture_ms",
+    "Header picture",
+    "A page's full-size picture fading in over the small one.",
+    500,
+);
+/// A season folding open or shut.
+pub static FOLD: Timing = Timing::new(
+    "motion_fold_ms",
+    "Season fold",
+    "A season's episodes opening or closing.",
+    200,
+);
+/// A poster lighting up under the mouse, or dimming after it.
+pub static HOVER: Timing = Timing::new(
+    "motion_hover_ms",
+    "Poster under the mouse",
+    "A poster brightening under the mouse, and dimming after.",
+    160,
+);
+/// A mouse wheel step gliding to a stop (about 95% of the way).
+pub static WHEEL: Timing = Timing::new(
+    "motion_wheel_ms",
+    "Wheel scroll",
+    "A mouse wheel step gliding to a stop.",
+    150,
+);
+
+pub static TIMINGS: [&Timing; 5] = [&PAGE, &PICTURE, &FOLD, &HOVER, &WHEEL];
 
 /// `base`, stretched by `VIDEO_PLAYER_MOTION_SCALE` (tests slow animations
 /// down to see them midway).
@@ -88,6 +164,15 @@ pub fn ease_in_out(delta: f32) -> f32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn timings_stay_in_range() {
+        let timing = Timing::new("test", "Test", "A test.", 200);
+        timing.set_ms(0);
+        assert_eq!(timing.ms(), TIMING_MIN_MS);
+        timing.set_ms(99_999);
+        assert_eq!(timing.ms(), TIMING_MAX_MS);
+    }
 
     #[test]
     fn easing_runs_from_zero_to_one() {

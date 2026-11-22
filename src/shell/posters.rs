@@ -1,6 +1,7 @@
 //! How bright posters are: a little dimmed while browsing, lit up under
 //! the mouse (or the arrow keys' cursor), easing between the two. Both
-//! levels are settings (Settings > Appearance).
+//! levels are settings (Settings > Appearance), and so are the animations'
+//! timings (`motion::TIMINGS`).
 
 use std::cell::RefCell;
 use std::collections::HashMap;
@@ -13,6 +14,7 @@ use gpui::{
 
 use super::{ACCENT, MUTED, Shell};
 use crate::library::Db;
+use crate::motion::{TIMING_MAX_MS, TIMING_MIN_MS, Timing};
 
 const REST_SETTING: &str = "poster_brightness";
 const LIT_SETTING: &str = "poster_hover_brightness";
@@ -63,7 +65,7 @@ fn ease(started: Instant) -> f32 {
     if !crate::motion::enabled() {
         return 1.0;
     }
-    let time = crate::motion::duration(crate::motion::HOVER).as_secs_f32();
+    let time = crate::motion::HOVER.time().as_secs_f32();
     crate::motion::ease_out((started.elapsed().as_secs_f32() / time).min(1.0))
 }
 
@@ -111,6 +113,36 @@ impl Hover {
 /// Where each slider's track was drawn, for turning the mouse into a value.
 pub(super) type Tracks = RefCell<HashMap<&'static str, Bounds<Pixels>>>;
 
+/// What a slider runs over: `min` to `max` in steps of `step`.
+#[derive(Clone, Copy)]
+pub(super) struct Range {
+    pub min: f32,
+    pub max: f32,
+    pub step: f32,
+}
+
+impl Range {
+    /// Poster brightness, as a fraction.
+    const BRIGHTNESS: Range = Range {
+        min: DIMMEST,
+        max: 1.0,
+        step: 0.01,
+    };
+
+    fn fraction(self, value: f32) -> f32 {
+        ((value - self.min) / (self.max - self.min)).clamp(0.0, 1.0)
+    }
+
+    fn at(self, fraction: f32) -> f32 {
+        let value = self.min + fraction.clamp(0.0, 1.0) * (self.max - self.min);
+        ((value / self.step).round() * self.step).clamp(self.min, self.max)
+    }
+}
+
+fn percent(value: f32) -> String {
+    format!("{:.0}%", value * 100.0)
+}
+
 /// The darkening laid over a card's picture to make it `brightness`.
 pub(super) fn shade(brightness: f32) -> AnyElement {
     let alpha = ((1.0 - brightness).clamp(0.0, 1.0) * 255.0).round() as u32;
@@ -143,25 +175,29 @@ impl Shell {
     }
 
     /// A setting picked along a track: the text on the left, the track and
-    /// the value on the right. Click or drag anywhere on the row.
+    /// the value (written by `show`) on the right. Click or drag anywhere on
+    /// the row.
+    #[allow(clippy::too_many_arguments)]
     pub(super) fn slider_row(
         &self,
         id: &'static str,
-        title: &'static str,
-        description: &'static str,
+        title: impl Into<SharedString>,
+        description: impl Into<SharedString>,
         value: f32,
+        range: Range,
+        show: fn(f32) -> String,
         cx: &mut Context<Self>,
-        set: fn(&mut Shell, f32),
+        set: impl Fn(&mut Shell, f32) + 'static,
     ) -> AnyElement {
-        let fraction = ((value - DIMMEST) / (1.0 - DIMMEST)).clamp(0.0, 1.0);
-        let pick = move |this: &mut Shell, x: Pixels| {
+        let fraction = range.fraction(value);
+        let set = std::rc::Rc::new(set);
+        let pick = std::rc::Rc::new(move |this: &mut Shell, x: Pixels| {
             let Some(track) = this.slider_tracks.borrow().get(id).copied() else {
                 return;
             };
-            let along = ((x - track.left()) / track.size.width).clamp(0.0, 1.0);
-            let value = DIMMEST + along * (1.0 - DIMMEST);
-            set(this, (value * 100.0).round() / 100.0);
-        };
+            set(this, range.at((x - track.left()) / track.size.width));
+        });
+        let pick_on_move = pick.clone();
         const TRACK: f32 = 220.0;
         const KNOB: f32 = 16.0;
         let tracks = self.slider_tracks.clone();
@@ -181,8 +217,13 @@ impl Shell {
                     .flex_col()
                     .gap_1()
                     .min_w(px(0.0))
-                    .child(div().font_weight(FontWeight::MEDIUM).child(title))
-                    .child(div().text_sm().text_color(rgb(MUTED)).child(description)),
+                    .child(div().font_weight(FontWeight::MEDIUM).child(title.into()))
+                    .child(
+                        div()
+                            .text_sm()
+                            .text_color(rgb(MUTED))
+                            .child(description.into()),
+                    ),
             )
             .child(
                 div()
@@ -238,10 +279,10 @@ impl Shell {
                     )
                     .child(
                         div()
-                            .w(px(44.0))
+                            .w(px(64.0))
                             .text_sm()
                             .text_color(rgb(MUTED))
-                            .child(format!("{:.0}%", value * 100.0)),
+                            .child(show(value)),
                     ),
             )
             .on_mouse_down(
@@ -254,7 +295,7 @@ impl Shell {
             )
             .on_mouse_move(cx.listener(move |this, event: &MouseMoveEvent, _, cx| {
                 if this.slider_drag == Some(id) && event.pressed_button == Some(MouseButton::Left) {
-                    pick(this, event.position.x);
+                    pick_on_move(this, event.position.x);
                     cx.notify();
                 }
             }))
@@ -303,6 +344,8 @@ impl Shell {
                 "Brightness",
                 "How bright posters and pictures are while you browse.",
                 light.rest,
+                Range::BRIGHTNESS,
+                percent,
                 cx,
                 |this, value| {
                     let light = this.poster_light.get();
@@ -317,6 +360,8 @@ impl Shell {
                 "Under the mouse",
                 "How bright the one under the mouse, or picked with the arrow keys, gets.",
                 light.lit,
+                Range::BRIGHTNESS,
+                percent,
                 cx,
                 |this, value| {
                     let light = this.poster_light.get();
@@ -335,8 +380,85 @@ impl Shell {
                     .child(sample("While browsing", light.rest))
                     .child(sample("Under the mouse", light.lit)),
             );
-        vec![Self::section("Posters", body)]
+        vec![Self::section("Posters", body), self.timing_settings(cx)]
     }
+
+    /// Sets a timing and keeps it.
+    fn set_timing(&mut self, timing: &'static Timing, ms: u32) {
+        let old = timing.ms();
+        timing.set_ms(ms);
+        if timing.ms() == old {
+            return;
+        }
+        if std::ptr::eq(timing, &crate::motion::WHEEL) {
+            gpui::set_wheel_glide_time(timing.time());
+        }
+        if let Err(e) = self.db.set_setting(timing.key, &timing.ms().to_string()) {
+            eprintln!("[settings] saving {}: {e:#}", timing.key);
+        }
+    }
+
+    /// Settings > Appearance: how long each kind of animation takes.
+    fn timing_settings(&self, cx: &mut Context<Self>) -> AnyElement {
+        let range = Range {
+            min: TIMING_MIN_MS as f32,
+            max: TIMING_MAX_MS as f32,
+            step: 10.0,
+        };
+        let mut body = div().flex().flex_col().gap_2();
+        for (n, &timing) in crate::motion::TIMINGS.iter().enumerate() {
+            body = body.child(self.slider_row(
+                TIMING_SLIDERS[n],
+                timing.label,
+                format!("{} Default {} ms.", timing.about, timing.default_ms),
+                timing.ms() as f32,
+                range,
+                |ms| format!("{ms:.0} ms"),
+                cx,
+                move |this, ms| this.set_timing(timing, ms as u32),
+            ));
+        }
+        let reset = Self::action_button(
+            "timings-reset",
+            "Reset to defaults",
+            false,
+            cx,
+            |this, _, cx| {
+                for &timing in &crate::motion::TIMINGS {
+                    this.set_timing(timing, timing.default_ms);
+                }
+                cx.notify();
+            },
+        );
+        Self::section(
+            "Animation",
+            body.child(div().flex().pt_3().px_4().child(reset)),
+        )
+    }
+}
+
+/// The timings' sliders' ids, one per `motion::TIMINGS`.
+const TIMING_SLIDERS: [&str; 5] = [
+    "setting-timing-0",
+    "setting-timing-1",
+    "setting-timing-2",
+    "setting-timing-3",
+    "setting-timing-4",
+];
+
+/// Reads the saved timings (Settings > Appearance > Animation).
+pub(super) fn load_timings(db: &Db) {
+    for &timing in &crate::motion::TIMINGS {
+        if let Some(ms) = db
+            .setting(timing.key)
+            .ok()
+            .flatten()
+            .and_then(|v| v.parse::<u32>().ok())
+        {
+            timing.set_ms(ms);
+        }
+    }
+    gpui::set_wheel_glide_time(crate::motion::WHEEL.time());
 }
 
 /// Needs a frame to draw the next step of a card easing.
@@ -359,6 +481,19 @@ mod tests {
         assert_eq!(light.at(0.0), 0.8);
         assert_eq!(light.at(1.0), 1.0);
         assert!((light.at(0.5) - 0.9).abs() < 1e-6);
+    }
+
+    #[test]
+    fn sliders_snap_to_steps() {
+        let range = Range {
+            min: 40.0,
+            max: 1500.0,
+            step: 10.0,
+        };
+        assert_eq!(range.at(0.0), 40.0);
+        assert_eq!(range.at(1.0), 1500.0);
+        assert_eq!(range.at(0.1234) % 10.0, 0.0);
+        assert!((range.fraction(range.at(0.5)) - 0.5).abs() < 0.01);
     }
 
     #[test]
