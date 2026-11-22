@@ -23,6 +23,7 @@ targets are left out. Changes:
   eased out over about 150 ms (`clamp_scroll_position` steps it before clamping and asks for
   another frame). It stops at an end, and when something else moves the offset (a touchpad, the
   app). Touchpads (`ScrollDelta::Pixels`) scroll as before.
+  `gpui::set_smooth_wheel_scrolling(false)` turns it off (the app does, for reduced motion).
 - Backdrop blur (frosted glass), Windows only: `gpui::backdrop_blur(radius)` is a background
   that blurs whatever was painted under the element.
   - `src/color.rs`: `BackgroundTag::BackdropBlur` (radius in `gradient_angle_or_pattern_height`,

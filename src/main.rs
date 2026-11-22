@@ -39,6 +39,7 @@ fn main() {
         .with_assets(ui::icons::Assets)
         .run(move |cx: &mut App| {
             ui::text_input::bind_keys(cx);
+            gpui::set_smooth_wheel_scrolling(motion::enabled());
             // macOS apps need their own menu, Cmd+Q, and quitting when the
             // window closes; Windows does the equivalent by itself.
             if cfg!(target_os = "macos") {

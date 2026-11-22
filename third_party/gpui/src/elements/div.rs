@@ -2449,7 +2449,7 @@ impl Interactivity {
                             delta_x = Pixels::ZERO;
                         }
                     }
-                    if matches!(event.delta, ScrollDelta::Lines(_)) {
+                    if matches!(event.delta, ScrollDelta::Lines(_)) && super::glide::enabled() {
                         // A mouse wheel: glides there (a touchpad's steps
                         // are already small).
                         if !delta_x.is_zero() || !delta_y.is_zero() {

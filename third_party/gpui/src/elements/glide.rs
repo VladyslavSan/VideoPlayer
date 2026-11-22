@@ -6,7 +6,7 @@
 //! end, or something else moves it (a touchpad, a scrollbar, the app).
 
 use std::{
-    cell::RefCell,
+    cell::{Cell, RefCell},
     collections::HashMap,
     rc::{Rc, Weak},
     time::{Duration, Instant},
@@ -32,6 +32,17 @@ struct Glide {
 
 thread_local! {
     static GLIDES: RefCell<HashMap<usize, Glide>> = RefCell::new(HashMap::new());
+    static ON: Cell<bool> = const { Cell::new(true) };
+}
+
+/// Whether wheel steps glide (on by default); off, they jump as before.
+/// For when the system asks for less motion.
+pub fn set_smooth_wheel_scrolling(on: bool) {
+    ON.set(on);
+}
+
+pub(crate) fn enabled() -> bool {
+    ON.get()
 }
 
 fn key(offset: &Offset) -> usize {

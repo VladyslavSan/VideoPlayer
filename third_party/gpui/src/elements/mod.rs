@@ -17,6 +17,7 @@ pub use animation::*;
 pub use canvas::*;
 pub use deferred::*;
 pub use div::*;
+pub use glide::set_smooth_wheel_scrolling;
 pub use image_cache::*;
 pub use img::*;
 pub use list::*;
