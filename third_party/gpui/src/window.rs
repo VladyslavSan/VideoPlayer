@@ -660,6 +660,8 @@ pub(crate) struct DeferredDraw {
     text_style_stack: Vec<TextStyleRefinement>,
     element: Option<AnyElement>,
     absolute_offset: Point<Pixels>,
+    /// The opacity of the elements it was deferred inside.
+    opacity: f32,
     prepaint_range: Range<PrepaintStateIndex>,
     paint_range: Range<PaintIndex>,
 }
@@ -2170,9 +2172,13 @@ impl Window {
 
             let prepaint_start = self.prepaint_index();
             if let Some(element) = deferred_draw.element.as_mut() {
+                let opacity = deferred_draw.opacity;
                 self.with_rendered_view(deferred_draw.current_view, |window| {
-                    window.with_absolute_element_offset(deferred_draw.absolute_offset, |window| {
-                        element.prepaint(window, cx)
+                    window.with_element_opacity(Some(opacity), |window| {
+                        window.with_absolute_element_offset(
+                            deferred_draw.absolute_offset,
+                            |window| element.prepaint(window, cx),
+                        )
                     });
                 })
             } else {
@@ -2205,8 +2211,9 @@ impl Window {
 
             let paint_start = self.paint_index();
             if let Some(element) = deferred_draw.element.as_mut() {
+                let opacity = deferred_draw.opacity;
                 self.with_rendered_view(deferred_draw.current_view, |window| {
-                    element.paint(window, cx);
+                    window.with_element_opacity(Some(opacity), |window| element.paint(window, cx));
                 })
             } else {
                 self.reuse_paint(deferred_draw.paint_range.clone());
@@ -2272,6 +2279,7 @@ impl Window {
                     priority: deferred_draw.priority,
                     element: None,
                     absolute_offset: deferred_draw.absolute_offset,
+                    opacity: deferred_draw.opacity,
                     prepaint_range: deferred_draw.prepaint_range.clone(),
                     paint_range: deferred_draw.paint_range.clone(),
                 }),
@@ -2769,6 +2777,7 @@ impl Window {
             priority,
             element: Some(element),
             absolute_offset,
+            opacity: self.element_opacity,
             prepaint_range: PrepaintStateIndex::default()..PrepaintStateIndex::default(),
             paint_range: PaintIndex::default()..PaintIndex::default(),
         });

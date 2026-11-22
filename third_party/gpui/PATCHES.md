@@ -24,6 +24,11 @@ targets are left out. Changes:
   another frame). It stops at an end, and when something else moves the offset (a touchpad, the
   app). Touchpads (`ScrollDelta::Pixels`) scroll as before.
   `gpui::set_smooth_wheel_scrolling(false)` turns it off (the app does, for reduced motion).
+- Deferred elements keep their parents' opacity: `src/window.rs` (`DeferredDraw.opacity`, set in
+  `defer_draw`, applied in `prepaint_deferred_draws` and `paint_deferred_draws`) and
+  `src/elements/div.rs` (`Interactivity::prepaint` applies the element's opacity while
+  prepainting too, so `defer_draw` sees it). Upstream, a bar drawn with `deferred` inside a page
+  fading in stayed fully opaque.
 - Backdrop blur (frosted glass), Windows only: `gpui::backdrop_blur(radius)` is a background
   that blurs whatever was painted under the element.
   - `src/color.rs`: `BackgroundTag::BackdropBlur` (radius in `gradient_angle_or_pattern_height`,
