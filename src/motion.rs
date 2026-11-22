@@ -10,6 +10,9 @@ pub const PAGE: Duration = Duration::from_millis(220);
 pub const FOLD: Duration = Duration::from_millis(200);
 /// A poster lighting up under the mouse, or dimming after it.
 pub const HOVER: Duration = Duration::from_millis(160);
+/// A picture fading in over another (a page header's full backdrop):
+/// slower than a page, so one image dissolves into the next.
+pub const PICTURE: Duration = Duration::from_millis(500);
 
 /// `base`, stretched by `VIDEO_PLAYER_MOTION_SCALE` (tests slow animations
 /// down to see them midway).
@@ -74,6 +77,12 @@ fn system_allows() -> bool {
 /// 0 → 1, fast at first and settling gently.
 pub fn ease_out(delta: f32) -> f32 {
     1.0 - (1.0 - delta).powi(4)
+}
+
+/// Slow at both ends, for one picture dissolving into another (easing out
+/// alone does most of the change in the first moments).
+pub fn ease_in_out(delta: f32) -> f32 {
+    delta * delta * (3.0 - 2.0 * delta)
 }
 
 #[cfg(test)]

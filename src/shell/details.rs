@@ -219,8 +219,8 @@ impl Shell {
                 layer
                     .with_animation(
                         id,
-                        Animation::new(crate::motion::duration(crate::motion::PAGE))
-                            .with_easing(crate::motion::ease_out),
+                        Animation::new(crate::motion::duration(crate::motion::PICTURE))
+                            .with_easing(crate::motion::ease_in_out),
                         |layer, t| layer.opacity(t),
                     )
                     .into_any_element()
