@@ -189,7 +189,7 @@ impl Shell {
             item.id,
             fnv(url)
         );
-        let path = self.paths.thumbs.join("arr").join(name);
+        let path = self.paths.arr_pictures().join(name);
         match self.arr_pages.pictures.get(&path) {
             Some(Picture::Ready) => return Some(path),
             Some(_) => return None,

@@ -14,10 +14,12 @@ use ureq::Agent;
 mod activity;
 mod add;
 mod library;
+mod picture;
 mod seasons;
 pub use activity::{Download, Event, Recent, State as DownloadState, Subject};
 pub use add::{AddOptions, Candidate, Monitor, Setup};
 pub use library::{Art, Tracked};
+pub use picture::readable;
 pub use seasons::{SeasonSummary, format_date, next_airing, parse_utc, summarize};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -199,6 +201,7 @@ pub fn fetch_poster(url: &str, out: &std::path::Path) -> Result<()> {
         .with_config()
         .limit(20 << 20)
         .read_to_vec()?;
+    let bytes = readable(bytes)?;
     if let Some(dir) = out.parent() {
         std::fs::create_dir_all(dir)?;
     }
@@ -492,6 +495,7 @@ impl Client {
         if !(bytes.starts_with(&[0xFF, 0xD8]) || bytes.starts_with(b"\x89PNG")) {
             bail!("not a picture");
         }
+        let bytes = readable(bytes)?;
         if let Some(dir) = out.parent() {
             std::fs::create_dir_all(dir)?;
         }

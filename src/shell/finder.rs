@@ -260,7 +260,7 @@ impl Shell {
         }
         // Named by the address, so a changed poster is fetched anew.
         let name = format!("{:016x}.jpg", fnv(&url));
-        let path = self.paths.thumbs.join("arr").join(name);
+        let path = self.paths.arr_pictures().join(name);
         if path.exists() {
             self.finder.posters.insert(url, Poster::Ready(path));
             return;

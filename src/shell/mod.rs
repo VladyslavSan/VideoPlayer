@@ -143,6 +143,13 @@ impl Paths {
         self.db.with_file_name("previews")
     }
 
+    /// Pictures from Sonarr, Radarr and the metadata sites. (Their old
+    /// folder, `arr`, may hold ones that show up green; see
+    /// `arr::readable`.)
+    pub fn arr_pictures(&self) -> PathBuf {
+        self.thumbs.join("arr-pictures")
+    }
+
     /// Where the library last fetched from a server is kept.
     pub fn library_cache(&self, server: i64) -> PathBuf {
         self.db.with_file_name(format!("jellyfin-{server}.json"))
@@ -553,6 +560,14 @@ impl Shell {
         shell.load_undelivered(cx);
         shell.refresh(cx);
         shell.generate_thumbs(cx);
+        let old_pictures = shell.paths.thumbs.join("arr");
+        if old_pictures.exists() {
+            cx.background_executor()
+                .spawn(async move {
+                    let _ = std::fs::remove_dir_all(old_pictures);
+                })
+                .detach();
+        }
         if let Some(source) = source {
             let title = Path::new(&source)
                 .file_name()
