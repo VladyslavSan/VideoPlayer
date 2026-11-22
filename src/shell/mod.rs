@@ -1873,9 +1873,11 @@ impl Shell {
                 let grid = Grid::of(screen).expect("a library tab");
                 Err(self.library_grid(grid, window, cx))
             }
-            Screen::Show(name) => Ok(self.show_page(&name, cx)),
-            Screen::Details(key) => Ok(self.details_page(&key, cx)),
-            Screen::Tracked(server, kind, id) => Ok(self.tracked_page(server, kind, id, cx)),
+            Screen::Show(name) => Ok(self.show_page(&name, window, cx)),
+            Screen::Details(key) => Ok(self.details_page(&key, window, cx)),
+            Screen::Tracked(server, kind, id) => {
+                Ok(self.tracked_page(server, kind, id, window, cx))
+            }
             Screen::Downloads => Ok(self.downloads_page(cx)),
             Screen::Arr(server, kind) => Err(self.arr_page(server, kind, window, cx)),
             Screen::Settings => Err(self.settings_view(window, cx)),
@@ -2728,7 +2730,12 @@ impl Shell {
         self.reveal_cursor = false;
     }
 
-    fn show_page(&self, show: &str, cx: &mut Context<Self>) -> Vec<AnyElement> {
+    fn show_page(
+        &self,
+        show: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Vec<AnyElement> {
         let mut seasons: BTreeMap<u16, Vec<&Item>> = BTreeMap::new();
         for item in self.items().filter(|i| i.show.as_deref() == Some(show)) {
             seasons
@@ -2736,7 +2743,7 @@ impl Shell {
                 .or_default()
                 .push(item);
         }
-        let header = self.show_header(show, cx);
+        let header = self.show_header(show, window, cx);
         // Seasons Sonarr could still get join the list in order.
         let sonarr: BTreeMap<u16, &crate::arr::SeasonSummary> = self
             .sonarr_seasons(show)

@@ -5,7 +5,7 @@
 
 use std::time::{Duration, Instant};
 
-use gpui::{AnyElement, Context, SharedString, div, prelude::*, rgb};
+use gpui::{AnyElement, Context, SharedString, Window, div, prelude::*, rgb};
 
 use super::details::{Details, SHOW_HERO_HEIGHT, format_runtime};
 use super::sonarr::tracked_show;
@@ -49,6 +49,7 @@ impl Shell {
         server: i64,
         kind: Kind,
         id: i64,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Vec<AnyElement> {
         let Some(item) = self.tracked_item(server, kind, id) else {
@@ -70,6 +71,7 @@ impl Shell {
             .into_iter()
             .chain(self.arr_art(key, &item, Art::Backdrop, cx))
             .collect();
+        let images = Self::ready_pictures(images, window, cx);
         let mut facts = Vec::new();
         facts.extend(item.year.map(|y| y.to_string()));
         facts.extend(item.state.clone());

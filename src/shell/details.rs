@@ -179,6 +179,25 @@ impl Shell {
             .into_any_element()
     }
 
+    /// Those of `images` loaded and ready to draw, in order. The rest are
+    /// asked for (the page is drawn again when they're ready), so each
+    /// fades in once it can be seen rather than finishing its fade before.
+    pub(super) fn ready_pictures(
+        images: Vec<PathBuf>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Vec<PathBuf> {
+        images
+            .into_iter()
+            .filter(|path| {
+                let source = gpui::Resource::Path(path.as_path().into());
+                window
+                    .use_asset::<gpui::ImgResourceLoader>(&source, cx)
+                    .is_some_and(|loaded| loaded.is_ok())
+            })
+            .collect()
+    }
+
     /// A wide image with the title and facts over a fade to the background.
     /// `images` go bottom to top, each fading in over the ones below when
     /// it arrives (a small picture first, the full backdrop once fetched),
@@ -318,7 +337,12 @@ impl Shell {
         )
     }
 
-    pub(super) fn details_page(&self, key: &str, cx: &mut Context<Self>) -> Vec<AnyElement> {
+    pub(super) fn details_page(
+        &self,
+        key: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Vec<AnyElement> {
         let Some(item) = self.items().find(|i| i.key() == key) else {
             return vec![
                 div()
@@ -337,6 +361,7 @@ impl Shell {
             .cloned()
             .collect();
         images.dedup();
+        let images = Self::ready_pictures(images, window, cx);
         let mut page = vec![Self::hero(
             HERO_HEIGHT,
             images,
@@ -446,7 +471,12 @@ impl Shell {
 
     /// The top of a show's page: backdrop, facts, overview, and a button for
     /// the episode to watch next.
-    pub(super) fn show_header(&self, show: &str, cx: &mut Context<Self>) -> AnyElement {
+    pub(super) fn show_header(
+        &self,
+        show: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
         let key = format!("show:{show}");
         let details = self.details.get(&key);
         let loading = self.details_loading.contains(&key);
@@ -469,7 +499,7 @@ impl Shell {
             .flex_col()
             .child(Self::hero(
                 SHOW_HERO_HEIGHT,
-                image.into_iter().collect(),
+                Self::ready_pictures(image.into_iter().collect(), window, cx),
                 show.to_string(),
                 facts,
                 None,
