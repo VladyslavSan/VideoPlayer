@@ -1,6 +1,7 @@
 //! The Settings screen: a sidebar of pages on the left, the chosen page on
 //! the right. Library holds the Jellyfin servers and local folders;
-//! Playback holds player preferences, kept in the library database.
+//! Playback holds player preferences, kept in the library database;
+//! Appearance holds how bright posters are (`posters.rs`).
 
 use gpui::{
     AnyElement, ClickEvent, Context, Focusable, FontWeight, SharedString, Window, div, prelude::*,
@@ -18,13 +19,15 @@ pub(super) enum SettingsPage {
     Library,
     Playback,
     Controls,
+    Appearance,
 }
 
 impl SettingsPage {
-    const ALL: [SettingsPage; 3] = [
+    const ALL: [SettingsPage; 4] = [
         SettingsPage::Library,
         SettingsPage::Playback,
         SettingsPage::Controls,
+        SettingsPage::Appearance,
     ];
 
     fn label(self) -> &'static str {
@@ -32,6 +35,7 @@ impl SettingsPage {
             SettingsPage::Library => "Library",
             SettingsPage::Playback => "Playback",
             SettingsPage::Controls => "Controls",
+            SettingsPage::Appearance => "Appearance",
         }
     }
 }
@@ -138,6 +142,7 @@ impl Shell {
             SettingsPage::Library => self.library_settings(window, cx),
             SettingsPage::Playback => self.playback_settings(cx),
             SettingsPage::Controls => self.controls_settings(cx),
+            SettingsPage::Appearance => self.appearance_settings(cx),
         };
         let mut page = div()
             .id(SharedString::from(format!(

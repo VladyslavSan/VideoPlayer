@@ -38,6 +38,7 @@ mod finder;
 mod keynav;
 mod live;
 mod offline;
+mod posters;
 mod releases;
 mod reports;
 mod settings;
@@ -423,6 +424,12 @@ pub struct Shell {
     /// Counts screen changes; each new page fades in.
     page_generation: usize,
     leaving: Option<Leaving>,
+    /// How bright posters are at rest and lit.
+    poster_light: Cell<posters::Light>,
+    card_hover: RefCell<posters::Hover>,
+    /// Where Settings' sliders were drawn, and the one being dragged.
+    slider_tracks: Rc<posters::Tracks>,
+    slider_drag: Option<&'static str>,
     /// While the page being left is drawn: its cards aren't the arrow keys'
     /// to move between. (Its bars are drawn before the new page's, which
     /// block the mouse from them.)
@@ -462,6 +469,7 @@ impl Shell {
     ) -> Result<Self> {
         crate::net::init(paths.db.with_file_name("addresses.json"));
         let db = Db::open(&paths.db)?;
+        let poster_light = posters::Light::load(&db);
         let device_id = db.device_id()?;
         let focus = cx.focus_handle();
         focus.focus(window);
@@ -539,6 +547,10 @@ impl Shell {
             columns_hint: Cell::new(4),
             page_generation: 0,
             leaving: None,
+            poster_light: Cell::new(poster_light),
+            card_hover: RefCell::default(),
+            slider_tracks: Rc::default(),
+            slider_drag: None,
             drawing_leaving: Cell::new(false),
             focus_episode: None,
             focus_bounds: Rc::default(),
@@ -2127,6 +2139,13 @@ impl Shell {
         } = card;
         let text_id = ElementId::NamedChild(Box::new(id.clone().into()), "text".into());
         let selected = self.cursor.as_ref() == Some(&id);
+        let lit = if selected {
+            1.0
+        } else {
+            self.card_hover.borrow().level(&id)
+        };
+        let brightness = self.poster_light.get().at(lit);
+        let hover_id = id.clone();
         let on_click: CardAction = Rc::new(on_click);
         let leaving = self.drawing_leaving.get();
         if !leaving {
@@ -2170,7 +2189,10 @@ impl Shell {
             .flex_col()
             .gap_2()
             .cursor_pointer()
-            .hover(|s| s.opacity(0.85))
+            .on_hover(cx.listener(move |this, hovered: &bool, _, cx| {
+                this.card_hover.borrow_mut().set(&hover_id, *hovered);
+                cx.notify();
+            }))
             .child(
                 // Records where the card is, for the arrow keys.
                 canvas(
@@ -2198,6 +2220,7 @@ impl Shell {
                         d.border_2().border_color(rgb(ACCENT))
                     })
                     .child(art)
+                    .child(posters::shade(brightness))
                     .children(highlight.then(|| {
                         // Records where the card is, so the page can scroll to it.
                         let bounds = self.focus_bounds.clone();
@@ -3016,6 +3039,7 @@ impl Render for Shell {
             self.tab = Screen::Home;
         }
         self.update_scroll(window, cx);
+        posters::keep_animating(self, window);
         self.columns_hint.set(browse::columns(window));
         // Refilled as this frame's cards are laid out.
         self.card_bounds.borrow_mut().clear();

@@ -8,6 +8,8 @@ use std::time::Duration;
 pub const PAGE: Duration = Duration::from_millis(220);
 /// A season folding open or shut.
 pub const FOLD: Duration = Duration::from_millis(200);
+/// A poster lighting up under the mouse, or dimming after it.
+pub const HOVER: Duration = Duration::from_millis(160);
 
 /// `base`, stretched by `VIDEO_PLAYER_MOTION_SCALE` (tests slow animations
 /// down to see them midway).
