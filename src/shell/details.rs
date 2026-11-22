@@ -5,8 +5,8 @@
 use std::path::PathBuf;
 
 use gpui::{
-    AnyElement, ClickEvent, Context, FontWeight, ObjectFit, SharedString, Window, div, img,
-    linear_color_stop, linear_gradient, prelude::*, px, rgb, rgba,
+    Animation, AnimationExt, AnyElement, ClickEvent, Context, FontWeight, ObjectFit, SharedString,
+    Window, div, img, linear_color_stop, linear_gradient, prelude::*, px, rgb, rgba,
 };
 
 use super::{BG, MUTED, Screen, Shell, TEXT};
@@ -180,13 +180,35 @@ impl Shell {
     }
 
     /// A wide image with the title and facts over a fade to the background.
+    /// `images` go bottom to top, each fading in over the ones below when
+    /// it arrives (a small picture first, the full backdrop once fetched),
+    /// so one never cuts to another.
     pub(super) fn hero(
         height: f32,
-        image: Option<PathBuf>,
+        images: Vec<PathBuf>,
         title: String,
         facts: Vec<String>,
         tagline: Option<String>,
     ) -> AnyElement {
+        let layers = images.into_iter().map(|path| {
+            let id = SharedString::from(format!("hero-{}", path.display()));
+            let layer = div()
+                .absolute()
+                .inset_0()
+                .child(img(path).size_full().object_fit(ObjectFit::Cover));
+            if crate::motion::enabled() {
+                layer
+                    .with_animation(
+                        id,
+                        Animation::new(crate::motion::duration(crate::motion::PAGE))
+                            .with_easing(crate::motion::ease_out),
+                        |layer, t| layer.opacity(t),
+                    )
+                    .into_any_element()
+            } else {
+                layer.into_any_element()
+            }
+        });
         div()
             .relative()
             .w_full()
@@ -195,7 +217,7 @@ impl Shell {
             .rounded_2xl()
             .overflow_hidden()
             .bg(rgb(0x1a1d26))
-            .children(image.map(|path| img(path).size_full().object_fit(ObjectFit::Cover)))
+            .children(layers)
             .child(div().absolute().inset_0().bg(linear_gradient(
                 180.0,
                 linear_color_stop(rgba(BG << 8), 0.3),
@@ -308,12 +330,16 @@ impl Shell {
         };
         let details = self.details.get(key);
         let loading = self.details_loading.contains(key);
-        let image = details
-            .and_then(|d| d.backdrop.clone())
-            .or_else(|| item.thumb.clone());
+        let mut images: Vec<PathBuf> = item
+            .thumb
+            .iter()
+            .chain(details.and_then(|d| d.backdrop.as_ref()))
+            .cloned()
+            .collect();
+        images.dedup();
         let mut page = vec![Self::hero(
             HERO_HEIGHT,
-            image,
+            images,
             item.title.clone(),
             Self::facts(item.year, item.duration, details),
             details.and_then(|d| d.tagline.clone()),
@@ -428,9 +454,11 @@ impl Shell {
             .items()
             .filter(|i| i.show.as_deref() == Some(show))
             .collect();
-        let image = details
-            .and_then(|d| d.backdrop.clone())
-            .or_else(|| episodes.iter().find_map(|e| e.thumb.clone()));
+        let image = match details.and_then(|d| d.backdrop.clone()) {
+            Some(backdrop) => Some(backdrop),
+            None if loading => None,
+            None => episodes.iter().find_map(|e| e.thumb.clone()),
+        };
         let mut facts = vec![format!("{} episodes", episodes.len())];
         facts.extend(Self::facts(None, None, details));
 
@@ -441,7 +469,7 @@ impl Shell {
             .flex_col()
             .child(Self::hero(
                 SHOW_HERO_HEIGHT,
-                image,
+                image.into_iter().collect(),
                 show.to_string(),
                 facts,
                 None,

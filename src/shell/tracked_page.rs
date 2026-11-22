@@ -61,10 +61,15 @@ impl Shell {
             ];
         };
         let key = (server, kind);
-        // The full-size fanart once it's here; the card's picture till then.
-        let image = self
-            .arr_art(key, &item, Art::Backdrop, cx)
-            .or_else(|| self.arr_art(key, &item, item.art.as_ref()?.0, cx));
+        // The card's picture, and the full-size fanart over it once it's here.
+        let card = item
+            .art
+            .as_ref()
+            .and_then(|(art, _)| self.arr_art(key, &item, *art, cx));
+        let images: Vec<_> = card
+            .into_iter()
+            .chain(self.arr_art(key, &item, Art::Backdrop, cx))
+            .collect();
         let mut facts = Vec::new();
         facts.extend(item.year.map(|y| y.to_string()));
         facts.extend(item.state.clone());
@@ -82,7 +87,7 @@ impl Shell {
                     .join(", "),
             );
         }
-        let hero = Self::hero(SHOW_HERO_HEIGHT, image, item.title.clone(), facts, None);
+        let hero = Self::hero(SHOW_HERO_HEIGHT, images, item.title.clone(), facts, None);
 
         let mut actions = Vec::new();
         if kind == Kind::Radarr {
