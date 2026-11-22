@@ -21,7 +21,7 @@ use crate::{
     Hitbox, HitboxBehavior, HitboxId, InspectorElementId, IntoElement, IsZero, KeyContext,
     KeyDownEvent, KeyUpEvent, KeyboardButton, KeyboardClickEvent, LayoutId, ModifiersChangedEvent,
     MouseButton, MouseClickEvent, MouseDownEvent, MouseMoveEvent, MouseUpEvent, Overflow,
-    ParentElement, Pixels, Point, Render, ScrollWheelEvent, SharedString, Size, Style,
+    ParentElement, Pixels, Point, Render, ScrollDelta, ScrollWheelEvent, SharedString, Size, Style,
     StyleRefinement, Styled, Task, TooltipId, Visibility, Window, WindowControlArea, point, px,
     size,
 };
@@ -1749,13 +1749,18 @@ impl Interactivity {
                 .max(&Default::default());
             // Clamp scroll offset in case scroll max is smaller now (e.g., if children
             // were removed or the bounds became larger).
+            let shared_offset = scroll_offset;
             let mut scroll_offset = scroll_offset.borrow_mut();
+            let gliding = super::glide::step(shared_offset, &mut scroll_offset);
 
             scroll_offset.x = scroll_offset.x.clamp(-scroll_max.width, px(0.));
             if scroll_to_bottom {
                 scroll_offset.y = -scroll_max.height;
             } else {
                 scroll_offset.y = scroll_offset.y.clamp(-scroll_max.height, px(0.));
+            }
+            if gliding && super::glide::settle(shared_offset, *scroll_offset) {
+                window.request_animation_frame();
             }
 
             if let Some(mut scroll_handle_state) = tracked_scroll_handle {
@@ -2416,6 +2421,7 @@ impl Interactivity {
             let current_view = window.current_view();
             window.on_mouse_event(move |event: &ScrollWheelEvent, phase, window, cx| {
                 if phase == DispatchPhase::Bubble && hitbox.should_handle_scroll(window) {
+                    let shared_offset = &scroll_offset;
                     let mut scroll_offset = scroll_offset.borrow_mut();
                     let old_scroll_offset = *scroll_offset;
                     let delta = event.delta.pixel_delta(line_height);
@@ -2442,6 +2448,15 @@ impl Interactivity {
                         } else {
                             delta_x = Pixels::ZERO;
                         }
+                    }
+                    if matches!(event.delta, ScrollDelta::Lines(_)) {
+                        // A mouse wheel: glides there (a touchpad's steps
+                        // are already small).
+                        if !delta_x.is_zero() || !delta_y.is_zero() {
+                            super::glide::add(shared_offset, point(delta_x, delta_y));
+                            cx.notify(current_view);
+                        }
+                        return;
                     }
                     scroll_offset.y += delta_y;
                     scroll_offset.x += delta_x;

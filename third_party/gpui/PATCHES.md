@@ -17,6 +17,12 @@ targets are left out. Changes:
 - `src/elements/uniform_list.rs`: items and decorations no longer add the list's top padding
   twice, and `ScrollStrategy::Top` scrolls an item to just below the padding (the app's grid
   scrolls under a see-through bar).
+- Smooth mouse wheel scrolling: `src/elements/glide.rs` (new). A wheel step (`ScrollDelta::Lines`)
+  in a scrolling element (`div.rs`, `paint_scroll_listener`) is no longer added to the offset at
+  once; it's added to what the element still has to go, and each frame covers part of the rest,
+  eased out over about 150 ms (`clamp_scroll_position` steps it before clamping and asks for
+  another frame). It stops at an end, and when something else moves the offset (a touchpad, the
+  app). Touchpads (`ScrollDelta::Pixels`) scroll as before.
 - Backdrop blur (frosted glass), Windows only: `gpui::backdrop_blur(radius)` is a background
   that blurs whatever was painted under the element.
   - `src/color.rs`: `BackgroundTag::BackdropBlur` (radius in `gradient_angle_or_pattern_height`,

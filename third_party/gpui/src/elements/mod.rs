@@ -3,6 +3,7 @@ mod animation;
 mod canvas;
 mod deferred;
 mod div;
+mod glide;
 mod image_cache;
 mod img;
 mod list;
