@@ -30,6 +30,7 @@ use crate::ui::text_input::TextInput;
 
 mod arr_page;
 mod arr_settings;
+mod arriving;
 mod browse;
 mod controls_page;
 mod details;
@@ -423,6 +424,8 @@ pub struct Shell {
     columns_hint: Cell<usize>,
     /// Counts screen changes; each new page fades in.
     page_generation: usize,
+    /// What the page has shown so far, for fading in what comes later.
+    revealed: RefCell<arriving::Revealed>,
     leaving: Option<Leaving>,
     /// How bright posters are at rest and lit.
     poster_light: Cell<posters::Light>,
@@ -547,6 +550,7 @@ impl Shell {
             fold_count: 0,
             columns_hint: Cell::new(4),
             page_generation: 0,
+            revealed: RefCell::default(),
             leaving: None,
             poster_light: Cell::new(poster_light),
             card_hover: RefCell::default(),
@@ -2643,6 +2647,7 @@ impl Shell {
     fn update_scroll(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.scrolled_screen.as_ref() != Some(&self.screen) {
             self.page_generation += 1;
+            self.revealed.borrow_mut().page_opened();
             self.start_leaving(cx);
             if let (Some(old), Some(cursor)) = (self.scrolled_screen.take(), self.cursor.take()) {
                 self.cursors.retain(|(screen, _)| *screen != old);
@@ -2868,13 +2873,34 @@ impl Shell {
             )
             .children(summary.map(|s| div().flex_none().text_sm().text_color(rgb(MUTED)).child(s)))
             .children(status.map(|(text, color)| {
-                div()
+                let status = div()
                     .min_w(px(0.0))
                     .truncate()
                     .text_sm()
                     .text_color(rgb(color))
-                    .child(if have { format!("· {text}") } else { text })
+                    .child(if have { format!("· {text}") } else { text });
+                if have {
+                    self.arriving(format!("season-status-{show}-{number}"), status)
+                } else {
+                    status.into_any_element()
+                }
             }));
+        // Sonarr's say about a season Jellyfin has comes in after it; a
+        // season only Sonarr knows of comes in whole (below).
+        let buttons: Vec<AnyElement> = if have {
+            buttons
+                .into_iter()
+                .enumerate()
+                .map(|(n, button)| {
+                    self.arriving(
+                        format!("season-button-{show}-{number}-{n}"),
+                        div().flex_none().child(button),
+                    )
+                })
+                .collect()
+        } else {
+            buttons
+        };
         let row = div()
             .flex()
             .items_center()
@@ -2951,13 +2977,17 @@ impl Shell {
                 None => outer.into_any_element(),
             }
         });
-        div()
+        let block = div()
             .flex()
             .flex_col()
             .child(row)
             .children(panel.map(|panel| div().pt_2().child(panel)))
-            .children(grid)
-            .into_any_element()
+            .children(grid);
+        if have {
+            block.into_any_element()
+        } else {
+            self.arriving(format!("season-{show}-{number}"), block)
+        }
     }
 
     fn field(label: &str, input: &Entity<TextInput>) -> AnyElement {

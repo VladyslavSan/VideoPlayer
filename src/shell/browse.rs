@@ -464,15 +464,12 @@ impl Shell {
             rows.push(if scope.is_none() {
                 self.empty_state(cx)
             } else {
-                div()
-                    .pt_10()
-                    .text_color(rgb(MUTED))
-                    .child(if self.loading_servers.is_empty() {
-                        "Nothing here yet."
-                    } else {
-                        "Loading…"
-                    })
-                    .into_any_element()
+                let note = div().pt_10().text_color(rgb(MUTED));
+                if self.loading_servers.is_empty() {
+                    self.arriving("nothing-here", note.child("Nothing here yet."))
+                } else {
+                    self.waiting("library-loading", note.child("Loading…"))
+                }
             });
             return rows;
         }

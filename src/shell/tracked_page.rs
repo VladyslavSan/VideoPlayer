@@ -122,7 +122,7 @@ impl Shell {
                     .pt_5()
                     .children(actions),
             )
-            .children(Self::overview(Some(&details), false, None))
+            .children(self.overview(Some(&details), false, None))
             .into_any_element();
 
         let mut page = vec![header];

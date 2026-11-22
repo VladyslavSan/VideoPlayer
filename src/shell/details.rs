@@ -295,25 +295,28 @@ impl Shell {
     /// The item's overview; `lines` limits it (a show's page keeps it short
     /// so the seasons follow soon).
     pub(super) fn overview(
+        &self,
         details: Option<&Details>,
         loading: bool,
         lines: Option<usize>,
     ) -> Option<AnyElement> {
-        let text = match details.and_then(|d| d.overview.clone()) {
-            Some(text) => text,
-            None if loading => "Loading details…".into(),
+        let (text, waiting) = match details.and_then(|d| d.overview.clone()) {
+            Some(text) => (text, false),
+            None if loading => ("Loading details…".into(), true),
             None => return None,
         };
-        Some(
-            div()
-                .pt_6()
-                .max_w(px(780.0))
-                .line_height(px(24.0))
-                .text_color(rgb(if loading { MUTED } else { 0xd5d9e3 }))
-                .when_some(lines, |d, lines| d.line_clamp(lines))
-                .child(text)
-                .into_any_element(),
-        )
+        let text = div()
+            .pt_6()
+            .max_w(px(780.0))
+            .line_height(px(24.0))
+            .text_color(rgb(if waiting { MUTED } else { 0xd5d9e3 }))
+            .when_some(lines, |d, lines| d.line_clamp(lines))
+            .child(text);
+        Some(if waiting {
+            self.waiting("overview-loading", text)
+        } else {
+            self.arriving("overview", text)
+        })
     }
 
     fn info_row(label: &str, values: Vec<String>) -> Option<AnyElement> {
@@ -420,7 +423,7 @@ impl Shell {
                 ))
                 .into_any_element(),
         );
-        page.extend(Self::overview(details, loading, None));
+        page.extend(self.overview(details, loading, None));
 
         let mut info = Vec::new();
         if let Some(d) = details {
@@ -432,15 +435,10 @@ impl Shell {
             info.extend(Self::info_row("File", vec![path.display().to_string()]));
         }
         if !info.is_empty() {
-            page.push(
-                div()
-                    .flex()
-                    .flex_col()
-                    .gap_3()
-                    .pt_8()
-                    .children(info)
-                    .into_any_element(),
-            );
+            page.push(self.arriving(
+                format!("details-info-{}", details.is_some()),
+                div().flex().flex_col().gap_3().pt_8().children(info),
+            ));
         }
         page
     }
@@ -535,7 +533,7 @@ impl Shell {
                     )
                     .into_any_element()
             }))
-            .children(Self::overview(details, loading, Some(3)))
+            .children(self.overview(details, loading, Some(3)))
             .into_any_element()
     }
 }

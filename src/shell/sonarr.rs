@@ -250,28 +250,33 @@ impl Shell {
         if self.sonarr_for(show).is_none() {
             return Vec::new();
         }
-        let note = |text: String, color: u32| {
-            div()
-                .text_sm()
-                .text_color(rgb(color))
-                .child(text)
-                .into_any_element()
-        };
+        let note = |text: String, color: u32| div().text_sm().text_color(rgb(color)).child(text);
         match self.sonarr.get(show) {
             None => Vec::new(),
-            Some(SonarrView::Loading) => vec![note("Checking Sonarr…".into(), MUTED)],
-            Some(SonarrView::Absent) => vec![note(
-                "Sonarr doesn't have this show, so it can't download more of it.".into(),
-                MUTED,
+            Some(SonarrView::Loading) => vec![self.waiting(
+                format!("sonarr-checking-{show}"),
+                note("Checking Sonarr…".into(), MUTED),
             )],
-            Some(SonarrView::Failed(e)) => vec![note(e.to_string(), ERROR)],
+            Some(SonarrView::Absent) => vec![self.arriving(
+                format!("sonarr-absent-{show}"),
+                note(
+                    "Sonarr doesn't have this show, so it can't download more of it.".into(),
+                    MUTED,
+                ),
+            )],
+            Some(SonarrView::Failed(e)) => {
+                vec![self.arriving(format!("sonarr-failed-{show}"), note(e.to_string(), ERROR))]
+            }
             Some(SonarrView::Ready(found)) => found
                 .next
                 .iter()
                 .map(|(label, at)| {
-                    note(
-                        format!("Next episode: {label}, airs {}", arr::format_date(*at)),
-                        MUTED,
+                    self.arriving(
+                        format!("sonarr-next-{show}"),
+                        note(
+                            format!("Next episode: {label}, airs {}", arr::format_date(*at)),
+                            MUTED,
+                        ),
                     )
                 })
                 .collect(),

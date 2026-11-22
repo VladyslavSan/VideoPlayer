@@ -88,7 +88,23 @@ pub static WHEEL: Timing = Timing::new(
     150,
 );
 
-pub static TIMINGS: [&Timing; 5] = [&PAGE, &PICTURE, &FOLD, &HOVER, &WHEEL];
+/// Something arriving on a page already open (Sonarr's answer, an
+/// overview) fading in.
+pub static APPEAR: Timing = Timing::new(
+    "motion_appear_ms",
+    "Content arriving",
+    "Something that loads after its page opened fading in.",
+    250,
+);
+/// How long something takes to load before a note says it's loading.
+pub static WAIT: Timing = Timing::new(
+    "motion_wait_ms",
+    "Loading note delay",
+    "How long a wait goes on before \"Loading…\" fades in.",
+    400,
+);
+
+pub static TIMINGS: [&Timing; 7] = [&PAGE, &PICTURE, &APPEAR, &WAIT, &FOLD, &HOVER, &WHEEL];
 
 /// `base`, stretched by `VIDEO_PLAYER_MOTION_SCALE` (tests slow animations
 /// down to see them midway).

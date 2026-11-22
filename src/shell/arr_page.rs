@@ -397,12 +397,14 @@ impl Shell {
                 .justify_center()
                 .text_color(rgb(color))
                 .child(text)
-                .into_any_element()
         };
         let Some(items) = list.and_then(|l| l.items.as_ref()) else {
             return match list.and_then(|l| l.error.clone()) {
-                Some(error) => message(error.to_string(), ERROR),
-                None => message(format!("Asking {}…", key.1.name()), MUTED),
+                Some(error) => self.arriving("arr-error", message(error.to_string(), ERROR)),
+                None => self.waiting(
+                    "arr-asking",
+                    message(format!("Asking {}…", key.1.name()), MUTED),
+                ),
             };
         };
         let count = if self.arr_pages.missing_only {
@@ -411,18 +413,21 @@ impl Shell {
             items.len()
         };
         if count == 0 {
-            return message(
-                if self.arr_pages.missing_only {
-                    "Nothing missing.".into()
-                } else {
-                    format!("{} has no {}s yet.", key.1.name(), noun(key.1))
-                },
-                MUTED,
+            return self.arriving(
+                "arr-empty",
+                message(
+                    if self.arr_pages.missing_only {
+                        "Nothing missing.".into()
+                    } else {
+                        format!("{} has no {}s yet.", key.1.name(), noun(key.1))
+                    },
+                    MUTED,
+                ),
             );
         }
         let columns = columns(window);
         let rows = count.div_ceil(columns);
-        uniform_list(
+        let grid = uniform_list(
             ElementId::Name(format!("arr-grid-{}-{}", key.0, key.1.name()).into()),
             rows,
             cx.processor(move |this, range: Range<usize>, _window, cx| {
@@ -452,8 +457,8 @@ impl Shell {
         .track_scroll(self.arr_pages.scroll.clone())
         .flex_1()
         .min_h(px(0.0))
-        .pt(px(HEADER_HEIGHT + SORT_BAR_HEIGHT))
-        .into_any_element()
+        .pt(px(HEADER_HEIGHT + SORT_BAR_HEIGHT));
+        self.arriving("arr-grid", grid)
     }
 
     /// The bar under the header: which app, Library or Activity, and the
