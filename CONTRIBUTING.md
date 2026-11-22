@@ -34,8 +34,9 @@ Commit messages follow [Conventional Commits 1.0](https://www.conventionalcommit
 <footers>
 ```
 
-- **Summary**: imperative, lower case, no full stop, at most 72 characters in all
-  (`fix(arr): decode split-scan JPEG posters`, not `Fixed the posters.`).
+- **Summary**: imperative, lower case (names like Sonarr keep their capitals), no full stop, at
+  most 72 characters in all (`fix(arr): decode split-scan JPEG posters`, not
+  `Fixed the posters.`).
 - **Body** (optional, after a blank line): what was wrong or missing and why the change fixes
   it, in plain words, wrapped at 72 columns.
 - **Footers**: `BREAKING CHANGE: ...`, `Co-Authored-By: ...` and the like, after a blank line.
@@ -88,3 +89,22 @@ perf(ui): match download titles through an index
 build: fetch the official LGPL libmpv on Windows
 ci: play the test clips instead of skipping them
 ```
+
+### Checking messages
+
+`scripts/check-commits.sh` checks messages against these rules: CI runs it on every push and
+pull request (`.github/workflows/checks.yml`), and a local hook runs it as you commit. Enable
+the hook once per clone:
+
+```
+git config core.hooksPath scripts/hooks
+```
+
+## Code style
+
+- `cargo fmt` formatting, default settings.
+- No clippy warnings: `cargo clippy --all-targets -- -D warnings`.
+- CI checks both on every push and pull request (`.github/workflows/checks.yml`); run them
+  before committing.
+- `third_party/gpui` is a patched copy of upstream code and keeps upstream's style; list every
+  change to it in `third_party/gpui/PATCHES.md`.

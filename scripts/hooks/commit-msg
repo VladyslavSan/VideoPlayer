@@ -1,0 +1,4 @@
+#!/usr/bin/env bash
+# Checks the message before git commits it. Enable once per clone:
+#   git config core.hooksPath scripts/hooks
+exec bash "$(git rev-parse --show-toplevel)/scripts/check-commits.sh" --file "$1"

@@ -1,0 +1,48 @@
+# Every push and pull request: commit messages follow CONTRIBUTING.md,
+# the code is formatted, and clippy has nothing to say.
+name: Checks
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  commits:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Commit messages
+        env:
+          BEFORE: ${{ github.event_name == 'pull_request' && github.event.pull_request.base.sha || github.event.before }}
+          AFTER: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}
+        run: |
+          # A new branch has no "before": check what isn't on master yet.
+          if [[ "$BEFORE" =~ ^0+$ ]]; then
+            BEFORE=$(git merge-base origin/master "$AFTER")
+          fi
+          bash scripts/check-commits.sh "$BEFORE..$AFTER"
+
+  style:
+    # Windows: the platform code there is what most changes touch, and
+    # build.rs fetches libmpv for it.
+    runs-on: windows-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: Formatting
+        run: cargo fmt --check
+      - name: Clippy
+        run: cargo clippy --all-targets -- -D warnings
