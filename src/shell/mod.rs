@@ -219,6 +219,33 @@ enum Screen {
     Settings,
 }
 
+/// The page being left, fading out under the new one: drawn as it was,
+/// scrolled where it was, until the new page has faded in.
+struct Leaving {
+    screen: Screen,
+    started: Instant,
+    content_scroll: ScrollHandle,
+    grid_scroll: UniformListScrollHandle,
+    arr_scroll: UniformListScrollHandle,
+}
+
+/// A scroll handle at the same place as `handle`, for drawing a page that
+/// no longer moves.
+fn frozen(handle: &ScrollHandle) -> ScrollHandle {
+    let copy = ScrollHandle::new();
+    copy.set_offset(handle.offset());
+    copy
+}
+
+fn frozen_list(handle: &UniformListScrollHandle) -> UniformListScrollHandle {
+    let copy = UniformListScrollHandle::new();
+    copy.0
+        .borrow()
+        .base_handle
+        .set_offset(handle.0.borrow().base_handle.offset());
+    copy
+}
+
 /// A season folding open or shut, from when; `id` restarts the animation.
 struct Fold {
     opening: bool,
@@ -395,6 +422,11 @@ pub struct Shell {
     columns_hint: Cell<usize>,
     /// Counts screen changes; each new page fades in.
     page_generation: usize,
+    leaving: Option<Leaving>,
+    /// While the page being left is drawn: its cards aren't the arrow keys'
+    /// to move between. (Its bars are drawn before the new page's, which
+    /// block the mouse from them.)
+    drawing_leaving: Cell<bool>,
     /// On a show page: the episode it was opened at (by item key), ringed.
     focus_episode: Option<String>,
     /// Where the focused episode's card was last drawn, and whether the
@@ -506,6 +538,8 @@ impl Shell {
             fold_count: 0,
             columns_hint: Cell::new(4),
             page_generation: 0,
+            leaving: None,
+            drawing_leaving: Cell::new(false),
             focus_episode: None,
             focus_bounds: Rc::default(),
             focus_scroll: None,
@@ -1807,6 +1841,63 @@ impl Shell {
 
     // ---- rendering ----
 
+    /// A screen's page, below the header.
+    fn page(&mut self, screen: &Screen, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
+        let query = self.search_query(cx);
+        let on_tab = matches!(
+            screen,
+            Screen::Home
+                | Screen::Source(_)
+                | Screen::Movies(_)
+                | Screen::Shows(_)
+                | Screen::Downloads
+                | Screen::Arr(..)
+        );
+        let body: Result<Vec<AnyElement>, AnyElement> = match screen.clone() {
+            _ if on_tab && !query.is_empty() => Ok(self.search_results(&query, cx)),
+            Screen::Home => Ok(self.home(None, cx)),
+            Screen::Source(origin) => Ok(self.home(Some(origin), cx)),
+            ref screen @ (Screen::Movies(_) | Screen::Shows(_)) => {
+                let grid = Grid::of(screen).expect("a library tab");
+                Err(self.library_grid(grid, window, cx))
+            }
+            Screen::Show(name) => Ok(self.show_page(&name, cx)),
+            Screen::Details(key) => Ok(self.details_page(&key, cx)),
+            Screen::Tracked(server, kind, id) => Ok(self.tracked_page(server, kind, id, cx)),
+            Screen::Downloads => Ok(self.downloads_page(cx)),
+            Screen::Arr(server, kind) => Err(self.arr_page(server, kind, window, cx)),
+            Screen::Settings => Err(self.settings_view(window, cx)),
+        };
+        // Sections scroll as one page; the grids scroll (and virtualize) themselves.
+        match body {
+            Ok(sections) => {
+                let mut page = div()
+                    .id("content")
+                    .flex_1()
+                    .min_h(px(0.0))
+                    .overflow_y_scroll()
+                    .track_scroll(&self.content_scroll)
+                    .px_8()
+                    .pt(px(HEADER_HEIGHT))
+                    .pb_10()
+                    .children(sections);
+                // Sideways scrolling (shift+wheel, trackpad) is for the rows.
+                page.style().restrict_scroll_to_axis = Some(true);
+                page.into_any_element()
+            }
+            // Settings doesn't scroll as a whole: it just starts below the bar.
+            Err(view) if *screen == Screen::Settings => div()
+                .flex()
+                .flex_col()
+                .flex_1()
+                .min_h(px(0.0))
+                .pt(px(HEADER_HEIGHT))
+                .child(view)
+                .into_any_element(),
+            Err(grid) => grid,
+        }
+    }
+
     fn button(
         &self,
         id: impl Into<ElementId>,
@@ -1827,6 +1918,15 @@ impl Shell {
             .child(label.into())
             .on_click(cx.listener(move |this, _: &ClickEvent, window, cx| action(this, window, cx)))
             .into_any_element()
+    }
+
+    /// The screen whose page is being drawn: the one being left while it
+    /// fades out, otherwise the current one.
+    fn page_screen(&self) -> Screen {
+        match &self.leaving {
+            Some(leaving) if self.drawing_leaving.get() => leaving.screen.clone(),
+            _ => self.screen.clone(),
+        }
     }
 
     /// Whether a library grid's sort bar sits under the header.
@@ -2028,9 +2128,12 @@ impl Shell {
         let text_id = ElementId::NamedChild(Box::new(id.clone().into()), "text".into());
         let selected = self.cursor.as_ref() == Some(&id);
         let on_click: CardAction = Rc::new(on_click);
-        self.card_actions
-            .borrow_mut()
-            .insert(id.clone(), on_click.clone());
+        let leaving = self.drawing_leaving.get();
+        if !leaving {
+            self.card_actions
+                .borrow_mut()
+                .insert(id.clone(), on_click.clone());
+        }
         let registry = self.card_bounds.clone();
         let key = id.clone();
         let color = PLACEHOLDER_COLORS
@@ -2071,7 +2174,11 @@ impl Shell {
             .child(
                 // Records where the card is, for the arrow keys.
                 canvas(
-                    move |b, _, _| registry.borrow_mut().push((key, b)),
+                    move |b, _, _| {
+                        if !leaving {
+                            registry.borrow_mut().push((key, b));
+                        }
+                    },
                     |_, _, _, _| {},
                 )
                 .absolute()
@@ -2445,14 +2552,72 @@ impl Shell {
         });
     }
 
+    /// The page just left starts fading out (keeping where it was
+    /// scrolled), unless motion is off or Settings, with its own layout,
+    /// is either side.
+    fn start_leaving(&mut self, cx: &mut Context<Self>) {
+        let arr_scroll = self.arr_pages.left_scroll.take();
+        let Some(old) = self.scrolled_screen.clone() else {
+            return;
+        };
+        if !crate::motion::enabled() || old == Screen::Settings || self.screen == Screen::Settings {
+            self.leaving = None;
+            return;
+        }
+        self.leaving = Some(Leaving {
+            screen: old,
+            started: Instant::now(),
+            content_scroll: frozen(&self.content_scroll),
+            grid_scroll: frozen_list(&self.grid_scroll),
+            arr_scroll: arr_scroll.unwrap_or_else(|| frozen_list(&self.arr_pages.scroll)),
+        });
+        // Gone once the new page has faded in.
+        let generation = self.page_generation;
+        let page_time = crate::motion::duration(crate::motion::PAGE);
+        cx.spawn(async move |this, cx| {
+            cx.background_executor().timer(page_time).await;
+            this.update(cx, |this, cx| {
+                if this.page_generation == generation {
+                    this.leaving = None;
+                    cx.notify();
+                }
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    /// The page being left, drawn with its own scroll positions.
+    fn leaving_page(&mut self, window: &mut Window, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let leaving = self.leaving.as_mut()?;
+        if leaving.started.elapsed() >= crate::motion::duration(crate::motion::PAGE) {
+            self.leaving = None;
+            return None;
+        }
+        let screen = leaving.screen.clone();
+        let leaving = self.leaving.as_mut()?;
+        std::mem::swap(&mut self.content_scroll, &mut leaving.content_scroll);
+        std::mem::swap(&mut self.grid_scroll, &mut leaving.grid_scroll);
+        std::mem::swap(&mut self.arr_pages.scroll, &mut leaving.arr_scroll);
+        self.drawing_leaving.set(true);
+        let page = self.page(&screen, window, cx);
+        self.drawing_leaving.set(false);
+        let leaving = self.leaving.as_mut()?;
+        std::mem::swap(&mut self.content_scroll, &mut leaving.content_scroll);
+        std::mem::swap(&mut self.grid_scroll, &mut leaving.grid_scroll);
+        std::mem::swap(&mut self.arr_pages.scroll, &mut leaving.arr_scroll);
+        Some(page)
+    }
+
     /// Scrolling for the page about to be drawn: a new screen starts at the
     /// top; a show page opened at an episode scrolls to it. The card's
     /// position is only known once it's been drawn, and the page above it
     /// can still grow (the show's details arrive), so the scroll is redone
     /// each frame for a moment, unless the viewer scrolls first.
-    fn update_scroll(&mut self, window: &mut Window) {
+    fn update_scroll(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.scrolled_screen.as_ref() != Some(&self.screen) {
             self.page_generation += 1;
+            self.start_leaving(cx);
             if let (Some(old), Some(cursor)) = (self.scrolled_screen.take(), self.cursor.take()) {
                 self.cursors.retain(|(screen, _)| *screen != old);
                 self.cursors.push((old, cursor));
@@ -2850,84 +3015,59 @@ impl Render for Shell {
             self.screen = Screen::Home;
             self.tab = Screen::Home;
         }
-        self.update_scroll(window);
+        self.update_scroll(window, cx);
         self.columns_hint.set(browse::columns(window));
         // Refilled as this frame's cards are laid out.
         self.card_bounds.borrow_mut().clear();
         self.card_actions.borrow_mut().clear();
         self.bounds_screen = Some(self.screen.clone());
-        let query = self.search_query(cx);
-        let on_tab = matches!(
-            self.screen,
-            Screen::Home
-                | Screen::Source(_)
-                | Screen::Movies(_)
-                | Screen::Shows(_)
-                | Screen::Downloads
-                | Screen::Arr(..)
-        );
-        let body: Result<Vec<AnyElement>, AnyElement> = match self.screen.clone() {
-            _ if on_tab && !query.is_empty() => Ok(self.search_results(&query, cx)),
-            Screen::Home => Ok(self.home(None, cx)),
-            Screen::Source(origin) => Ok(self.home(Some(origin), cx)),
-            ref screen @ (Screen::Movies(_) | Screen::Shows(_)) => {
-                let grid = Grid::of(screen).expect("a library tab");
-                Err(self.library_grid(grid, window, cx))
-            }
-            Screen::Show(name) => Ok(self.show_page(&name, cx)),
-            Screen::Details(key) => Ok(self.details_page(&key, cx)),
-            Screen::Tracked(server, kind, id) => Ok(self.tracked_page(server, kind, id, cx)),
-            Screen::Downloads => Ok(self.downloads_page(cx)),
-            Screen::Arr(server, kind) => Err(self.arr_page(server, kind, window, cx)),
-            Screen::Settings => Err(self.settings_view(window, cx)),
-        };
-        // Sections scroll as one page; the grids scroll (and virtualize) themselves.
-        let content = match body {
-            Ok(sections) => {
-                let mut page = div()
-                    .id("content")
-                    .flex_1()
-                    .min_h(px(0.0))
-                    .overflow_y_scroll()
-                    .track_scroll(&self.content_scroll)
-                    .px_8()
-                    .pt(px(HEADER_HEIGHT))
-                    .pb_10()
-                    .children(sections);
-                // Sideways scrolling (shift+wheel, trackpad) is for the rows.
-                page.style().restrict_scroll_to_axis = Some(true);
-                page.into_any_element()
-            }
-            // Settings doesn't scroll as a whole: it just starts below the bar.
-            Err(view) if self.screen == Screen::Settings => div()
-                .flex()
-                .flex_col()
-                .flex_1()
-                .min_h(px(0.0))
-                .pt(px(HEADER_HEIGHT))
-                .child(view)
-                .into_any_element(),
-            Err(grid) => grid,
-        };
-        // Each new page fades in, rising a little.
+        let content = self.page(&self.screen.clone(), window, cx);
+        // Each new page fades in, rising a little, over the page it replaces
+        // fading out, so one turns into the other.
+        let leaving = self.leaving_page(window, cx);
         let content = if crate::motion::enabled() {
-            div()
+            let page_time = crate::motion::duration(crate::motion::PAGE);
+            let entering = div()
+                .id("entering")
                 .flex()
                 .flex_col()
                 .flex_1()
                 .min_h(px(0.0))
                 .min_w(px(0.0))
+                // The page being left doesn't react to the mouse.
+                .occlude()
                 .child(content)
                 .with_animation(
                     ("page", self.page_generation),
-                    Animation::new(crate::motion::duration(crate::motion::PAGE))
-                        .with_easing(crate::motion::ease_out),
+                    Animation::new(page_time).with_easing(crate::motion::ease_out),
                     |page, t| {
                         page.opacity(t)
                             .relative()
                             .top(px((1.0 - t) * crate::motion::PAGE_RISE))
                     },
-                )
+                );
+            div()
+                .relative()
+                .flex()
+                .flex_col()
+                .flex_1()
+                .min_h(px(0.0))
+                .min_w(px(0.0))
+                .children(leaving.map(|page| {
+                    div()
+                        .id("leaving")
+                        .absolute()
+                        .inset_0()
+                        .flex()
+                        .flex_col()
+                        .child(page)
+                        .with_animation(
+                            ("leaving", self.page_generation),
+                            Animation::new(page_time).with_easing(crate::motion::ease_out),
+                            |page, t| page.opacity(1.0 - t),
+                        )
+                }))
+                .child(entering)
                 .into_any_element()
         } else {
             content

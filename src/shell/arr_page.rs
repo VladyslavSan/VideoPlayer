@@ -78,7 +78,9 @@ pub(super) struct ArrPages {
     fetching: usize,
     tab: Tab,
     missing_only: bool,
-    scroll: UniformListScrollHandle,
+    pub(super) scroll: UniformListScrollHandle,
+    /// The scroll of the page just left, for its fade.
+    pub(super) left_scroll: Option<UniformListScrollHandle>,
 }
 
 impl ArrPages {
@@ -139,7 +141,9 @@ impl Shell {
             .clone()
             .update(cx, |input, cx| input.set_text("", cx));
         self.arr_pages.tab = Tab::Library;
-        self.arr_pages.scroll = UniformListScrollHandle::new();
+        // The page being left (if it's one of these) fades out where it was.
+        let left = std::mem::replace(&mut self.arr_pages.scroll, UniformListScrollHandle::new());
+        self.arr_pages.left_scroll = Some(left);
         self.refresh_downloads(cx);
         self.load_arr_list((server, kind), false, cx);
     }
@@ -544,7 +548,7 @@ impl Shell {
         cx: &mut Context<Self>,
         pick: impl Fn(&mut Self) + 'static,
     ) -> AnyElement {
-        let kind = match self.screen {
+        let kind = match self.page_screen() {
             Screen::Arr(_, kind) => Some(kind),
             _ => None,
         };
