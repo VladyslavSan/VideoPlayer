@@ -13,9 +13,11 @@ use ureq::Agent;
 
 mod activity;
 mod add;
+mod library;
 mod seasons;
 pub use activity::{Download, Event, Recent, State as DownloadState, Subject};
 pub use add::{AddOptions, Candidate, Monitor, Setup};
+pub use library::{Art, Tracked};
 pub use seasons::{SeasonSummary, format_date, next_airing, parse_utc, summarize};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -457,6 +459,51 @@ impl Client {
         };
         let added: Value = self.slow().request("POST", path, Some(&body))?;
         added["id"].as_i64().context("no id in the answer")
+    }
+
+    /// Every show (Sonarr) or movie (Radarr) the app keeps track of.
+    pub fn library(&self) -> Result<Vec<Tracked>> {
+        let items: Vec<Value> = self.slow().get(match self.kind {
+            Kind::Sonarr => "/series",
+            Kind::Radarr => "/movie",
+        })?;
+        Ok(library::tracked(self.kind, items))
+    }
+
+    /// Saves the app's resized copy of a show's or movie's picture to `out`.
+    pub fn fetch_art(&self, id: i64, art: Art, out: &std::path::Path) -> Result<()> {
+        let url = format!("{}/api/v3/mediacover/{id}/{}", self.base, art.file());
+        let mut response = self
+            .agent
+            .get(&url)
+            .header("X-Api-Key", &self.key)
+            .call()
+            .with_context(|| format!("couldn't reach {}", self.base))?;
+        let status = response.status().as_u16();
+        if status != 200 {
+            bail!("{} answered HTTP {status} for a picture", self.kind.name());
+        }
+        let bytes = response
+            .body_mut()
+            .with_config()
+            .limit(20 << 20)
+            .read_to_vec()?;
+        // JPEG or PNG; anything else is likely a sign-in page.
+        if !(bytes.starts_with(&[0xFF, 0xD8]) || bytes.starts_with(b"\x89PNG")) {
+            bail!("not a picture");
+        }
+        if let Some(dir) = out.parent() {
+            std::fs::create_dir_all(dir)?;
+        }
+        let partial = out.with_extension("part");
+        std::fs::write(&partial, bytes)?;
+        std::fs::rename(&partial, out)?;
+        Ok(())
+    }
+
+    /// A page of the app's web interface.
+    pub fn web_page(&self, path: &str) -> String {
+        format!("{}{path}", self.base)
     }
 
     /// Checks the address and key, and that it's the right app.

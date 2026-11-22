@@ -306,6 +306,8 @@ pub struct Shell {
     arr_search: [Entity<TextInput>; 2],
     /// Library titles, for finding what a download is of.
     title_index: RefCell<Option<Rc<downloads::TitleIndex>>>,
+    /// What the Sonarr and Radarr pages have and show.
+    arr_pages: arr_page::ArrPages,
     /// Details pages' extra information, by item key or `show:<name>`.
     details: HashMap<String, Details>,
     details_loading: HashSet<String>,
@@ -462,6 +464,7 @@ impl Shell {
             search,
             arr_search,
             title_index: RefCell::new(None),
+            arr_pages: Default::default(),
             details: HashMap::new(),
             details_loading: HashSet::new(),
             quality_menu: None,
@@ -1803,7 +1806,8 @@ impl Shell {
 
     /// Whether a library grid's sort bar sits under the header.
     fn sort_bar_below(&self, cx: &Context<Self>) -> bool {
-        Grid::of(&self.screen).is_some() && self.search_query(cx).is_empty()
+        (Grid::of(&self.screen).is_some() || matches!(self.screen, Screen::Arr(..)))
+            && self.search_query(cx).is_empty()
     }
 
     /// The blur under the header (and the sort bar, if there is one): one
@@ -2846,7 +2850,7 @@ impl Render for Shell {
             Screen::Show(name) => Ok(self.show_page(&name, cx)),
             Screen::Details(key) => Ok(self.details_page(&key, cx)),
             Screen::Downloads => Ok(self.downloads_page(cx)),
-            Screen::Arr(server, kind) => Ok(self.arr_page(server, kind, cx)),
+            Screen::Arr(server, kind) => Err(self.arr_page(server, kind, window, cx)),
             Screen::Settings => Err(self.settings_view(window, cx)),
         };
         // Sections scroll as one page; the grids scroll (and virtualize) themselves.

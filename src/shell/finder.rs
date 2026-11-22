@@ -399,8 +399,10 @@ impl Shell {
                         {
                             c.existing = Some(id);
                         }
-                        // Its download shows up there soon.
+                        // Its download shows up there soon, and it's on
+                        // the app's page now.
                         this.refresh_downloads(cx);
+                        this.load_arr_list((key.0, key.1), true, cx);
                     }
                     Err(e) => {
                         eprintln!("[{}] adding {title}: {e:#}", key.1.name());

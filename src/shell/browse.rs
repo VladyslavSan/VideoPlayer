@@ -437,7 +437,7 @@ impl Shell {
     pub(super) fn set_tab(&mut self, screen: Screen, cx: &mut Context<Self>) {
         match screen {
             Screen::Downloads => self.refresh_downloads(cx),
-            Screen::Arr(_, kind) => self.arr_page_opened(kind, cx),
+            Screen::Arr(server, kind) => self.arr_page_opened(server, kind, cx),
             _ => {}
         }
         self.tab = screen.clone();
