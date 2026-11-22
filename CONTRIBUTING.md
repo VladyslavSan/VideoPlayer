@@ -4,6 +4,10 @@
 
 The app should feel calm and continuous, like a native media app: nothing on screen jumps.
 
+**Nothing ever pops.** No text, picture, button, note or panel appears, disappears or changes
+from one frame to the next: each one fades, dissolves or moves. A change that skips this is a
+bug, however small or brief.
+
 - **Smooth scrolling.** Every scrolling view moves smoothly. A mouse wheel step glides (the
   patched GPUI does this for any `overflow_scroll` element and `uniform_list`); scrolling the
   app does itself (to a row, to the top, keyboard moves through a grid) eases there too.
