@@ -94,7 +94,7 @@ pub static APPEAR: Timing = Timing::new(
     "motion_appear_ms",
     "Content arriving",
     "Something that loads after its page opened fading in.",
-    250,
+    350,
 );
 /// How long something takes to load before a note says it's loading.
 pub static WAIT: Timing = Timing::new(
@@ -171,8 +171,9 @@ pub fn ease_out(delta: f32) -> f32 {
     1.0 - (1.0 - delta).powi(4)
 }
 
-/// Slow at both ends, for one picture dissolving into another (easing out
-/// alone does most of the change in the first moments).
+/// Slow at both ends, for something dissolving in (a picture over another,
+/// text arriving): easing out alone does most of the change in the first
+/// moments, and reads as a pop.
 pub fn ease_in_out(delta: f32) -> f32 {
     delta * delta * (3.0 - 2.0 * delta)
 }

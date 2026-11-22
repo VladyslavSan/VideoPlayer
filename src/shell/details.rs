@@ -300,22 +300,25 @@ impl Shell {
         loading: bool,
         lines: Option<usize>,
     ) -> Option<AnyElement> {
-        let (text, waiting) = match details.and_then(|d| d.overview.clone()) {
-            Some(text) => (text, false),
-            None if loading => ("Loading details…".into(), true),
-            None => return None,
+        let paragraph = |text: SharedString, color: u32| {
+            div()
+                .pt_6()
+                .max_w(px(780.0))
+                .line_height(px(24.0))
+                .text_color(rgb(color))
+                .when_some(lines, |d, lines| d.line_clamp(lines))
+                .child(text)
         };
-        let text = div()
-            .pt_6()
-            .max_w(px(780.0))
-            .line_height(px(24.0))
-            .text_color(rgb(if waiting { MUTED } else { 0xd5d9e3 }))
-            .when_some(lines, |d, lines| d.line_clamp(lines))
-            .child(text);
-        Some(if waiting {
-            self.waiting("overview-loading", text)
-        } else {
-            self.arriving("overview", text)
+        let note = || paragraph("Loading details…".into(), MUTED);
+        Some(match details.and_then(|d| d.overview.clone()) {
+            Some(text) => self.arriving_over(
+                "overview-loading",
+                note(),
+                "overview",
+                paragraph(text.into(), 0xd5d9e3),
+            ),
+            None if loading => self.waiting("overview-loading", note()),
+            None => return None,
         })
     }
 
