@@ -36,7 +36,8 @@ Commit messages follow [Conventional Commits 1.0](https://www.conventionalcommit
 
 - **Summary**: imperative, lower case (names like Sonarr keep their capitals), no full stop, at
   most 72 characters in all (`fix(arr): decode split-scan JPEG posters`, not
-  `Fixed the posters.`).
+  `Fixed the posters.`). It's what the release notes show, so write it for someone using the
+  app.
 - **Body** (optional, after a blank line): what was wrong or missing and why the change fixes
   it, in plain words, wrapped at 72 columns.
 - **Footers**: `BREAKING CHANGE: ...`, `Co-Authored-By: ...` and the like, after a blank line.
@@ -99,6 +100,13 @@ the hook once per clone:
 ```
 git config core.hooksPath scripts/hooks
 ```
+
+### Release notes
+
+A release's notes are made from the commit summaries since the previous tag (`cliff.toml`,
+used by `.github/workflows/release.yml`): `feat` under New, `fix` under Fixed, `perf` under
+Faster, `revert` under Reverted. `refactor`, `test`, `docs`, `build`, `ci` and `chore` are left
+out, so a change users will notice needs `feat`, `fix` or `perf`.
 
 ## Code style
 

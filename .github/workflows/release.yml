@@ -1,5 +1,6 @@
 # Pushing a tag like v1.2.3 builds the Windows and macOS apps, runs the
-# tests on both, and publishes a GitHub release with the two downloads.
+# tests on both, and publishes a GitHub release with the two downloads
+# and notes made from the commit messages since the previous tag.
 # The tag sets the version (Cargo.toml's is replaced during the build).
 # Running it by hand (Actions > Release > Run workflow) builds and tests
 # without publishing; the downloads are kept as workflow artifacts.
@@ -113,6 +114,18 @@ jobs:
     permissions:
       contents: write
     steps:
+      - uses: actions/checkout@v4
+        with:
+          # The notes need the commits since the previous tag.
+          fetch-depth: 0
+      - name: Release notes
+        # From the commit messages since the previous tag (cliff.toml).
+        uses: orhun/git-cliff-action@v4
+        with:
+          config: cliff.toml
+          args: --latest --strip all
+        env:
+          OUTPUT: release-notes.md
       - uses: actions/download-artifact@v4
         with:
           path: dist
@@ -124,4 +137,4 @@ jobs:
           gh release create "$GITHUB_REF_NAME" dist/*.zip \
             --repo "$GITHUB_REPOSITORY" \
             --title "Video Player ${GITHUB_REF_NAME#v}" \
-            --generate-notes
+            --notes-file release-notes.md
