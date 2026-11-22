@@ -22,23 +22,23 @@ impl Timing {
 }
 
 /// A page appearing, and the one it replaces fading out.
-pub const PAGE: Timing = Timing::ms(500);
+pub const PAGE: Timing = Timing::ms(350);
 /// A picture fading in over another (a page header's full backdrop).
-pub const PICTURE: Timing = Timing::ms(500);
+pub const PICTURE: Timing = Timing::ms(350);
 /// Something that loads after its page opened (Sonarr's answer, an
 /// overview) fading in.
-pub const APPEAR: Timing = Timing::ms(500);
+pub const APPEAR: Timing = Timing::ms(350);
 /// Something on a page growing or shrinking to its new size (a loading
 /// note turning into a long description).
-pub const RESIZE: Timing = Timing::ms(500);
+pub const RESIZE: Timing = Timing::ms(350);
 /// How long something takes to load before a note says it's loading.
-pub const WAIT: Timing = Timing::ms(500);
+pub const WAIT: Timing = Timing::ms(350);
 /// A season folding open or shut.
-pub const FOLD: Timing = Timing::ms(500);
+pub const FOLD: Timing = Timing::ms(350);
 /// A poster lighting up under the mouse, or dimming after it.
-pub const HOVER: Timing = Timing::ms(500);
+pub const HOVER: Timing = Timing::ms(350);
 /// A mouse wheel step gliding to a stop (about 95% of the way).
-pub const WHEEL: Timing = Timing::ms(500);
+pub const WHEEL: Timing = Timing::ms(350);
 
 /// `base`, stretched by `VIDEO_PLAYER_MOTION_SCALE` (tests slow animations
 /// down to see them midway).
