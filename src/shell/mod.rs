@@ -43,6 +43,7 @@ mod reports;
 mod settings;
 mod sonarr;
 mod sync;
+mod tracked_page;
 mod watched;
 use browse::{Grid, Sort};
 use details::Details;
@@ -212,6 +213,9 @@ enum Screen {
     Downloads,
     /// A server's Sonarr or Radarr: adding to it, and what it's doing.
     Arr(i64, crate::arr::Kind),
+    /// A show or movie from Sonarr's or Radarr's list that Jellyfin doesn't
+    /// have: getting it. By server, app and the app's id for it.
+    Tracked(i64, crate::arr::Kind, i64),
     Settings,
 }
 
@@ -337,6 +341,8 @@ pub struct Shell {
     sonarr: HashMap<String, sonarr::SonarrView>,
     sonarr_loading: HashSet<String>,
     sonarr_requests: HashMap<(String, u32), sonarr::Request>,
+    /// Downloads asked for on a movie's page, by server and Radarr id.
+    movie_requests: HashMap<(i64, i64), tracked_page::MovieRequest>,
     downloads: downloads::Downloads,
     finder: finder::Finder,
     /// Open release lists, by show and season.
@@ -526,6 +532,7 @@ impl Shell {
             sonarr: HashMap::new(),
             sonarr_loading: HashSet::new(),
             sonarr_requests: HashMap::new(),
+            movie_requests: HashMap::new(),
             downloads: Default::default(),
             finder: Default::default(),
             release_panels: HashMap::new(),
@@ -1755,7 +1762,10 @@ impl Shell {
             (Screen::Settings, "tab") if self.adding_server => self.focus_next_field(window, cx),
 
             (Screen::Settings, "escape")
-            | (Screen::Show(_) | Screen::Details(_), "escape" | "backspace") => {
+            | (
+                Screen::Show(_) | Screen::Details(_) | Screen::Tracked(..),
+                "escape" | "backspace",
+            ) => {
                 self.screen = self.tab.clone();
                 window.focus(&self.focus);
                 cx.notify();
@@ -1901,7 +1911,7 @@ impl Shell {
             | Screen::Shows(_)
             | Screen::Downloads
             | Screen::Arr(..) => solid(self.search_field()),
-            Screen::Show(_) | Screen::Details(_) => back(self, cx),
+            Screen::Show(_) | Screen::Details(_) | Screen::Tracked(..) => back(self, cx),
             Screen::Settings => div()
                 .flex()
                 .items_center()
@@ -2831,7 +2841,9 @@ impl Render for Shell {
             Screen::Movies(_) | Screen::Shows(_) => !self.library_screens().contains(&self.screen),
             Screen::Source(origin) => !self.sources().iter().any(|s| s.origin == *origin),
             Screen::Downloads => self.arr_apps().is_empty(),
-            Screen::Arr(server, kind) => self.arr_client(*server, *kind).is_none(),
+            Screen::Arr(server, kind) | Screen::Tracked(server, kind, _) => {
+                self.arr_client(*server, *kind).is_none()
+            }
             _ => false,
         };
         if gone {
@@ -2864,6 +2876,7 @@ impl Render for Shell {
             }
             Screen::Show(name) => Ok(self.show_page(&name, cx)),
             Screen::Details(key) => Ok(self.details_page(&key, cx)),
+            Screen::Tracked(server, kind, id) => Ok(self.tracked_page(server, kind, id, cx)),
             Screen::Downloads => Ok(self.downloads_page(cx)),
             Screen::Arr(server, kind) => Err(self.arr_page(server, kind, window, cx)),
             Screen::Settings => Err(self.settings_view(window, cx)),

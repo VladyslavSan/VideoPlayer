@@ -18,7 +18,7 @@ mod picture;
 mod seasons;
 pub use activity::{Download, Event, Recent, State as DownloadState, Subject};
 pub use add::{AddOptions, Candidate, Monitor, Setup};
-pub use library::{Art, Tracked};
+pub use library::{Art, Have, Tracked};
 pub use picture::readable;
 pub use seasons::{SeasonSummary, format_date, next_airing, parse_utc, summarize};
 
@@ -319,6 +319,11 @@ impl Client {
         Ok(found.into_iter().next())
     }
 
+    /// The Sonarr show with this id.
+    pub fn series(&self, id: i64) -> Result<Series> {
+        self.get(&format!("/series/{id}"))
+    }
+
     pub fn episodes(&self, series: i64) -> Result<Vec<Episode>> {
         self.get(&format!("/episode?seriesId={series}"))
     }
@@ -393,6 +398,20 @@ impl Client {
             let _: Value = self.request("PUT", "/episode/monitor", Some(&monitor))?;
         }
         let search = json!({ "name": "SeasonSearch", "seriesId": series, "seasonNumber": season });
+        let _: Value = self.request("POST", "/command", Some(&search))?;
+        Ok(())
+    }
+
+    /// What a movie's Download button does: monitors it, then asks Radarr
+    /// to search for it.
+    pub fn download_movie(&self, id: i64) -> Result<()> {
+        // The whole movie object goes back, with the flag changed.
+        let mut movie: Value = self.get(&format!("/movie/{id}"))?;
+        if movie["monitored"] != json!(true) {
+            movie["monitored"] = json!(true);
+            let _: Value = self.request("PUT", &format!("/movie/{id}"), Some(&movie))?;
+        }
+        let search = json!({ "name": "MoviesSearch", "movieIds": [id] });
         let _: Value = self.request("POST", "/command", Some(&search))?;
         Ok(())
     }

@@ -81,6 +81,13 @@ pub(super) struct ArrPages {
     scroll: UniformListScrollHandle,
 }
 
+impl ArrPages {
+    /// The app's list, once it's been fetched.
+    pub(super) fn list(&self, key: AppKey) -> Option<Arc<Vec<Tracked>>> {
+        self.lists.get(&key)?.items.clone()
+    }
+}
+
 /// FNV-1a: a stable name for a cached file.
 fn fnv(text: &str) -> u64 {
     text.bytes().fold(0xcbf29ce484222325, |hash, b| {
@@ -181,13 +188,30 @@ impl Shell {
         item: &Tracked,
         cx: &mut Context<Self>,
     ) -> Option<PathBuf> {
-        let (art, url) = item.art.as_ref()?;
+        let (art, _) = item.art.as_ref()?;
+        self.arr_art(key, item, *art, cx)
+    }
+
+    /// A picture of it, if it's here; asks for it if not. The backdrop
+    /// (full size) is only for those with fanart.
+    pub(super) fn arr_art(
+        &mut self,
+        key: AppKey,
+        item: &Tracked,
+        art: Art,
+        cx: &mut Context<Self>,
+    ) -> Option<PathBuf> {
+        let (has, url) = item.art.as_ref()?;
+        if art == Art::Backdrop && *has != Art::Fanart {
+            return None;
+        }
         let name = format!(
-            "{}-{}-{}-{:016x}.jpg",
+            "{}-{}-{}-{:016x}{}.jpg",
             key.1.name().to_lowercase(),
             key.0,
             item.id,
-            fnv(url)
+            fnv(url),
+            if art == Art::Backdrop { "-full" } else { "" }
         );
         let path = self.paths.arr_pictures().join(name);
         match self.arr_pages.pictures.get(&path) {
@@ -202,7 +226,7 @@ impl Shell {
         self.arr_pages
             .pictures
             .insert(path.clone(), Picture::Loading);
-        self.arr_pages.queue.push_front((key, item.id, *art, path));
+        self.arr_pages.queue.push_front((key, item.id, art, path));
         self.fetch_pictures(cx);
         None
     }
@@ -281,23 +305,13 @@ impl Shell {
                 year: item.year,
             },
         };
-        // In the Jellyfin library: its page there. If not (yet), its page in
-        // the app's web interface.
+        // In the Jellyfin library: its page there. If not (yet), its page
+        // from what Sonarr or Radarr knows, to get it from.
         let target = self.library_target(server, &subject);
-        let web = item.slug.as_ref().and_then(|slug| {
-            let path = match kind {
-                Kind::Sonarr => format!("/series/{slug}"),
-                Kind::Radarr => format!("/movie/{slug}"),
-            };
-            Some(self.arr_client(server, kind)?.web_page(&path))
-        });
+        let id = item.id;
         self.card(card, None, cx, move |this, _, cx| match &target {
             Some(target) => this.open_target(target, cx),
-            None => {
-                if let Some(url) = &web {
-                    cx.open_url(url);
-                }
-            }
+            None => this.open_tracked(server, kind, id, cx),
         })
     }
 

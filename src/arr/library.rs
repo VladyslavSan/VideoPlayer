@@ -28,6 +28,8 @@ pub enum Art {
     Fanart,
     /// For the few with no fanart.
     Poster,
+    /// The fanart at full size, behind the title on its page.
+    Backdrop,
 }
 
 impl Art {
@@ -36,6 +38,7 @@ impl Art {
         match self {
             Art::Fanart => "fanart-360.jpg",
             Art::Poster => "poster-250.jpg",
+            Art::Backdrop => "fanart.jpg",
         }
     }
 }
@@ -54,6 +57,12 @@ pub struct Tracked {
     pub art: Option<(Art, String)>,
     /// Its page in the app's web interface: `/series/<slug>`, `/movie/<slug>`.
     pub slug: Option<String>,
+    pub overview: Option<String>,
+    pub genres: Vec<String>,
+    /// An episode's or the movie's length.
+    pub runtime_minutes: Option<u32>,
+    /// "Continuing", "Ended", "Released", …
+    pub state: Option<String>,
 }
 
 impl Tracked {
@@ -154,6 +163,29 @@ fn read(kind: Kind, v: &Value) -> Option<Tracked> {
         have,
         art,
         slug: v["titleSlug"].as_str().map(String::from),
+        overview: v["overview"]
+            .as_str()
+            .map(str::trim)
+            .filter(|o| !o.is_empty())
+            .map(String::from),
+        genres: v["genres"]
+            .as_array()
+            .map(|g| {
+                g.iter()
+                    .filter_map(|g| g.as_str().map(String::from))
+                    .collect()
+            })
+            .unwrap_or_default(),
+        runtime_minutes: v["runtime"]
+            .as_u64()
+            .filter(|m| *m > 0)
+            .and_then(|m| u32::try_from(m).ok()),
+        state: v["status"].as_str().map(|s| {
+            let mut c = s.chars();
+            c.next()
+                .map(|f| f.to_uppercase().chain(c).collect())
+                .unwrap_or_default()
+        }),
     })
 }
 
@@ -168,7 +200,8 @@ mod tests {
             Kind::Sonarr,
             vec![
                 json!({"id": 115, "title": "The Show", "sortTitle": "show", "year": 2011,
-                       "monitored": true, "titleSlug": "the-show",
+                       "monitored": true, "titleSlug": "the-show", "overview": " A show. ",
+                       "genres": ["Drama", "Anime"], "runtime": 24, "status": "continuing",
                        "statistics": {"episodeFileCount": 4, "episodeCount": 6, "totalEpisodeCount": 34},
                        "images": [{"coverType": "poster", "url": "/MediaCover/115/poster.jpg?lastWrite=1"},
                                   {"coverType": "fanart", "url": "/MediaCover/115/fanart.jpg?lastWrite=2"}]}),
@@ -191,6 +224,11 @@ mod tests {
         assert!(show.missing());
         assert_eq!(show.art.as_ref().map(|a| a.0), Some(Art::Fanart));
         assert_eq!(show.slug.as_deref(), Some("the-show"));
+        assert_eq!(show.overview.as_deref(), Some("A show."));
+        assert_eq!(show.genres, ["Drama", "Anime"]);
+        assert_eq!(show.runtime_minutes, Some(24));
+        assert_eq!(show.state.as_deref(), Some("Continuing"));
+        assert_eq!(list[0].overview, None);
     }
 
     #[test]

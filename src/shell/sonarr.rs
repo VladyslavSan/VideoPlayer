@@ -1,6 +1,7 @@
 //! A show's page and Sonarr: the seasons the show is missing, a Download
-//! button for each, their download progress, and the next air date. Only
-//! for shows on a Jellyfin server with Sonarr set up.
+//! button for each, their download progress, and the next air date. For
+//! shows on a Jellyfin server with Sonarr set up, and for shows Sonarr
+//! keeps that Jellyfin doesn't have yet (their page from Sonarr's list).
 
 use std::time::{Duration, Instant};
 
@@ -39,25 +40,61 @@ pub(super) enum Request {
     Failed(SharedString),
 }
 
+/// How a show is found in Sonarr.
+pub(super) enum SeriesRef {
+    Tvdb(String),
+    Id(i64),
+}
+
+/// Starts the names of shows from Sonarr's list (not in Jellyfin), which
+/// key the same maps as shows in the library; no show's name has it.
+const TRACKED: &str = "\u{1}sonarr:";
+
+/// The name a show from Sonarr's list goes by here.
+pub(super) fn tracked_show(server: i64, id: i64) -> String {
+    format!("{TRACKED}{server}:{id}")
+}
+
+/// The server and Sonarr id in a name from [`tracked_show`].
+pub(super) fn parse_tracked_show(show: &str) -> Option<(i64, i64)> {
+    let (server, id) = show.strip_prefix(TRACKED)?.split_once(':')?;
+    Some((server.parse().ok()?, id.parse().ok()?))
+}
+
 fn now() -> i64 {
     super::now()
 }
 
 impl Shell {
-    /// The Sonarr for a show's server, and the show's TVDB id.
-    pub(super) fn sonarr_for(&self, show: &str) -> Option<(Client, String)> {
+    /// The Sonarr for a show's server, and how to find the show there.
+    pub(super) fn sonarr_for(&self, show: &str) -> Option<(Client, SeriesRef)> {
+        if let Some((server, id)) = parse_tracked_show(show) {
+            return Some((self.arr_client(server, Kind::Sonarr)?, SeriesRef::Id(id)));
+        }
         let server = self.items().find_map(|i| match &i.source {
             Source::Jellyfin { server, .. } if i.show.as_deref() == Some(show) => Some(*server),
             _ => None,
         })?;
         let tvdb = self.details.get(&format!("show:{show}"))?.tvdb.clone()?;
-        Some((self.arr_client(server, Kind::Sonarr)?, tvdb))
+        Some((
+            self.arr_client(server, Kind::Sonarr)?,
+            SeriesRef::Tvdb(tvdb),
+        ))
+    }
+
+    /// Whether the show's page is the one open.
+    fn showing(&self, show: &str) -> bool {
+        match &self.screen {
+            Screen::Show(name) => name == show,
+            Screen::Tracked(server, Kind::Sonarr, id) => tracked_show(*server, *id) == show,
+            _ => false,
+        }
     }
 
     /// Asks Sonarr about the show (again), if it has Sonarr. Keeps asking
     /// every few seconds while the page is open and something downloads.
     pub(super) fn load_sonarr(&mut self, show: String, cx: &mut Context<Self>) {
-        let Some((client, tvdb)) = self.sonarr_for(&show) else {
+        let Some((client, series)) = self.sonarr_for(&show) else {
             return;
         };
         if !self.sonarr_loading.insert(show.clone()) {
@@ -70,8 +107,12 @@ impl Shell {
             let result = cx
                 .background_executor()
                 .spawn(async move {
-                    let Some(series) = client.series_by_tvdb(&tvdb)? else {
-                        return Ok(None);
+                    let series = match series {
+                        SeriesRef::Tvdb(tvdb) => match client.series_by_tvdb(&tvdb)? {
+                            Some(series) => series,
+                            None => return Ok(None),
+                        },
+                        SeriesRef::Id(id) => client.series(id)?,
                     };
                     let episodes = client.episodes(series.id)?;
                     let queue = client.queue(series.id)?;
@@ -118,7 +159,7 @@ impl Shell {
                     cx.spawn(async move |this, cx| {
                         cx.background_executor().timer(POLL).await;
                         this.update(cx, |this, cx| {
-                            if this.screen == Screen::Show(show.clone()) && this.player.is_none() {
+                            if this.showing(&show) && this.player.is_none() {
                                 this.load_sonarr(show, cx);
                             }
                         })
@@ -194,6 +235,14 @@ impl Shell {
                         .contains_key(&(show.to_string(), s.number))
             })
             .collect()
+    }
+
+    /// Every season Sonarr knows of (for a show Jellyfin doesn't have).
+    pub(super) fn sonarr_all_seasons(&self, show: &str) -> Vec<&SeasonSummary> {
+        match self.sonarr.get(show) {
+            Some(SonarrView::Ready(found)) => found.seasons.iter().collect(),
+            _ => Vec::new(),
+        }
     }
 
     /// Lines under the season list: Sonarr's state, and the next air date.
@@ -278,6 +327,12 @@ impl Shell {
                         None,
                     )
                 }
+                _ if season.aired == 0 && season.monitored => (
+                    "Not aired yet · Sonarr will get it when it airs".to_string(),
+                    MUTED,
+                    None,
+                ),
+                _ if season.aired == 0 => ("Not aired yet".to_string(), MUTED, Some("Download")),
                 _ if season.missing == 0 => ("Downloaded".to_string(), MUTED, None),
                 _ if season.monitored => (
                     format!("{missing} · Sonarr is watching for releases"),

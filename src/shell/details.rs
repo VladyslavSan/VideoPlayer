@@ -17,7 +17,7 @@ use crate::library::{self, Item, Source};
 const BACKDROP_WIDTH: u32 = 1920;
 const HERO_HEIGHT: f32 = 420.0;
 /// Lower on a show's page, so its seasons are in view.
-const SHOW_HERO_HEIGHT: f32 = 280.0;
+pub(super) const SHOW_HERO_HEIGHT: f32 = 280.0;
 
 /// Extra information for a details page, fetched when it opens.
 #[derive(Debug, Clone, Default)]
@@ -157,7 +157,7 @@ impl Shell {
         .detach();
     }
 
-    fn action_button(
+    pub(super) fn action_button(
         id: impl Into<gpui::ElementId>,
         label: impl Into<SharedString>,
         primary: bool,
@@ -180,7 +180,7 @@ impl Shell {
     }
 
     /// A wide image with the title and facts over a fade to the background.
-    fn hero(
+    pub(super) fn hero(
         height: f32,
         image: Option<PathBuf>,
         title: String,
@@ -226,7 +226,7 @@ impl Shell {
             .into_any_element()
     }
 
-    fn facts(
+    pub(super) fn facts(
         item_year: Option<u16>,
         duration: Option<f64>,
         details: Option<&Details>,
@@ -253,7 +253,7 @@ impl Shell {
 
     /// The item's overview; `lines` limits it (a show's page keeps it short
     /// so the seasons follow soon).
-    fn overview(
+    pub(super) fn overview(
         details: Option<&Details>,
         loading: bool,
         lines: Option<usize>,
