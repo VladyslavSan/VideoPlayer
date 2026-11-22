@@ -1,7 +1,6 @@
 //! How bright posters are: a little dimmed while browsing, lit up under
 //! the mouse (or the arrow keys' cursor), easing between the two. Both
-//! levels are settings (Settings > Appearance), and so are the animations'
-//! timings (`motion::TIMINGS`).
+//! levels are settings (Settings > Appearance).
 
 use std::cell::RefCell;
 use std::collections::HashMap;
@@ -14,7 +13,6 @@ use gpui::{
 
 use super::{ACCENT, MUTED, Shell};
 use crate::library::Db;
-use crate::motion::{TIMING_MAX_MS, TIMING_MIN_MS, Timing};
 
 const REST_SETTING: &str = "poster_brightness";
 const LIT_SETTING: &str = "poster_hover_brightness";
@@ -66,7 +64,7 @@ fn ease(started: Instant) -> f32 {
         return 1.0;
     }
     let time = crate::motion::HOVER.time().as_secs_f32();
-    crate::motion::ease_out((started.elapsed().as_secs_f32() / time).min(1.0))
+    crate::motion::ease_in_out((started.elapsed().as_secs_f32() / time).min(1.0))
 }
 
 impl Hover {
@@ -380,88 +378,8 @@ impl Shell {
                     .child(sample("While browsing", light.rest))
                     .child(sample("Under the mouse", light.lit)),
             );
-        vec![Self::section("Posters", body), self.timing_settings(cx)]
+        vec![Self::section("Posters", body)]
     }
-
-    /// Sets a timing and keeps it.
-    fn set_timing(&mut self, timing: &'static Timing, ms: u32) {
-        let old = timing.ms();
-        timing.set_ms(ms);
-        if timing.ms() == old {
-            return;
-        }
-        if std::ptr::eq(timing, &crate::motion::WHEEL) {
-            gpui::set_wheel_glide_time(timing.time());
-        }
-        if let Err(e) = self.db.set_setting(timing.key, &timing.ms().to_string()) {
-            eprintln!("[settings] saving {}: {e:#}", timing.key);
-        }
-    }
-
-    /// Settings > Appearance: how long each kind of animation takes.
-    fn timing_settings(&self, cx: &mut Context<Self>) -> AnyElement {
-        let range = Range {
-            min: TIMING_MIN_MS as f32,
-            max: TIMING_MAX_MS as f32,
-            step: 10.0,
-        };
-        let mut body = div().flex().flex_col().gap_2();
-        for (n, &timing) in crate::motion::TIMINGS.iter().enumerate() {
-            body = body.child(self.slider_row(
-                TIMING_SLIDERS[n],
-                timing.label,
-                format!("{} Default {} ms.", timing.about, timing.default_ms),
-                timing.ms() as f32,
-                range,
-                |ms| format!("{ms:.0} ms"),
-                cx,
-                move |this, ms| this.set_timing(timing, ms as u32),
-            ));
-        }
-        let reset = Self::action_button(
-            "timings-reset",
-            "Reset to defaults",
-            false,
-            cx,
-            |this, _, cx| {
-                for &timing in &crate::motion::TIMINGS {
-                    this.set_timing(timing, timing.default_ms);
-                }
-                cx.notify();
-            },
-        );
-        Self::section(
-            "Animation",
-            body.child(div().flex().pt_3().px_4().child(reset)),
-        )
-    }
-}
-
-/// The timings' sliders' ids, one per `motion::TIMINGS`.
-const TIMING_SLIDERS: [&str; 8] = [
-    "setting-timing-0",
-    "setting-timing-1",
-    "setting-timing-2",
-    "setting-timing-3",
-    "setting-timing-4",
-    "setting-timing-5",
-    "setting-timing-6",
-    "setting-timing-7",
-];
-
-/// Reads the saved timings (Settings > Appearance > Animation).
-pub(super) fn load_timings(db: &Db) {
-    for &timing in &crate::motion::TIMINGS {
-        if let Some(ms) = db
-            .setting(timing.key)
-            .ok()
-            .flatten()
-            .and_then(|v| v.parse::<u32>().ok())
-        {
-            timing.set_ms(ms);
-        }
-    }
-    gpui::set_wheel_glide_time(crate::motion::WHEEL.time());
 }
 
 /// Needs a frame to draw the next step of a card easing.

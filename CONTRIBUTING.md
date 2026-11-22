@@ -17,10 +17,10 @@ bug, however small or brief.
   that loads after its page opened fades in (`Shell::arriving`), and a "Loading…" note waits a
   moment before fading in (`Shell::waiting`), so a quick answer never flashes one.
 - **Standard timings.** Use the timings in `src/motion.rs` (`PAGE.time()`, `FOLD.time()`, …)
-  and its easings, and add a named one to `TIMINGS` for a new kind of motion instead of a
-  literal in place: each is a setting (Settings > Appearance > Animation), so it can be tuned
-  in the running app. Roughly 150–250 ms, easing out; long enough to follow, short enough never
-  to wait on. One picture dissolving into another is the exception, slower (`PICTURE`).
+  and its easings, and add a named one there for a new kind of motion instead of a literal in
+  place, so every timing is tuned in one file. They're 500 ms for now, easing in and out
+  (`ease_in_out`): a fast ease-out does most of the change in its first moments and reads as a
+  pop.
 - **Reduced motion.** Animations run only when `motion::enabled()`: the system's "Animation
   effects" (Windows) / "Reduce motion" (macOS) turns them off, and so does
   `VIDEO_PLAYER_NO_MOTION`. Without motion, things simply appear in their final state.

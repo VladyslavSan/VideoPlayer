@@ -479,7 +479,6 @@ impl Shell {
         crate::net::init(paths.db.with_file_name("addresses.json"));
         let db = Db::open(&paths.db)?;
         let poster_light = posters::Light::load(&db);
-        posters::load_timings(&db);
         let device_id = db.device_id()?;
         let focus = cx.focus_handle();
         focus.focus(window);
@@ -3103,7 +3102,7 @@ impl Render for Shell {
                 .child(content)
                 .with_animation(
                     ("page", self.page_generation),
-                    Animation::new(page_time).with_easing(crate::motion::ease_out),
+                    Animation::new(page_time).with_easing(crate::motion::ease_in_out),
                     |page, t| {
                         page.opacity(t)
                             .relative()
@@ -3127,7 +3126,7 @@ impl Render for Shell {
                         .child(page)
                         .with_animation(
                             ("leaving", self.page_generation),
-                            Animation::new(page_time).with_easing(crate::motion::ease_out),
+                            Animation::new(page_time).with_easing(crate::motion::ease_in_out),
                             |page, t| page.opacity(1.0 - t),
                         )
                 }))
