@@ -176,8 +176,18 @@ impl Shell {
         item: &Tracked,
         cx: &mut Context<Self>,
     ) -> Vec<AnyElement> {
-        let Have::Movie { file, released } = item.have else {
+        let Have::Movie {
+            file,
+            released,
+            in_cinemas,
+        } = item.have
+        else {
             return Vec::new();
+        };
+        let not_out = if in_cinemas {
+            "In cinemas"
+        } else {
+            "Not released yet"
         };
         let request = self.movie_requests.get(&(server, item.id));
         let searching =
@@ -187,12 +197,15 @@ impl Shell {
             Some(MovieRequest::Sending) => ("Asking Radarr…".to_string(), MUTED, None),
             Some(MovieRequest::Failed(e)) => (e.to_string(), ERROR, Some("Try Again")),
             _ if searching => ("Radarr is searching for it".to_string(), MUTED, None),
+            // Radarr only looks by itself once it's out (by the movie's
+            // minimum availability), but a search asked for now looks
+            // anyway: something may be out already.
             _ if !released && item.monitored => (
-                "Not released yet · Radarr will get it when it's out".to_string(),
+                format!("{not_out} · Radarr will get it when it's out"),
                 MUTED,
-                None,
+                Some("Search Now"),
             ),
-            _ if !released => ("Not released yet".to_string(), MUTED, Some("Download")),
+            _ if !released => (not_out.to_string(), MUTED, Some("Download")),
             _ if item.monitored => (
                 "Missing · Radarr is watching for releases".to_string(),
                 MUTED,

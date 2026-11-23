@@ -10,14 +10,14 @@ use super::Kind;
 pub enum Have {
     /// Episodes on disk, of those it's after (monitored, aired); and all
     /// it knows of.
-    Episodes {
-        files: u32,
-        wanted: u32,
-        total: u32,
-    },
+    Episodes { files: u32, wanted: u32, total: u32 },
     Movie {
         file: bool,
+        /// Available, by its minimum availability (out on digital or disc,
+        /// say): what Radarr waits for before it looks by itself.
         released: bool,
+        /// Its cinema date has passed.
+        in_cinemas: bool,
     },
 }
 
@@ -71,7 +71,7 @@ impl Tracked {
         self.monitored
             && match self.have {
                 Have::Episodes { files, wanted, .. } => files < wanted,
-                Have::Movie { file, released } => released && !file,
+                Have::Movie { file, released, .. } => released && !file,
             }
     }
 
@@ -92,6 +92,11 @@ impl Tracked {
             },
             Have::Movie { file: true, .. } => "Downloaded".into(),
             Have::Movie {
+                released: false,
+                in_cinemas: true,
+                ..
+            } => "In cinemas".into(),
+            Have::Movie {
                 released: false, ..
             } => "Not released yet".into(),
             Have::Movie { .. } if self.monitored => "Missing".into(),
@@ -107,6 +112,12 @@ impl Tracked {
         }
         text
     }
+}
+
+fn now() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs() as i64)
 }
 
 fn plural(n: u32, noun: &str) -> String {
@@ -137,6 +148,10 @@ fn read(kind: Kind, v: &Value) -> Option<Tracked> {
         Kind::Radarr => Have::Movie {
             file: v["hasFile"].as_bool().unwrap_or(false),
             released: v["isAvailable"].as_bool().unwrap_or(true),
+            in_cinemas: v["inCinemas"]
+                .as_str()
+                .and_then(super::parse_utc)
+                .is_some_and(|at| at <= now()),
         },
     };
     let image = |cover: &str| {
@@ -229,6 +244,22 @@ mod tests {
         assert_eq!(show.runtime_minutes, Some(24));
         assert_eq!(show.state.as_deref(), Some("Continuing"));
         assert_eq!(list[0].overview, None);
+    }
+
+    #[test]
+    fn a_movie_in_cinemas_says_so() {
+        let movie = |cinemas: &str| {
+            tracked(
+                Kind::Radarr,
+                vec![
+                    json!({"id": 1, "title": "Film", "hasFile": false, "isAvailable": false,
+                            "monitored": true, "inCinemas": cinemas, "images": []}),
+                ],
+            )
+            .remove(0)
+        };
+        assert_eq!(movie("2020-01-01T00:00:00Z").status(), "In cinemas");
+        assert_eq!(movie("2999-01-01T00:00:00Z").status(), "Not released yet");
     }
 
     #[test]
