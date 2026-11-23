@@ -28,7 +28,7 @@ const POSTER_H: f32 = 108.0;
 const ADDED: u32 = 0x7ad89a;
 
 pub(super) type AppKey = (i64, Kind);
-type ResultKey = (i64, Kind, i64);
+pub(super) type ResultKey = (i64, Kind, i64);
 
 enum Lookup {
     Searching,
@@ -70,6 +70,9 @@ pub(super) struct Finder {
     /// Added from here, with whether a search was started.
     added: HashMap<ResultKey, bool>,
     posters: HashMap<String, Poster>,
+    /// Results whose page was opened, kept (with what's needed to add
+    /// them) past the next search.
+    opened: HashMap<ResultKey, Candidate>,
 }
 
 fn kind_noun(kind: Kind) -> &'static str {
@@ -254,7 +257,24 @@ impl Shell {
         .detach();
     }
 
-    fn load_poster(&mut self, url: String, cx: &mut Context<Self>) {
+    /// The picture at `url`, if it's here (`load_poster` fetches it).
+    pub(super) fn poster_file(&self, url: &str) -> Option<PathBuf> {
+        match self.finder.posters.get(url) {
+            Some(Poster::Ready(path)) => Some(path.clone()),
+            _ => None,
+        }
+    }
+
+    /// Keeps a result whose page is opened.
+    pub(super) fn keep_candidate(&mut self, key: ResultKey, candidate: Candidate) {
+        self.finder.opened.insert(key, candidate);
+    }
+
+    pub(super) fn kept_candidate(&self, key: ResultKey) -> Option<&Candidate> {
+        self.finder.opened.get(&key)
+    }
+
+    pub(super) fn load_poster(&mut self, url: String, cx: &mut Context<Self>) {
         if self.finder.posters.contains_key(&url) {
             return;
         }
@@ -290,10 +310,11 @@ impl Shell {
     }
 
     fn candidate(&self, key: ResultKey) -> Option<&Candidate> {
-        match self.finder.lookups.get(&(key.0, key.1))? {
-            Lookup::Ready(found) => found.iter().find(|c| c.key == key.2),
+        let found = match self.finder.lookups.get(&(key.0, key.1)) {
+            Some(Lookup::Ready(found)) => found.iter().find(|c| c.key == key.2),
             _ => None,
-        }
+        };
+        found.or_else(|| self.finder.opened.get(&key))
     }
 
     fn setup(&self, key: AppKey) -> Option<Arc<Setup>> {
@@ -491,20 +512,6 @@ impl Shell {
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let key: ResultKey = (server, kind, candidate.key);
-        let subject = match kind {
-            Kind::Sonarr => Subject::Episodes {
-                show: candidate.title.clone(),
-                year: candidate.year,
-                episodes: Vec::new(),
-            },
-            Kind::Radarr => Subject::Movie {
-                title: candidate.title.clone(),
-                year: candidate.year,
-            },
-        };
-        let in_library = candidate
-            .existing
-            .and_then(|_| self.library_target(server, &subject));
         let poster = candidate
             .poster
             .as_ref()
@@ -529,7 +536,138 @@ impl Shell {
             facts.push(status);
         }
         facts.extend(candidate.genres.iter().take(3).cloned());
-        let action: AnyElement = if let Some(target) = in_library {
+        let action = self.candidate_action(server, kind, candidate, cx);
+        let open = candidate.clone();
+        let summary = div()
+            .flex()
+            .gap_4()
+            .child(
+                // The poster and text open its page.
+                div()
+                    .id(SharedString::from(format!(
+                        "result-{}-{}",
+                        kind.name(),
+                        candidate.key
+                    )))
+                    .flex()
+                    .gap_4()
+                    .flex_1()
+                    .min_w(px(0.0))
+                    .cursor_pointer()
+                    .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
+                        this.open_candidate(server, kind, open.clone(), cx)
+                    }))
+                    .child(
+                        div()
+                            .flex_none()
+                            .w(px(POSTER_W))
+                            .h(px(POSTER_H))
+                            .rounded_md()
+                            .overflow_hidden()
+                            .bg(rgba(0xffffff0d))
+                            .children(
+                                poster.map(|p| img(p).size_full().object_fit(ObjectFit::Cover)),
+                            ),
+                    )
+                    .child(
+                        div()
+                            .flex()
+                            .flex_col()
+                            .gap_1()
+                            .flex_1()
+                            .min_w(px(0.0))
+                            .child(
+                                div()
+                                    .flex()
+                                    .items_baseline()
+                                    .gap_2()
+                                    .child(
+                                        div()
+                                            .font_weight(FontWeight::SEMIBOLD)
+                                            .child(candidate.title.clone()),
+                                    )
+                                    .children(candidate.year.map(|y| {
+                                        div().text_sm().text_color(rgb(MUTED)).child(y.to_string())
+                                    }))
+                                    .when(candidate.is_anime(), |d| {
+                                        d.child(
+                                            div()
+                                                .px_1p5()
+                                                .rounded_sm()
+                                                .text_xs()
+                                                .bg(rgba(0xffffff1a))
+                                                .child("Anime"),
+                                        )
+                                    }),
+                            )
+                            .when(!facts.is_empty(), |d| {
+                                d.child(
+                                    div()
+                                        .text_xs()
+                                        .text_color(rgb(MUTED))
+                                        .child(facts.join(" · ")),
+                                )
+                            })
+                            .children(candidate.overview.clone().map(|o| {
+                                div()
+                                    .text_sm()
+                                    .text_color(rgb(MUTED))
+                                    .line_clamp(2)
+                                    .child(o)
+                            })),
+                    ),
+            )
+            .child(div().flex_none().child(action));
+        div()
+            .flex()
+            .flex_col()
+            .gap_4()
+            .p_3()
+            .rounded_lg()
+            .bg(rgba(0xffffff08))
+            .child(summary)
+            .children(self.add_form_for(key, candidate, cx))
+            .into_any_element()
+    }
+
+    /// The form for adding the result, if it's open.
+    pub(super) fn add_form_for(
+        &self,
+        key: ResultKey,
+        candidate: &Candidate,
+        cx: &mut Context<Self>,
+    ) -> Option<AnyElement> {
+        self.finder
+            .form
+            .as_ref()
+            .filter(|f| f.key == key)
+            .map(|form| self.add_form(form, candidate, cx))
+    }
+
+    /// What can be done with a result: Add…, or where it already is.
+    pub(super) fn candidate_action(
+        &self,
+        server: i64,
+        kind: Kind,
+        candidate: &Candidate,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let key: ResultKey = (server, kind, candidate.key);
+        let subject = match kind {
+            Kind::Sonarr => Subject::Episodes {
+                show: candidate.title.clone(),
+                year: candidate.year,
+                episodes: Vec::new(),
+            },
+            Kind::Radarr => Subject::Movie {
+                title: candidate.title.clone(),
+                year: candidate.year,
+            },
+        };
+        let in_library = candidate
+            .existing
+            .and_then(|_| self.library_target(server, &subject));
+        if let Some(target) = in_library {
             div()
                 .id(SharedString::from(format!(
                     "open-{}-{}",
@@ -572,84 +710,7 @@ impl Shell {
                 cx,
                 move |this, _, cx| this.open_form(key, cx),
             )
-        };
-        let summary = div()
-            .flex()
-            .gap_4()
-            .child(
-                div()
-                    .flex_none()
-                    .w(px(POSTER_W))
-                    .h(px(POSTER_H))
-                    .rounded_md()
-                    .overflow_hidden()
-                    .bg(rgba(0xffffff0d))
-                    .children(poster.map(|p| img(p).size_full().object_fit(ObjectFit::Cover))),
-            )
-            .child(
-                div()
-                    .flex()
-                    .flex_col()
-                    .gap_1()
-                    .flex_1()
-                    .min_w(px(0.0))
-                    .child(
-                        div()
-                            .flex()
-                            .items_baseline()
-                            .gap_2()
-                            .child(
-                                div()
-                                    .font_weight(FontWeight::SEMIBOLD)
-                                    .child(candidate.title.clone()),
-                            )
-                            .children(candidate.year.map(|y| {
-                                div().text_sm().text_color(rgb(MUTED)).child(y.to_string())
-                            }))
-                            .when(candidate.is_anime(), |d| {
-                                d.child(
-                                    div()
-                                        .px_1p5()
-                                        .rounded_sm()
-                                        .text_xs()
-                                        .bg(rgba(0xffffff1a))
-                                        .child("Anime"),
-                                )
-                            }),
-                    )
-                    .when(!facts.is_empty(), |d| {
-                        d.child(
-                            div()
-                                .text_xs()
-                                .text_color(rgb(MUTED))
-                                .child(facts.join(" · ")),
-                        )
-                    })
-                    .children(candidate.overview.clone().map(|o| {
-                        div()
-                            .text_sm()
-                            .text_color(rgb(MUTED))
-                            .line_clamp(2)
-                            .child(o)
-                    })),
-            )
-            .child(div().flex_none().child(action));
-        div()
-            .flex()
-            .flex_col()
-            .gap_4()
-            .p_3()
-            .rounded_lg()
-            .bg(rgba(0xffffff08))
-            .child(summary)
-            .children(
-                self.finder
-                    .form
-                    .as_ref()
-                    .filter(|f| f.key == key)
-                    .map(|form| self.add_form(form, candidate, cx)),
-            )
-            .into_any_element()
+        }
     }
 
     fn add_form(

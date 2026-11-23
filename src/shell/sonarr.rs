@@ -29,6 +29,8 @@ pub(super) struct SonarrShow {
     seasons: Vec<SeasonSummary>,
     /// "S12E3 · Title" and when it airs.
     next: Option<(String, i64)>,
+    /// Every episode, by season.
+    episodes: std::collections::BTreeMap<u32, Vec<super::episode_list::EpisodeLine>>,
 }
 
 pub(super) enum Request {
@@ -126,10 +128,22 @@ impl Shell {
                         };
                         (label, at)
                     });
+                    let mut by_season: std::collections::BTreeMap<u32, Vec<_>> =
+                        std::collections::BTreeMap::new();
+                    for e in &episodes {
+                        by_season
+                            .entry(e.season_number)
+                            .or_default()
+                            .push(super::episode_list::EpisodeLine::from_sonarr(e));
+                    }
+                    for list in by_season.values_mut() {
+                        list.sort_by_key(|e| e.number);
+                    }
                     anyhow::Ok(Some(SonarrShow {
                         series: series.id,
                         seasons,
                         next,
+                        episodes: by_season,
                     }))
                 })
                 .await;
@@ -235,6 +249,22 @@ impl Shell {
                         .contains_key(&(show.to_string(), s.number))
             })
             .collect()
+    }
+
+    /// A season's episodes as Sonarr knows them.
+    pub(super) fn sonarr_episodes(
+        &self,
+        show: &str,
+        season: u16,
+    ) -> Vec<super::episode_list::EpisodeLine> {
+        match self.sonarr.get(show) {
+            Some(SonarrView::Ready(found)) => found
+                .episodes
+                .get(&u32::from(season))
+                .cloned()
+                .unwrap_or_default(),
+            _ => Vec::new(),
+        }
     }
 
     /// Every season Sonarr knows of (for a show Jellyfin doesn't have).

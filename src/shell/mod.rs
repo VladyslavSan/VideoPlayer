@@ -35,7 +35,9 @@ mod browse;
 mod controls_page;
 mod details;
 mod downloads;
+mod episode_list;
 mod finder;
+mod found_page;
 mod keynav;
 mod live;
 mod offline;
@@ -220,6 +222,9 @@ enum Screen {
     /// A show or movie from Sonarr's or Radarr's list that Jellyfin doesn't
     /// have: getting it. By server, app and the app's id for it.
     Tracked(i64, crate::arr::Kind, i64),
+    /// A search result neither Jellyfin nor the app has: what the search
+    /// found. By server, app and its TVDB (shows) or TMDB (movies) id.
+    Found(i64, crate::arr::Kind, i64),
     Settings,
 }
 
@@ -432,6 +437,8 @@ pub struct Shell {
     pictures: RefCell<pictures::Pictures>,
     /// Boxes easing to a new height.
     heights: resize::Heights,
+    /// What search results' pages know beyond the search.
+    found: found_page::FoundPages,
     leaving: Option<Leaving>,
     /// How bright posters are at rest and lit.
     poster_light: Cell<posters::Light>,
@@ -558,6 +565,7 @@ impl Shell {
             revealed: RefCell::default(),
             pictures: RefCell::default(),
             heights: resize::Heights::default(),
+            found: found_page::FoundPages::default(),
             leaving: None,
             poster_light: Cell::new(poster_light),
             card_hover: RefCell::default(),
@@ -1821,7 +1829,7 @@ impl Shell {
 
             (Screen::Settings, "escape")
             | (
-                Screen::Show(_) | Screen::Details(_) | Screen::Tracked(..),
+                Screen::Show(_) | Screen::Details(_) | Screen::Tracked(..) | Screen::Found(..),
                 "escape" | "backspace",
             ) => {
                 self.screen = self.tab.clone();
@@ -1890,6 +1898,7 @@ impl Shell {
             Screen::Tracked(server, kind, id) => {
                 Ok(self.tracked_page(server, kind, id, window, cx))
             }
+            Screen::Found(server, kind, key) => Ok(self.found_page(server, kind, key, window, cx)),
             Screen::Downloads => Ok(self.downloads_page(cx)),
             Screen::Arr(server, kind) => Err(self.arr_page(server, kind, window, cx)),
             Screen::Settings => Err(self.settings_view(window, cx)),
@@ -2037,7 +2046,9 @@ impl Shell {
             | Screen::Shows(_)
             | Screen::Downloads
             | Screen::Arr(..) => solid(self.search_field()),
-            Screen::Show(_) | Screen::Details(_) | Screen::Tracked(..) => back(self, cx),
+            Screen::Show(_) | Screen::Details(_) | Screen::Tracked(..) | Screen::Found(..) => {
+                back(self, cx)
+            }
             Screen::Settings => div()
                 .flex()
                 .items_center()
@@ -2764,7 +2775,19 @@ impl Shell {
             .into_iter()
             .map(|number| {
                 let episodes = seasons.remove(&number).unwrap_or_default();
-                self.season_block(show, number, episodes, sonarr.get(&number).copied(), cx)
+                let listed = if episodes.is_empty() {
+                    self.sonarr_episodes(show, number)
+                } else {
+                    Vec::new()
+                };
+                self.season_block(
+                    show,
+                    number,
+                    episodes,
+                    sonarr.get(&number).copied(),
+                    listed,
+                    cx,
+                )
             })
             .collect();
         let list = div()
@@ -2784,11 +2807,15 @@ impl Shell {
         number: u16,
         mut episodes: Vec<&Item>,
         sonarr: Option<&crate::arr::SeasonSummary>,
+        listed: Vec<episode_list::EpisodeLine>,
         cx: &mut Context<Self>,
     ) -> AnyElement {
         episodes.sort_by_key(|e| e.episode);
         let have = !episodes.is_empty();
-        let open = have
+        // Without Jellyfin's episodes, what Sonarr (or its metadata) lists.
+        let listing = !have && !listed.is_empty();
+        let foldable = have || listing;
+        let open = foldable
             && self
                 .open_seasons
                 .get(show)
@@ -2800,6 +2827,10 @@ impl Shell {
         };
         let unwatched = episodes.iter().filter(|e| !e.watched).count();
         let summary = match (episodes.len(), unwatched) {
+            (0, _) if listing && sonarr.is_none() => Some(match listed.len() {
+                1 => "1 episode".to_string(),
+                n => format!("{n} episodes"),
+            }),
             (0, _) => None,
             (1, 0) => Some("1 episode · watched".to_string()),
             (n, 0) => Some(format!("{n} episodes · all watched")),
@@ -2833,7 +2864,7 @@ impl Shell {
             .flex_1()
             .min_w(px(0.0))
             .py_3()
-            .when(have, |d| {
+            .when(foldable, |d| {
                 d.cursor_pointer()
                     .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
                         let open = this.open_seasons.entry(toggle_show.clone()).or_default();
@@ -2858,7 +2889,7 @@ impl Shell {
                     .w(px(14.0))
                     .flex_none()
                     .text_color(rgb(MUTED))
-                    .child(if !have {
+                    .child(if !foldable {
                         ""
                     } else if open {
                         "▾"
@@ -2928,34 +2959,37 @@ impl Shell {
             .copied()
             .unwrap_or_else(|| {
                 // Not drawn yet: a guess, corrected after the first frame.
+                if listing {
+                    return 24.0 + listed.len() as f32 * 76.0;
+                }
                 let rows = episodes.len().div_ceil(self.columns_hint.get().max(1));
                 24.0 + rows as f32 * (CARD_HEIGHT + 56.0)
             });
-        let grid = (open || (have && closing)).then(|| {
-            let cards = episodes
-                .into_iter()
-                .map(|e| self.item_card("episode", e, false, cx))
-                .collect();
+        let grid = (open || (foldable && closing)).then(|| {
+            let content = if listing {
+                episode_list::episode_rows(&listed)
+            } else {
+                let cards = episodes
+                    .into_iter()
+                    .map(|e| self.item_card("episode", e, false, cx))
+                    .collect();
+                Self::grid(cards)
+            };
             let heights = self.season_heights.clone();
-            let inner = div()
-                .relative()
-                .pt_2()
-                .pb_4()
-                .child(Self::grid(cards))
-                .child(
-                    canvas(
-                        move |bounds, _, _| {
-                            heights
-                                .borrow_mut()
-                                .insert(key, f32::from(bounds.size.height));
-                        },
-                        |_, _, _, _| {},
-                    )
-                    .absolute()
-                    .top_0()
-                    .left_0()
-                    .size_full(),
-                );
+            let inner = div().relative().pt_2().pb_4().child(content).child(
+                canvas(
+                    move |bounds, _, _| {
+                        heights
+                            .borrow_mut()
+                            .insert(key, f32::from(bounds.size.height));
+                    },
+                    |_, _, _, _| {},
+                )
+                .absolute()
+                .top_0()
+                .left_0()
+                .size_full(),
+            );
             let outer = div().overflow_hidden().child(inner);
             match fold {
                 Some(fold) => {
@@ -3068,9 +3102,9 @@ impl Render for Shell {
             Screen::Movies(_) | Screen::Shows(_) => !self.library_screens().contains(&self.screen),
             Screen::Source(origin) => !self.sources().iter().any(|s| s.origin == *origin),
             Screen::Downloads => self.arr_apps().is_empty(),
-            Screen::Arr(server, kind) | Screen::Tracked(server, kind, _) => {
-                self.arr_client(*server, *kind).is_none()
-            }
+            Screen::Arr(server, kind)
+            | Screen::Tracked(server, kind, _)
+            | Screen::Found(server, kind, _) => self.arr_client(*server, *kind).is_none(),
             _ => false,
         };
         if gone {

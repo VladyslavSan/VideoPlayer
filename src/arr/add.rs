@@ -29,6 +29,20 @@ pub struct Candidate {
     /// "continuing", "ended", "released", "announced".
     pub status: Option<String>,
     pub poster: Option<String>,
+    /// A wide picture of it, for its page.
+    pub fanart: Option<String>,
+    /// Episode or movie length.
+    pub runtime: Option<u32>,
+    /// Out of 10.
+    pub rating: Option<f32>,
+    /// "PG-13" (movies).
+    pub certification: Option<String>,
+    /// First aired (shows) or out in cinemas (movies): `2026-12-15`.
+    pub released: Option<String>,
+    /// Last aired, for a show that's ended.
+    pub ended: Option<String>,
+    /// The series of films it belongs to: its TMDB id and name.
+    pub collection: Option<(i64, String)>,
     /// Its id in Sonarr/Radarr, when it's already there.
     pub existing: Option<i64>,
     /// The lookup's answer, sent back (with choices) to add it.
@@ -76,13 +90,23 @@ impl Candidate {
                 .filter(|s| !s.is_empty())
                 .map(String::from)
         };
-        let poster = text("remotePoster").or_else(|| {
+        let image = |cover: &str| {
             raw["images"].as_array()?.iter().find_map(|i| {
-                (i["coverType"] == "poster")
+                (i["coverType"] == cover)
                     .then(|| i["remoteUrl"].as_str().map(String::from))
                     .flatten()
             })
-        });
+        };
+        let poster = text("remotePoster").or_else(|| image("poster"));
+        let date = |field: &str| text(field).and_then(|d| d.get(..10).map(String::from));
+        let rating = [
+            &raw["ratings"]["value"],
+            &raw["ratings"]["imdb"]["value"],
+            &raw["ratings"]["tmdb"]["value"],
+        ]
+        .into_iter()
+        .find_map(|v| v.as_f64().filter(|r| *r > 0.0))
+        .map(|r| r as f32);
         Some(Self {
             title: text("title")?,
             year: raw["year"].as_i64().map(|y| y as i32).filter(|y| *y > 0),
@@ -96,6 +120,24 @@ impl Candidate {
                 .map_or(0, |s| s.iter().filter(|s| s["seasonNumber"] != 0).count()),
             status: text("status"),
             poster: poster.map(|p| poster_size(&p)),
+            fanart: image("fanart").map(|f| f.replacen("/t/p/original/", "/t/p/w1280/", 1)),
+            runtime: raw["runtime"]
+                .as_u64()
+                .filter(|m| *m > 0)
+                .and_then(|m| u32::try_from(m).ok()),
+            rating,
+            certification: text("certification"),
+            released: date("firstAired")
+                .or_else(|| date("inCinemas"))
+                .or_else(|| date("digitalRelease"))
+                .or_else(|| date("releaseDate")),
+            ended: (raw["ended"].as_bool() == Some(true))
+                .then(|| date("lastAired"))
+                .flatten(),
+            collection: raw["collection"]["tmdbId"]
+                .as_i64()
+                .filter(|id| *id > 0)
+                .zip(text_at(&raw["collection"]["title"])),
             existing: raw["id"].as_i64().filter(|id| *id > 0),
             raw,
         })
@@ -104,6 +146,18 @@ impl Candidate {
     pub fn is_anime(&self) -> bool {
         is_anime(&self.genres, self.language.as_deref())
     }
+}
+
+fn text_at(v: &Value) -> Option<String> {
+    v.as_str()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(String::from)
+}
+
+/// One lookup answer (`/movie/lookup/tmdb`).
+pub(super) fn candidate(kind: Kind, raw: Value) -> Option<Candidate> {
+    Candidate::from(kind, raw)
 }
 
 pub(super) fn candidates(kind: Kind, found: Vec<Value>) -> Vec<Candidate> {

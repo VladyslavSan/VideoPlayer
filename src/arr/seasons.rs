@@ -158,6 +158,8 @@ mod tests {
             title: None,
             air_date_utc: aired.map(String::from),
             has_file: file,
+            overview: None,
+            runtime: None,
         }
     }
 

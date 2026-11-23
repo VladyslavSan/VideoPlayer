@@ -14,11 +14,13 @@ use ureq::Agent;
 mod activity;
 mod add;
 mod library;
+mod metadata;
 mod picture;
 mod seasons;
 pub use activity::{Download, Event, Recent, State as DownloadState, Subject};
 pub use add::{AddOptions, Candidate, Monitor, Setup};
 pub use library::{Art, Have, Tracked};
+pub use metadata::{Collection, CollectionMovie, MetaEpisode, show_episodes};
 pub use picture::readable;
 pub use seasons::{SeasonSummary, format_date, next_airing, parse_utc, summarize};
 
@@ -97,6 +99,10 @@ pub struct Episode {
     /// `2020-12-28T02:00:00Z`; none for episodes without a date yet.
     pub air_date_utc: Option<String>,
     pub has_file: bool,
+    #[serde(default)]
+    pub overview: Option<String>,
+    #[serde(default)]
+    pub runtime: Option<u32>,
 }
 
 /// A release an indexer offers, with Sonarr's verdict on it.
@@ -450,6 +456,21 @@ impl Client {
         let term = encode(term.trim());
         let found: Vec<Value> = self.slow().get(&format!("{path}?term={term}"))?;
         Ok(add::candidates(self.kind, found))
+    }
+
+    /// The movie with this TMDB id, as a search would find it.
+    pub fn lookup_movie(&self, tmdb: i64) -> Result<Option<Candidate>> {
+        let found: Value = self
+            .slow()
+            .get(&format!("/movie/lookup/tmdb?tmdbId={tmdb}"))?;
+        Ok(add::candidate(self.kind, found))
+    }
+
+    /// The series of films the one with this collection id belongs to, if
+    /// Radarr knows it.
+    pub fn collection(&self, tmdb: i64) -> Result<Option<Collection>> {
+        let found: Vec<Value> = self.get(&format!("/collection?tmdbId={tmdb}"))?;
+        Ok(metadata::collection(&found))
     }
 
     /// The root folders and quality profiles, and how each folder is used.

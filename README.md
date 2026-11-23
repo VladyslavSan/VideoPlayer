@@ -227,6 +227,8 @@ folder).
   `VIDEO_PLAYER_TEST_CAPTURE=<dir>`, writing a name into `<dir>/request` makes the app save
   `<name>.ui.png` (its own frame, transparent over the video) and `<name>.video.png` (mpv's);
   layering the first over the second gives what the screen would show.
+- `VIDEO_PLAYER_SKYHOOK=<url>`: with `VIDEO_PLAYER_TEST_WINDOW=1`, where shows' episodes are
+  looked up instead of Sonarr's metadata service (Skyhook), for a fake one.
 - `VIDEO_PLAYER_MOTION_SCALE=<n>`: stretch animations `n` times, to capture them midway;
   `VIDEO_PLAYER_NO_MOTION=1` turns them off (as Windows' "Animation effects" and macOS's "Reduce
   motion" do)

@@ -52,6 +52,13 @@ impl Shell {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Vec<AnyElement> {
+        if self.arr_pages.list((server, kind)).is_none() {
+            // Opened from a search before the app's list was here.
+            return vec![self.waiting(
+                "tracked-loading",
+                div().pt_6().text_color(rgb(MUTED)).child("Loading…"),
+            )];
+        }
         let Some(item) = self.tracked_item(server, kind, id) else {
             return vec![
                 div()
@@ -149,7 +156,8 @@ impl Shell {
             .into_iter()
             .filter_map(|season| {
                 let number = u16::try_from(season.number).ok()?;
-                Some(self.season_block(&show, number, Vec::new(), Some(season), cx))
+                let listed = self.sonarr_episodes(&show, number);
+                Some(self.season_block(&show, number, Vec::new(), Some(season), listed, cx))
             })
             .collect();
         let list = div()
