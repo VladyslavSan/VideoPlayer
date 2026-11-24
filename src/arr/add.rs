@@ -21,8 +21,6 @@ pub struct Candidate {
     pub key: i64,
     pub overview: Option<String>,
     pub genres: Vec<String>,
-    /// Original language: "Japanese".
-    pub language: Option<String>,
     /// Network (shows) or studio (movies).
     pub network: Option<String>,
     pub seasons: usize,
@@ -49,11 +47,21 @@ pub struct Candidate {
     raw: Value,
 }
 
-/// Anime by its metadata: TVDB's "Anime" genre, or animated and Japanese
-/// (TMDB has no anime genre).
-pub fn is_anime(genres: &[String], language: Option<&str>) -> bool {
-    let has = |g: &str| genres.iter().any(|x| x.eq_ignore_ascii_case(g));
-    has("Anime") || (has("Animation") && language == Some("Japanese"))
+/// Anime by what the metadata sources say: TVDB's "Anime" genre (shows),
+/// TMDB's "anime" keyword (movies: TMDB has no anime genre), or, for
+/// entries tagged neither way, animated and Japanese.
+fn is_anime(raw: &Value) -> bool {
+    let has = |list: &str, word: &str| {
+        raw[list]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(Value::as_str)
+            .any(|x| x.eq_ignore_ascii_case(word))
+    };
+    has("genres", "Anime")
+        || has("keywords", "anime")
+        || (has("genres", "Animation") && language(raw).as_deref() == Some("Japanese"))
 }
 
 fn language(raw: &Value) -> Option<String> {
@@ -113,7 +121,6 @@ impl Candidate {
             key,
             overview: text("overview"),
             genres: genres(&raw),
-            language: language(&raw),
             network: text("network").or_else(|| text("studio")),
             seasons: raw["seasons"]
                 .as_array()
@@ -144,7 +151,7 @@ impl Candidate {
     }
 
     pub fn is_anime(&self) -> bool {
-        is_anime(&self.genres, self.language.as_deref())
+        is_anime(&self.raw)
     }
 }
 
@@ -269,10 +276,7 @@ pub fn habits(roots: &[RootFolder], items: &[Value]) -> Vec<Habits> {
             tags.sort();
             Habits {
                 count,
-                anime: items
-                    .iter()
-                    .filter(|i| is_anime(&genres(i), language(i).as_deref()))
-                    .count(),
+                anime: items.iter().filter(|i| is_anime(i)).count(),
                 profile: most(items.iter().filter_map(|i| i["qualityProfileId"].as_i64())),
                 tags,
                 series_type: most(
@@ -453,13 +457,23 @@ mod tests {
     }
 
     #[test]
-    fn anime_is_the_genre_or_animated_and_japanese() {
-        let g = |g: &[&str]| g.iter().map(|s| s.to_string()).collect::<Vec<_>>();
-        assert!(is_anime(&g(&["Animation", "Anime"]), Some("Japanese")));
-        assert!(is_anime(&g(&["Animation", "Thriller"]), Some("Japanese")));
+    fn anime_is_what_the_metadata_says() {
+        let anime = |genres: &[&str], keywords: &[&str], language: &str| {
+            is_anime(&json!({"genres": genres, "keywords": keywords,
+                             "originalLanguage": {"name": language}}))
+        };
+        // TVDB's genre, and TMDB's keyword (here on a Korean film).
+        assert!(anime(&["Anime", "Drama"], &[], "Japanese"));
+        assert!(anime(
+            &["Animation", "Romance"],
+            &["anime", "space"],
+            "Korean"
+        ));
+        // Tagged neither way: animated and Japanese still counts.
+        assert!(anime(&["Animation", "Action"], &["magic"], "Japanese"));
         // Japanese live action, and western animation, aren't.
-        assert!(!is_anime(&g(&["Drama", "Thriller"]), Some("Japanese")));
-        assert!(!is_anime(&g(&["Animation", "Comedy"]), Some("English")));
+        assert!(!anime(&["Drama"], &["road trip"], "Japanese"));
+        assert!(!anime(&["Animation", "Comedy"], &["superhero"], "English"));
     }
 
     #[test]
