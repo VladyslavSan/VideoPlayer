@@ -7,7 +7,9 @@ use anyhow::Result;
 use rusqlite::{Connection, OptionalExtension, Row, params};
 
 use super::parse::Parsed;
-use super::{Item, MIN_RESUME_SECONDS, Source, SubtitlePref, TrackPrefs, WATCHED_FRACTION};
+use super::{
+    Item, MIN_RESUME_SECONDS, Source, SubtitlePref, SubtitleTuning, TrackPrefs, WATCHED_FRACTION,
+};
 use crate::jellyfin::Server;
 
 const SCHEMA: &str = "
@@ -48,6 +50,13 @@ CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT NOT NULL);
 -- Remembered track choices. scope: 'general' or 'show:<name>'.
 -- subtitle: NULL = no choice yet, '' = off, else a language code.
 CREATE TABLE IF NOT EXISTS track_prefs (scope TEXT PRIMARY KEY, audio TEXT, subtitle TEXT);
+-- Subtitle delay (seconds) and size (1.0 = normal) set for a show or a
+-- movie. scope: 'show:<name>' or 'item:<library key>'.
+CREATE TABLE IF NOT EXISTS subtitle_tuning (
+    scope TEXT PRIMARY KEY,
+    delay REAL NOT NULL,
+    scale REAL NOT NULL
+);
 ";
 
 /// A video file found on disk.
@@ -365,6 +374,39 @@ impl Db {
         Ok(())
     }
 
+    /// The subtitle delay and size saved for `scope`, or the defaults.
+    pub fn subtitle_tuning(&self, scope: &str) -> Result<SubtitleTuning> {
+        Ok(self
+            .conn
+            .query_row(
+                "SELECT delay, scale FROM subtitle_tuning WHERE scope = ?1",
+                [scope],
+                |r| {
+                    Ok(SubtitleTuning {
+                        delay: r.get(0)?,
+                        scale: r.get(1)?,
+                    })
+                },
+            )
+            .optional()?
+            .unwrap_or_default())
+    }
+
+    /// Saves `tuning` for `scope`; the defaults just forget it.
+    pub fn save_subtitle_tuning(&self, scope: &str, tuning: SubtitleTuning) -> Result<()> {
+        if tuning.is_default() {
+            self.conn
+                .execute("DELETE FROM subtitle_tuning WHERE scope = ?1", [scope])?;
+        } else {
+            self.conn.execute(
+                "INSERT INTO subtitle_tuning (scope, delay, scale) VALUES (?1, ?2, ?3)
+                 ON CONFLICT(scope) DO UPDATE SET delay = excluded.delay, scale = excluded.scale",
+                params![scope, tuning.delay, tuning.scale],
+            )?;
+        }
+        Ok(())
+    }
+
     pub fn setting(&self, key: &str) -> Result<Option<String>> {
         Ok(self
             .conn
@@ -598,6 +640,35 @@ mod tests {
         .or(db.track_prefs("general")?);
         assert_eq!(merged.audio.as_deref(), Some("eng"));
         assert_eq!(merged.subtitle, Some(SubtitlePref::Language("eng".into())));
+        Ok(())
+    }
+
+    #[test]
+    fn subtitle_tuning_round_trip() -> Result<()> {
+        let db = Db::open_in_memory()?;
+        assert!(db.subtitle_tuning("show:X")?.is_default());
+        let tuned = SubtitleTuning {
+            delay: -0.4,
+            scale: 1.3,
+        };
+        db.save_subtitle_tuning("show:X", tuned)?;
+        assert_eq!(db.subtitle_tuning("show:X")?, tuned);
+        // Per show: others keep the defaults.
+        assert!(db.subtitle_tuning("show:Y")?.is_default());
+        db.save_subtitle_tuning(
+            "show:X",
+            SubtitleTuning {
+                delay: 0.2,
+                ..tuned
+            },
+        )?;
+        assert_eq!(db.subtitle_tuning("show:X")?.delay, 0.2);
+        // Back to the defaults: nothing left to remember.
+        db.save_subtitle_tuning("show:X", SubtitleTuning::default())?;
+        let rows: i64 = db
+            .conn
+            .query_row("SELECT COUNT(*) FROM subtitle_tuning", [], |r| r.get(0))?;
+        assert_eq!(rows, 0);
         Ok(())
     }
 

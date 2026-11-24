@@ -21,7 +21,7 @@ use crate::jellyfin::{
     self, Client, ImageRef, PlaySession, PlaybackInfo, PlaybackReport, QUALITIES, Quality, Server,
     discovery,
 };
-use crate::library::{Db, Item, Source, TrackPrefs, scan, thumbs};
+use crate::library::{Db, Item, Source, SubtitleTuning, TrackPrefs, scan, thumbs};
 use crate::media_session::MediaSession;
 use crate::player::{self, Episode, Playback, Player, PlayerEvent, SegmentSource};
 use crate::secrets;
@@ -289,6 +289,15 @@ fn item_card_id(prefix: &str, item: &Item) -> SharedString {
     format!("{prefix}-{}", item.key()).into()
 }
 
+/// Where an item's subtitle delay and size are remembered: episodes share
+/// their show's, a movie keeps its own.
+fn tuning_scope(item: &Item) -> String {
+    match &item.show {
+        Some(show) => format!("show:{show}"),
+        None => format!("item:{}", item.key()),
+    }
+}
+
 fn show_card_id(prefix: &str, show: &str) -> SharedString {
     format!("{prefix}-show-{show}").into()
 }
@@ -315,6 +324,9 @@ struct ActivePlayer {
     duration: f64,
     /// The show being watched, whose track choices are remembered.
     show: Option<String>,
+    /// Where subtitle delay and size are remembered: the show, or the movie
+    /// (`tuning_scope`). None for a file from the command line.
+    tuning_scope: Option<String>,
     /// Jellyfin playback: the session reports and transcoding belong to.
     session: Option<PlaySession>,
     /// The item's streams, to rebuild the subtitle list when the quality
@@ -652,6 +664,7 @@ impl Shell {
                 episodes: Vec::new(),
                 current: None,
                 prefs: shell.track_prefs(None),
+                tuning: SubtitleTuning::default(),
                 quality: None,
                 thumb: None,
             };
@@ -1245,12 +1258,18 @@ impl Shell {
             ),
         };
         let (episodes, current) = self.episodes_around(&item);
+        let scope = tuning_scope(&item);
+        let tuning = self.db.subtitle_tuning(&scope).unwrap_or_else(|e| {
+            eprintln!("[library] reading subtitle tuning: {e}");
+            SubtitleTuning::default()
+        });
         let playback = Playback {
             title,
             subtitle,
             episodes,
             current,
             prefs: self.track_prefs(item.show.as_deref()),
+            tuning,
             quality: None,
             thumb: item.thumb.clone(),
         };
@@ -1315,6 +1334,7 @@ impl Shell {
         }
         if let Some(active) = &mut self.player {
             active.show = item.show.clone();
+            active.tuning_scope = Some(scope);
         }
     }
 
@@ -1616,6 +1636,7 @@ impl Shell {
             position: start,
             duration: 0.0,
             show: None,
+            tuning_scope: None,
             session: None,
             playback_info: None,
             pause: None,
@@ -1672,6 +1693,13 @@ impl Shell {
                     if let Err(e) = self.db.save_subtitle_pref(&scope, pref) {
                         eprintln!("[library] saving subtitle choice: {e}");
                     }
+                }
+            }
+            PlayerEvent::SubtitleTuned(tuning) => {
+                if let Some(scope) = self.player.as_ref().and_then(|p| p.tuning_scope.as_ref())
+                    && let Err(e) = self.db.save_subtitle_tuning(scope, *tuning)
+                {
+                    eprintln!("[library] saving subtitle tuning: {e}");
                 }
             }
             PlayerEvent::Play(key) => {

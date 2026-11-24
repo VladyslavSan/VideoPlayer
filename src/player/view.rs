@@ -738,14 +738,14 @@ impl Player {
                 "Subtitle size",
                 format!("{:.0}%", status.subtitle_scale * 100.0),
                 cx,
-                |this, d, _| this.step_subtitle_scale(d as f64 * 0.1),
+                |this, d, cx| this.step_subtitle_scale(d as f64 * 0.1, cx),
             ),
             self.stepper(
                 "sub-delay",
                 "Subtitle delay",
                 format_delay(status.subtitle_delay),
                 cx,
-                |this, d, _| this.step_subtitle_delay(d as f64 * 0.1),
+                |this, d, cx| this.step_subtitle_delay(d as f64 * 0.1, cx),
             ),
         ];
         let mut options = options;

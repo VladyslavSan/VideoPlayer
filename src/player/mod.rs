@@ -17,7 +17,7 @@ use gpui::{
 };
 
 use crate::jellyfin::Quality;
-use crate::library::{SubtitlePref, TrackPrefs, WATCHED_FRACTION};
+use crate::library::{SubtitlePref, SubtitleTuning, TrackPrefs, WATCHED_FRACTION};
 use crate::media_session::{self, MediaCommand, MediaSession, NowPlaying};
 use crate::video::{ExternalSubtitle, Segment, SegmentKind, Track, TrackKind, VideoSurface};
 
@@ -78,6 +78,8 @@ pub enum PlayerEvent {
     AudioChosen(String),
     /// The viewer picked subtitles (or turned them off), to remember.
     SubtitleChosen(SubtitlePref),
+    /// The viewer changed the subtitle delay or size, to remember.
+    SubtitleTuned(SubtitleTuning),
     /// The viewer picked a streaming quality (Jellyfin only).
     QualityChosen(Quality),
 }
@@ -105,6 +107,8 @@ pub struct Playback {
     pub current: Option<usize>,
     /// Remembered track choices to apply once the tracks are known.
     pub prefs: TrackPrefs,
+    /// Subtitle delay and size saved for this show or movie.
+    pub tuning: SubtitleTuning,
     /// Streaming quality, for Jellyfin videos (None hides the setting).
     pub quality: Option<Quality>,
     /// Artwork for the system's now-playing panel.
@@ -224,6 +228,8 @@ pub struct Player {
     /// hidden; they come back once it has moved far enough from there.
     reveal_from: Option<(Point<Pixels>, Instant)>,
     toast: Option<(SharedString, Instant)>,
+    /// Said once the video shows: subtitles start with a saved delay or size.
+    tuning_note: Option<SharedString>,
     /// Subtitle position last sent to mpv, in percent of the window height.
     subtitle_position: f64,
     exited: bool,
@@ -269,6 +275,18 @@ fn format_time(seconds: f64) -> String {
 }
 
 /// Fraction of `bounds`' width at horizontal position `x`, clamped to 0..=1.
+/// Tells the viewer subtitles start with a delay or size saved earlier.
+fn tuning_note(tuning: SubtitleTuning) -> String {
+    let mut parts = Vec::new();
+    if tuning.delay.abs() >= 0.05 {
+        parts.push(format!("delay {}", view::format_delay(tuning.delay)));
+    }
+    if (tuning.scale - 1.0).abs() >= 0.05 {
+        parts.push(format!("size {:.0}%", tuning.scale * 100.0));
+    }
+    format!("Subtitle {}, as last time", parts.join(", "))
+}
+
 fn fraction_at(bounds: Bounds<Pixels>, x: Pixels) -> f64 {
     let width = f32::from(bounds.size.width);
     if width <= 0.0 {
@@ -292,6 +310,7 @@ impl Player {
             episodes,
             current,
             prefs,
+            tuning,
             quality,
             thumb,
         } = playback;
@@ -311,6 +330,11 @@ impl Player {
         focus.focus(window);
         video.sync_size();
         video.set_volume(volume);
+        let tuning_note = (!tuning.is_default()).then(|| {
+            video.set_subtitle_delay(tuning.delay);
+            video.set_subtitle_scale(tuning.scale);
+            tuning_note(tuning).into()
+        });
 
         let bounds = cx.observe_window_bounds(window, |this, _, _| this.video.sync_size());
         let poll = cx.spawn(async move |this, cx| {
@@ -353,8 +377,8 @@ impl Player {
                 volume,
                 muted: false,
                 speed: 1.0,
-                subtitle_scale: 1.0,
-                subtitle_delay: 0.0,
+                subtitle_scale: tuning.scale,
+                subtitle_delay: tuning.delay,
             },
             tracks: Vec::new(),
             tracks_read: Instant::now(),
@@ -372,6 +396,7 @@ impl Player {
             bar_hovered: false,
             reveal_from: None,
             toast: None,
+            tuning_note,
             subtitle_position: 100.0,
             exited: false,
             last_activity: Instant::now(),
@@ -532,6 +557,11 @@ impl Player {
         if switched && self.video.video_configured() {
             let since = *self.video_ready_since.get_or_insert_with(Instant::now);
             self.status.video_shown = since.elapsed() >= VIDEO_SETTLE;
+            if self.status.video_shown
+                && let Some(note) = self.tuning_note.take()
+            {
+                self.toast(note);
+            }
         } else {
             self.video_ready_since = None;
             self.status.video_shown = false;
@@ -1027,18 +1057,30 @@ impl Player {
         self.toast(format!("Speed {}", view::format_speed(SPEEDS[next])));
     }
 
-    fn step_subtitle_scale(&mut self, delta: f64) {
+    fn step_subtitle_scale(&mut self, delta: f64, cx: &mut Context<Self>) {
         let scale = ((self.status.subtitle_scale + delta) * 10.0).round() / 10.0;
         let scale = scale.clamp(0.5, 2.5);
         self.video.set_subtitle_scale(scale);
         self.status.subtitle_scale = scale;
+        self.tuned(cx);
     }
 
-    fn step_subtitle_delay(&mut self, delta: f64) {
+    fn step_subtitle_delay(&mut self, delta: f64, cx: &mut Context<Self>) {
         let delay = ((self.status.subtitle_delay + delta) * 10.0).round() / 10.0;
         self.video.set_subtitle_delay(delay);
         self.status.subtitle_delay = delay;
         self.toast(format!("Subtitle delay {}", view::format_delay(delay)));
+        self.tuned(cx);
+    }
+
+    /// The delay or size changed: remembered for the show's next episodes.
+    fn tuned(&mut self, cx: &mut Context<Self>) {
+        // A change made before the video shows makes the note out of date.
+        self.tuning_note = None;
+        cx.emit(PlayerEvent::SubtitleTuned(SubtitleTuning {
+            delay: self.status.subtitle_delay,
+            scale: self.status.subtitle_scale,
+        }));
     }
 
     /// Opens `panel`, or closes it if it's already open.
@@ -1165,8 +1207,8 @@ impl Player {
             Action::TracksPanel => self.toggle_panel(Panel::Tracks),
             Action::Slower => self.step_speed(-1),
             Action::Faster => self.step_speed(1),
-            Action::SubtitlesEarlier => self.step_subtitle_delay(-0.1),
-            Action::SubtitlesLater => self.step_subtitle_delay(0.1),
+            Action::SubtitlesEarlier => self.step_subtitle_delay(-0.1, cx),
+            Action::SubtitlesLater => self.step_subtitle_delay(0.1, cx),
             Action::Fullscreen => window.toggle_fullscreen(),
             Action::NextEpisode if has_episodes => {
                 self.play_next(cx);

@@ -42,6 +42,32 @@ impl TrackPrefs {
     }
 }
 
+/// Subtitle delay and size the viewer set for a show (or a movie), applied
+/// again when it's played next. Unlike track choices, there's no general
+/// fallback: a delay fits one release, not everything.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct SubtitleTuning {
+    /// Seconds; positive shows subtitles later.
+    pub delay: f64,
+    /// 1.0 is the normal size.
+    pub scale: f64,
+}
+
+impl Default for SubtitleTuning {
+    fn default() -> Self {
+        Self {
+            delay: 0.0,
+            scale: 1.0,
+        }
+    }
+}
+
+impl SubtitleTuning {
+    pub fn is_default(&self) -> bool {
+        *self == Self::default()
+    }
+}
+
 /// Where an item lives and how to play it.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum Source {
