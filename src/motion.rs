@@ -37,6 +37,10 @@ pub const WAIT: Timing = Timing::ms(350);
 pub const FOLD: Timing = Timing::ms(350);
 /// A poster lighting up under the mouse, or dimming after it.
 pub const HOVER: Timing = Timing::ms(350);
+/// The player's controls, panels and notes fading in or out (also the
+/// subtitles moving out of the control bar's way, and the black lifting off
+/// the video once it's on screen).
+pub const OVERLAY: Timing = Timing::ms(350);
 /// A mouse wheel step gliding to a stop (about 95% of the way).
 pub const WHEEL: Timing = Timing::ms(350);
 

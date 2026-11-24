@@ -1,6 +1,7 @@
 //! Playback screen: the mpv video layer plus GPUI controls drawn above it.
 
 pub mod controls;
+mod fade;
 mod previews;
 mod segments;
 mod tracks;
@@ -20,6 +21,7 @@ use crate::jellyfin::Quality;
 use crate::library::{SubtitlePref, SubtitleTuning, TrackPrefs, WATCHED_FRACTION};
 use crate::media_session::{self, MediaCommand, MediaSession, NowPlaying};
 use crate::video::{ExternalSubtitle, Segment, SegmentKind, Track, TrackKind, VideoSurface};
+use fade::{Fade, Notes, Swaps};
 
 pub use previews::Previews;
 pub use segments::merge as merge_segments;
@@ -47,6 +49,7 @@ const PROGRESS_INTERVAL: Duration = Duration::from_secs(5);
 const BROKE_OFF_BEFORE_END: f64 = 20.0;
 /// Waits between attempts to open a broken-off stream again.
 const REOPEN_WAITS: [u64; 5] = [2, 3, 5, 8, 10];
+/// How long a note like "Volume 80%" stays before it fades out.
 const TOAST_DURATION: Duration = Duration::from_millis(1200);
 /// How long mpv's video output must be up before the black backdrop is
 /// lifted, so its first frame is on screen first.
@@ -121,6 +124,58 @@ enum Panel {
     Tracks,
     Episodes,
     Shortcuts,
+}
+
+impl Panel {
+    const ALL: [Panel; 3] = [Panel::Tracks, Panel::Episodes, Panel::Shortcuts];
+
+    fn index(self) -> usize {
+        self as usize
+    }
+}
+
+/// The player's overlays, each fading in and out.
+struct Fades {
+    /// The control bar and the title.
+    controls: Fade,
+    /// Each panel, by `Panel::index`.
+    panels: [Fade; 3],
+    up_next: Fade,
+    skip: Fade,
+    /// The seek bar's time preview (and the bar thickening under it).
+    preview: Fade,
+    /// The speed chip in the control bar, when not at normal speed.
+    speed: Fade,
+    /// The video, as the black backdrop lifts off it.
+    video: Fade,
+}
+
+impl Fades {
+    fn new() -> Self {
+        Self {
+            controls: Fade::new(true),
+            panels: [Fade::new(false); 3],
+            up_next: Fade::new(false),
+            skip: Fade::new(false),
+            preview: Fade::new(false),
+            speed: Fade::new(false),
+            video: Fade::new(false),
+        }
+    }
+
+    fn moving(&self) -> bool {
+        [
+            &self.controls,
+            &self.up_next,
+            &self.skip,
+            &self.preview,
+            &self.speed,
+            &self.video,
+        ]
+        .into_iter()
+        .chain(&self.panels)
+        .any(Fade::moving)
+    }
 }
 
 /// What a held mouse button is dragging.
@@ -227,7 +282,28 @@ pub struct Player {
     /// Where (and when) the mouse started moving while the controls were
     /// hidden; they come back once it has moved far enough from there.
     reveal_from: Option<(Point<Pixels>, Instant)>,
-    toast: Option<(SharedString, Instant)>,
+    /// Notes like "Volume 80%", and when the current one was shown.
+    toasts: Notes,
+    toast_at: Option<Instant>,
+    /// "Loading…" or "Reconnecting…" in the middle.
+    notice: Notes,
+    /// Since when it's been loading ("Loading…" waits a moment).
+    loading_since: Option<Instant>,
+    /// Everything that fades in and out (see `view`'s `render`).
+    fades: Fades,
+    /// The up-next card's countdown and whether the video ended, as last
+    /// shown (drawn so while it fades out).
+    up_next_shown: (u64, bool),
+    /// The skip button's label, as last shown.
+    skip_shown: &'static str,
+    /// Where the seek bar's time preview was last shown.
+    preview_x: Pixels,
+    /// The episodes panel's season before the last switch, and when.
+    season_switch: Option<(u16, Instant)>,
+    /// Icons and values that dissolve when they change.
+    swaps: Swaps,
+    /// The last speed other than normal, shown while its chip fades out.
+    speed_shown: f64,
     /// Said once the video shows: subtitles start with a saved delay or size.
     tuning_note: Option<SharedString>,
     /// Subtitle position last sent to mpv, in percent of the window height.
@@ -395,7 +471,17 @@ impl Player {
             seek_hover: None,
             bar_hovered: false,
             reveal_from: None,
-            toast: None,
+            toasts: Notes::default(),
+            toast_at: None,
+            notice: Notes::default(),
+            loading_since: None,
+            fades: Fades::new(),
+            up_next_shown: (0, false),
+            skip_shown: "",
+            preview_x: Pixels::ZERO,
+            season_switch: None,
+            swaps: Swaps::default(),
+            speed_shown: 1.0,
             tuning_note,
             subtitle_position: 100.0,
             exited: false,
@@ -890,7 +976,8 @@ impl Player {
     }
 
     fn toast(&mut self, message: impl Into<SharedString>) {
-        self.toast = Some((message.into(), Instant::now()));
+        self.toasts.show(Some(message.into()));
+        self.toast_at = Some(Instant::now());
     }
 
     fn controls_visible(&self) -> bool {
@@ -1113,14 +1200,16 @@ impl Player {
     }
 
     /// Keeps subtitles above the control bar while it's showing.
-    fn place_subtitles(&mut self, window: &Window, raised: bool) {
+    /// `raised` is how far (0 to 1): it follows the bar fading in and out,
+    /// so the subtitles glide rather than jump.
+    fn place_subtitles(&mut self, window: &Window, raised: f32) {
         let height = f32::from(window.viewport_size().height);
-        let target = if raised && height > 0.0 {
-            100.0 - (view::BAR_CLEARANCE / height * 100.0) as f64
+        let target = if height > 0.0 {
+            100.0 - (view::BAR_CLEARANCE / height * 100.0 * raised) as f64
         } else {
             100.0
         };
-        if (target - self.subtitle_position).abs() >= 1.0 {
+        if (target - self.subtitle_position).abs() >= 0.05 {
             self.video.set_subtitle_position(target);
             self.subtitle_position = target;
         }

@@ -1,10 +1,12 @@
 //! Drawing the player overlay: a floating control bar, the audio/subtitle
 //! panel above it, the title, and transient messages.
 
+use std::time::Instant;
+
 use gpui::{
     AnyElement, ClickEvent, Context, CursorStyle, ElementId, FontWeight, MouseButton,
     MouseDownEvent, ObjectFit, SharedString, Window, canvas, div, img, prelude::*, px, relative,
-    rgb, rgba,
+    rgb, rgba, svg,
 };
 
 use super::{Panel, Player, TOAST_DURATION, segments, tracks};
@@ -32,6 +34,8 @@ const BAR_HEIGHT: f32 = 52.0;
 const BAR_BOTTOM: f32 = 24.0;
 const BAR_MAX_WIDTH: f32 = 860.0;
 const PANEL_WIDTH: f32 = 720.0;
+/// Room the speed chip ("1.75×") takes in the control bar.
+const SPEED_CHIP_WIDTH: f32 = 60.0;
 /// Height kept clear of subtitles while the bar shows.
 pub const BAR_CLEARANCE: f32 = BAR_BOTTOM + BAR_HEIGHT + 16.0;
 /// Hit area of the sliders; the visible track is thinner.
@@ -68,15 +72,24 @@ fn chip() -> gpui::Div {
 }
 
 impl Player {
+    /// A round icon button. `active` (0 to 1) lights it up, for a button
+    /// whose panel is open, following that panel's fade; a changed `glyph`
+    /// dissolves into the new one.
     fn icon_button(
         &self,
         id: impl Into<ElementId>,
         glyph: Icon,
         size: f32,
-        active: bool,
+        active: f32,
         cx: &mut Context<Self>,
         action: impl Fn(&mut Self, &mut Window, &mut Context<Self>) + 'static,
     ) -> gpui::Stateful<gpui::Div> {
+        let id = id.into();
+        let glyph = self
+            .swaps
+            .draw(format!("icon-{id:?}"), glyph.path(), move |path| {
+                svg().path(path).size(px(size)).text_color(rgb(TEXT))
+            });
         div()
             .id(id)
             .size(px(40.0))
@@ -86,9 +99,11 @@ impl Player {
             .justify_center()
             .rounded_full()
             .cursor_pointer()
-            .when(active, |d| d.bg(rgba(0xffffff26)))
+            .when(active > 0.0, |d| {
+                d.bg(rgba(0xffffff00 | (0x26 as f32 * active).round() as u32))
+            })
             .hover(|s| s.bg(rgba(0xffffff1f)))
-            .child(icon(glyph).size(px(size)).text_color(rgb(TEXT)))
+            .child(glyph)
             .on_mouse_down(
                 MouseButton::Left,
                 cx.listener(move |this, _: &MouseDownEvent, window, cx| {
@@ -107,7 +122,7 @@ impl Player {
         seconds: f64,
         cx: &mut Context<Self>,
     ) -> AnyElement {
-        self.icon_button(id, glyph, 26.0, false, cx, move |this, _, _| {
+        self.icon_button(id, glyph, 26.0, 0.0, cx, move |this, _, _| {
             this.skip(seconds)
         })
         .relative()
@@ -140,7 +155,7 @@ impl Player {
                 "back",
                 Icon::Back,
                 22.0,
-                false,
+                0.0,
                 cx,
                 |this, _, cx| this.exit(cx),
             )))
@@ -177,8 +192,10 @@ impl Player {
         };
         let progress = fraction(self.scrub.unwrap_or(self.status.position));
         let buffered = self.status.buffered.map(fraction);
-        let hovered = self.seek_hover.is_some();
-        let track_height = if hovered { 6.0 } else { 4.0 };
+        // The time preview fades in under the mouse, and the bar thickens
+        // with it.
+        let hover = self.fades.preview.value();
+        let track_height = 4.0 + 2.0 * hover;
         let bounds = self.seek_bounds.clone();
         let bands: Vec<(f32, f32)> = self
             .segments
@@ -196,7 +213,8 @@ impl Player {
             Vec::new()
         };
 
-        let preview = self.seek_hover.filter(|_| duration > 0.0).map(|x| {
+        let preview = self.fades.preview.on_screen().then(|| {
+            let x = self.preview_x;
             let area = self.seek_bounds.get();
             let time = super::fraction_at(area, x) * duration;
             let offset = f32::from(x - area.origin.x).clamp(0.0, f32::from(area.size.width));
@@ -224,6 +242,7 @@ impl Player {
             });
             div()
                 .absolute()
+                .opacity(hover)
                 .bottom(px(SLIDER_HEIGHT + 6.0))
                 .left(px(offset - 160.0))
                 .w(px(320.0))
@@ -397,7 +416,7 @@ impl Player {
         } else {
             Icon::Fullscreen
         };
-        let speed = (status.speed - 1.0).abs() > 0.01;
+        let speed = self.fades.speed.value();
 
         chip()
             .id("bar")
@@ -414,7 +433,7 @@ impl Player {
                 cx.notify();
             }))
             .child(
-                self.icon_button("play", play_icon, 24.0, false, cx, |this, _, _| {
+                self.icon_button("play", play_icon, 24.0, 0.0, cx, |this, _, _| {
                     this.toggle_pause()
                 }),
             )
@@ -430,7 +449,7 @@ impl Player {
                     "next-episode",
                     Icon::NextEpisode,
                     20.0,
-                    false,
+                    0.0,
                     cx,
                     |this, _, cx| this.play_next(cx),
                 ))
@@ -442,28 +461,24 @@ impl Player {
                 super::format_time(status.duration - shown)
             )))
             .child(
-                self.icon_button("mute", volume_icon, 22.0, false, cx, |this, _, _| {
+                self.icon_button("mute", volume_icon, 22.0, 0.0, cx, |this, _, _| {
                     this.toggle_mute()
                 }),
             )
             .child(self.volume_slider(cx))
             .child(div().w(px(6.0)).flex_none())
-            .when(speed, |bar| {
+            .when(self.fades.speed.on_screen(), |bar| {
+                // Opens up its room as it fades in, rather than shoving the
+                // seek bar aside.
                 bar.child(
                     div()
-                        .id("speed")
                         .flex_none()
-                        .px_2()
-                        .py_1()
-                        .rounded_full()
-                        .text_sm()
-                        .cursor_pointer()
-                        .hover(|s| s.bg(rgba(0xffffff1f)))
-                        .child(format_speed(status.speed))
-                        .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
-                            this.toggle_panel(Panel::Tracks);
-                            this.poke(cx);
-                        })),
+                        .w(px(SPEED_CHIP_WIDTH * speed))
+                        .overflow_hidden()
+                        .opacity(speed)
+                        .flex()
+                        .justify_center()
+                        .child(self.speed_chip(cx)),
                 )
             })
             .when(!self.episodes.is_empty(), |bar| {
@@ -471,7 +486,7 @@ impl Player {
                     "episodes",
                     Icon::Episodes,
                     21.0,
-                    self.panel == Some(Panel::Episodes),
+                    self.fades.panels[Panel::Episodes.index()].value(),
                     cx,
                     |this, _, _| this.toggle_panel(Panel::Episodes),
                 ))
@@ -480,7 +495,7 @@ impl Player {
                 "tracks",
                 Icon::Subtitles,
                 22.0,
-                self.panel == Some(Panel::Tracks),
+                self.fades.panels[Panel::Tracks.index()].value(),
                 cx,
                 |this, _, _| this.toggle_panel(Panel::Tracks),
             ))
@@ -488,10 +503,35 @@ impl Player {
                 "fullscreen",
                 fullscreen_icon,
                 20.0,
-                false,
+                0.0,
                 cx,
                 |_, window, _| window.toggle_fullscreen(),
             ))
+            .into_any_element()
+    }
+
+    /// The playback speed, when it isn't normal; opens the track panel.
+    fn speed_chip(&self, cx: &mut Context<Self>) -> AnyElement {
+        // While it fades out at normal speed again, it keeps its last value.
+        let speed = self.speed_shown;
+        div()
+            .id("speed")
+            .flex_none()
+            .px_2()
+            .py_1()
+            .rounded_full()
+            .text_sm()
+            .whitespace_nowrap()
+            .cursor_pointer()
+            .hover(|s| s.bg(rgba(0xffffff1f)))
+            .child(
+                self.swaps
+                    .draw("speed", format_speed(speed), |text| div().child(text)),
+            )
+            .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
+                this.toggle_panel(Panel::Tracks);
+                this.poke(cx);
+            }))
             .into_any_element()
     }
 
@@ -525,6 +565,7 @@ impl Player {
     }
 
     fn choice_row(
+        &self,
         id: ElementId,
         primary: SharedString,
         secondary: SharedString,
@@ -532,6 +573,7 @@ impl Player {
         cx: &mut Context<Self>,
         action: impl Fn(&mut Self, &mut Context<Self>) + 'static,
     ) -> AnyElement {
+        let check = format!("check-{id:?}");
         div()
             .id(id)
             .flex()
@@ -547,9 +589,16 @@ impl Player {
                     .size(px(18.0))
                     .flex_none()
                     .pt_0p5()
-                    .when(selected, |d| {
-                        d.child(icon(Icon::Check).size(px(16.0)).text_color(rgb(ACCENT)))
-                    }),
+                    .child(
+                        self.swaps
+                            .draw(check, if selected { "on" } else { "off" }, |state| {
+                                div().size(px(16.0)).when(state == "on", |d| {
+                                    d.child(
+                                        icon(Icon::Check).size(px(16.0)).text_color(rgb(ACCENT)),
+                                    )
+                                })
+                            }),
+                    ),
             )
             .child(
                 div()
@@ -594,7 +643,7 @@ impl Player {
                         (id, 0usize),
                         Icon::Minus,
                         16.0,
-                        false,
+                        0.0,
                         cx,
                         move |this, _, cx| down(this, -1, cx),
                     )))
@@ -604,13 +653,16 @@ impl Player {
                             .flex()
                             .justify_center()
                             .text_sm()
-                            .child(value),
+                            .child(
+                                self.swaps
+                                    .draw(format!("{id}-value"), value, |value| div().child(value)),
+                            ),
                     )
                     .child(small(self.icon_button(
                         (id, 1usize),
                         Icon::Plus,
                         16.0,
-                        false,
+                        0.0,
                         cx,
                         move |this, _, cx| step(this, 1, cx),
                     ))),
@@ -677,12 +729,12 @@ impl Player {
             .into_any_element()
     }
 
-    fn track_panel(&self, window: &Window, cx: &mut Context<Self>) -> AnyElement {
+    fn track_panel(&self, window: &Window, cx: &mut Context<Self>) -> gpui::Stateful<gpui::Div> {
         let mut audio = Vec::new();
         for (i, track) in self.tracks_of(TrackKind::Audio).enumerate() {
             let label = tracks::label(track, i + 1);
             let id = track.id;
-            audio.push(Self::choice_row(
+            audio.push(self.choice_row(
                 ElementId::NamedInteger("audio".into(), id as u64),
                 label.primary.into(),
                 label.secondary.into(),
@@ -703,7 +755,7 @@ impl Player {
         }
 
         let any_subtitle = self.tracks_of(TrackKind::Subtitle).any(|t| t.selected);
-        let mut subtitles = vec![Self::choice_row(
+        let mut subtitles = vec![self.choice_row(
             "subtitle-off".into(),
             "Off".into(),
             SharedString::default(),
@@ -714,7 +766,7 @@ impl Player {
         for (i, track) in self.tracks_of(TrackKind::Subtitle).enumerate() {
             let label = tracks::label(track, i + 1);
             let id = track.id;
-            subtitles.push(Self::choice_row(
+            subtitles.push(self.choice_row(
                 ElementId::NamedInteger("subtitle".into(), id as u64),
                 label.primary.into(),
                 label.secondary.into(),
@@ -759,7 +811,6 @@ impl Player {
             .child(Self::panel_column("Audio", audio))
             .child(Self::panel_column("Subtitles", subtitles))
             .child(Self::panel_column("Options", options))
-            .into_any_element()
     }
 
     /// The card that panels sit in, just above the control bar.
@@ -822,10 +873,21 @@ impl Player {
             .into_any_element()
     }
 
-    fn episodes_panel(&self, cx: &mut Context<Self>) -> AnyElement {
+    fn episodes_panel(&self, cx: &mut Context<Self>) -> gpui::Stateful<gpui::Div> {
         let seasons = self.seasons();
         let season = self.episode_season;
-        let current = self.current;
+        // Switching seasons: the old list dissolves into the new one, and
+        // the tab's highlight moves across.
+        let switch = self.season_switch.and_then(|(from, at)| {
+            let t = at.elapsed().as_secs_f32() / crate::motion::OVERLAY.time().as_secs_f32();
+            (crate::motion::enabled() && t < 1.0 && from != season)
+                .then(|| (from, crate::motion::ease_in_out(t)))
+        });
+        let lit = |s: u16| match switch {
+            _ if s == season => switch.map_or(1.0, |(_, t)| t),
+            Some((from, t)) if s == from => 1.0 - t,
+            _ => 0.0,
+        };
 
         let tabs: Vec<AnyElement> = seasons
             .iter()
@@ -837,19 +899,67 @@ impl Player {
                     .rounded_full()
                     .text_sm()
                     .cursor_pointer()
-                    .when(s == season, |d| d.bg(rgba(0xffffff26)))
+                    .when(lit(s) > 0.0, |d| {
+                        d.bg(rgba(0xffffff00 | (0x26 as f32 * lit(s)).round() as u32))
+                    })
                     .hover(|d| d.bg(rgba(0xffffff1f)))
                     .child(season_name(s))
                     .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
-                        this.episode_season = s;
+                        if this.episode_season != s {
+                            this.season_switch = Some((this.episode_season, Instant::now()));
+                            this.episode_season = s;
+                        }
                         this.poke(cx);
                     }))
                     .into_any_element()
             })
             .collect();
 
-        let rows: Vec<AnyElement> = self
-            .episodes
+        let mut list = |season: u16| self.episode_rows(season, cx);
+        let shown = div()
+            .id(("episode-list", season as usize))
+            .flex()
+            .flex_col()
+            .gap_0p5()
+            .max_h(px(340.0))
+            .overflow_y_scroll()
+            .children(list(season));
+        let shown = match switch {
+            Some((from, t)) => div()
+                .relative()
+                .child(shown.opacity(t))
+                .child(
+                    div()
+                        .absolute()
+                        .top_0()
+                        .left_0()
+                        .right_0()
+                        .max_h(px(340.0))
+                        .overflow_hidden()
+                        .opacity(1.0 - t)
+                        .flex()
+                        .flex_col()
+                        .gap_0p5()
+                        .children(list(from)),
+                )
+                .into_any_element(),
+            None => shown.into_any_element(),
+        };
+
+        Self::panel_frame("episodes-panel")
+            .flex()
+            .flex_col()
+            .gap_2()
+            .when(seasons.len() > 1, |d| {
+                d.child(div().flex().flex_wrap().gap_1().children(tabs))
+            })
+            .child(shown)
+    }
+
+    /// The episodes of `season`, for the episodes panel.
+    fn episode_rows(&self, season: u16, cx: &mut Context<Self>) -> Vec<AnyElement> {
+        let current = self.current;
+        self.episodes
             .iter()
             .enumerate()
             .filter(|(_, e)| e.season == season)
@@ -904,26 +1014,7 @@ impl Player {
                     }))
                     .into_any_element()
             })
-            .collect();
-
-        Self::panel_frame("episodes-panel")
-            .flex()
-            .flex_col()
-            .gap_2()
-            .when(seasons.len() > 1, |d| {
-                d.child(div().flex().flex_wrap().gap_1().children(tabs))
-            })
-            .child(
-                div()
-                    .id("episode-list")
-                    .flex()
-                    .flex_col()
-                    .gap_0p5()
-                    .max_h(px(340.0))
-                    .overflow_y_scroll()
-                    .children(rows),
-            )
-            .into_any_element()
+            .collect()
     }
 
     fn text_button(
@@ -955,9 +1046,14 @@ impl Player {
             .into_any_element()
     }
 
-    /// Shown when an episode ends: counts down to the next one.
-    fn up_next_card(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
-        let seconds = self.up_next_remaining()?;
+    /// Shown when an episode ends: counts down to the next one. `ended`:
+    /// the video is over (rather than in its credits).
+    fn up_next_card(
+        &self,
+        seconds: u64,
+        ended: bool,
+        cx: &mut Context<Self>,
+    ) -> Option<AnyElement> {
         let next = self.next_episode()?;
         let heading = match next.number {
             Some(n) => format!("{} · Episode {n}", season_name(next.season)),
@@ -1022,7 +1118,7 @@ impl Player {
                             cx,
                             |this, cx| this.play_next(cx),
                         ))
-                        .child(if self.status.ended {
+                        .child(if ended {
                             Self::text_button(
                                 "up-next-back",
                                 "Back to library",
@@ -1116,7 +1212,7 @@ impl Player {
                                 "close-shortcuts",
                                 Icon::Close,
                                 18.0,
-                                false,
+                                0.0,
                                 cx,
                                 |this, _, _| this.panel = None,
                             )),
@@ -1183,19 +1279,29 @@ impl Player {
                     .relative()
                     .w_full()
                     .max_w(px(BAR_MAX_WIDTH))
-                    .children(match self.panel {
-                        Some(Panel::Tracks) => Some(self.track_panel(window, cx)),
-                        Some(Panel::Episodes) => Some(self.episodes_panel(cx)),
-                        Some(Panel::Shortcuts) | None => None,
+                    // Both can be on screen for a moment, one fading into the
+                    // other.
+                    .when(self.panel_drawn(Panel::Tracks), |d| {
+                        let shown = self.fades.panels[Panel::Tracks.index()].value();
+                        d.child(self.track_panel(window, cx).opacity(shown))
+                    })
+                    .when(self.panel_drawn(Panel::Episodes), |d| {
+                        let shown = self.fades.panels[Panel::Episodes.index()].value();
+                        d.child(self.episodes_panel(cx).opacity(shown))
                     })
                     .child(self.control_bar(window, cx)),
             )
             .into_any_element()
     }
 
-    fn centered_message(top: f32, text: SharedString) -> AnyElement {
+    fn panel_drawn(&self, panel: Panel) -> bool {
+        self.fades.panels[panel.index()].on_screen()
+    }
+
+    fn centered_message(top: f32, text: SharedString, shown: f32) -> AnyElement {
         div()
             .absolute()
+            .opacity(shown)
             .top(px(top))
             .left_0()
             .right_0()
@@ -1206,49 +1312,114 @@ impl Player {
     }
 }
 
+impl Player {
+    /// Points each fade at where it should be now. Everything on the
+    /// player that comes and goes does so through these.
+    fn update_fades(&mut self, window: &Window) {
+        let visible = self.controls_visible();
+        self.fades.controls.set(visible);
+        for panel in Panel::ALL {
+            self.fades.panels[panel.index()].set(self.panel == Some(panel));
+        }
+        if self
+            .toast_at
+            .is_some_and(|at| at.elapsed() > TOAST_DURATION)
+        {
+            self.toast_at = None;
+            self.toasts.show(None);
+        }
+        // "Loading…" only once the wait is long enough to notice, so a
+        // quick seek never flashes it.
+        let loading = self.status.buffering && !self.status.paused && self.stall.is_none();
+        if !loading {
+            self.loading_since = None;
+        } else if self.loading_since.is_none() {
+            self.loading_since = Some(Instant::now());
+        }
+        let notice = if self.stall.is_some() {
+            Some("Lost the connection to the server. Reconnecting…")
+        } else {
+            self.loading_since
+                .filter(|since| since.elapsed() >= crate::motion::WAIT.time())
+                .map(|_| "Loading…")
+        };
+        self.notice.show(notice.map(SharedString::from));
+        let up_next = self
+            .up_next_remaining()
+            .filter(|_| self.next_episode().is_some());
+        if let Some(seconds) = up_next {
+            self.up_next_shown = (seconds, self.status.ended);
+        }
+        self.fades.up_next.set(up_next.is_some());
+        let skip = self.skip_target().filter(|_| up_next.is_none());
+        if let Some((label, _)) = skip {
+            self.skip_shown = label;
+        }
+        self.fades.skip.set(skip.is_some());
+        let preview = self.seek_hover.filter(|_| self.status.duration > 0.0);
+        if let Some(x) = preview {
+            self.preview_x = x;
+        }
+        self.fades.preview.set(preview.is_some());
+        let speed = (self.status.speed - 1.0).abs() > 0.01;
+        if speed {
+            self.speed_shown = self.status.speed;
+        }
+        self.fades.speed.set(speed);
+        self.fades.video.set(self.status.video_shown);
+        // Subtitles move out of the bar's way as it fades in.
+        self.place_subtitles(window, self.fades.controls.value());
+    }
+
+    /// Whether anything is still on its way in or out, to keep drawing.
+    fn fading(&self) -> bool {
+        self.fades.moving()
+            || self.toasts.moving()
+            || self.notice.moving()
+            || self
+                .season_switch
+                .is_some_and(|(_, at)| at.elapsed() < crate::motion::OVERLAY.time())
+    }
+}
+
 impl Render for Player {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let visible = self.controls_visible();
-        self.place_subtitles(window, visible);
         // The quality menu lives in the tracks panel and closes with it.
         if self.panel != Some(Panel::Tracks) {
             self.quality_menu = false;
         }
-        if self
-            .toast
-            .as_ref()
-            .is_some_and(|(_, at)| at.elapsed() > TOAST_DURATION)
-        {
-            self.toast = None;
-        }
+        self.update_fades(window);
 
         // No background: transparent pixels are where the video shows through.
         let mut overlay = Vec::new();
-        if visible {
-            overlay.push(self.top_bar(cx));
-            overlay.push(self.bottom(window, cx));
+        if self.fades.controls.on_screen() {
+            let shown = self.fades.controls.value();
+            overlay.push(
+                div()
+                    .absolute()
+                    .inset_0()
+                    .opacity(shown)
+                    .child(self.top_bar(cx))
+                    .child(self.bottom(window, cx))
+                    .into_any_element(),
+            );
         }
-        if self.stall.is_some() {
-            let middle = f32::from(window.viewport_size().height) / 2.0 - 20.0;
-            overlay.push(Self::centered_message(
-                middle,
-                "Lost the connection to the server. Reconnecting…".into(),
-            ));
-        } else if self.status.buffering && !self.status.paused {
-            let middle = f32::from(window.viewport_size().height) / 2.0 - 20.0;
-            overlay.push(Self::centered_message(middle, "Loading…".into()));
+        let middle = f32::from(window.viewport_size().height) / 2.0 - 20.0;
+        for (text, shown) in self.notice.drawn() {
+            overlay.push(Self::centered_message(middle, text, shown));
         }
-        if let Some((message, _)) = &self.toast {
-            overlay.push(Self::centered_message(84.0, message.clone()));
+        for (text, shown) in self.toasts.drawn() {
+            overlay.push(Self::centered_message(84.0, text, shown));
         }
-        if let Some(card) = self.up_next_card(cx) {
-            overlay.push(card);
-        } else if let Some((label, _)) = self.skip_target() {
+        if self.fades.skip.on_screen() {
+            let label = self.skip_shown;
             overlay.push(
                 div()
                     .absolute()
                     .right(px(24.0))
                     .bottom(px(BAR_CLEARANCE))
+                    .opacity(self.fades.skip.value())
                     .child(Self::text_button("skip", label, true, cx, |this, cx| {
                         this.skip_segment();
                         this.poke(cx);
@@ -1256,16 +1427,41 @@ impl Render for Player {
                     .into_any_element(),
             );
         }
-        if self.panel == Some(Panel::Shortcuts) {
-            overlay.push(self.shortcuts_overlay(cx));
+        if self.fades.up_next.on_screen() {
+            let (seconds, ended) = self.up_next_shown;
+            if let Some(card) = self.up_next_card(seconds, ended, cx) {
+                overlay.push(
+                    div()
+                        .absolute()
+                        .inset_0()
+                        .opacity(self.fades.up_next.value())
+                        .child(card)
+                        .into_any_element(),
+                );
+            }
         }
+        if self.panel_drawn(Panel::Shortcuts) {
+            let shown = self.fades.panels[Panel::Shortcuts.index()].value();
+            overlay.push(
+                div()
+                    .absolute()
+                    .inset_0()
+                    .opacity(shown)
+                    .child(self.shortcuts_overlay(cx))
+                    .into_any_element(),
+            );
+        }
+        if self.fading() {
+            window.request_animation_frame();
+        }
+        // Black until the video is on screen, then it lifts off the video.
+        let black = 1.0 - self.fades.video.value();
 
         div()
             .id("stage")
             .size_full()
             .relative()
-            // Black until the video is on screen; transparent after, so it shows.
-            .when(!self.status.video_shown, |d| d.bg(rgb(0x000000)))
+            .when(black > 0.0, |d| d.bg(gpui::black().opacity(black)))
             .track_focus(&self.focus)
             .when(!visible, |d| d.cursor(CursorStyle::None))
             .on_key_down(cx.listener(Self::on_key))

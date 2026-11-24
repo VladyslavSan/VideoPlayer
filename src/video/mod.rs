@@ -386,10 +386,14 @@ impl VideoSurface {
     }
 
     /// Vertical subtitle position in percent of the window (100 = bottom).
+    /// Where subtitles sit, in percent of the height (100 = the bottom).
+    /// Fractions move them smoothly where mpv takes them (0.37 and later);
+    /// older versions take whole percents.
     pub fn set_subtitle_position(&self, percent: f64) {
-        let _ = self
-            .mpv
-            .set_property("sub-pos", percent.round().clamp(0.0, 100.0) as i64);
+        let percent = percent.clamp(0.0, 100.0);
+        if self.mpv.set_property("sub-pos", percent).is_err() {
+            let _ = self.mpv.set_property("sub-pos", percent.round() as i64);
+        }
     }
 
     /// Saves what's on screen (the video as scaled to the window, with

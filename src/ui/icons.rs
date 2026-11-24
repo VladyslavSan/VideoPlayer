@@ -12,7 +12,7 @@ macro_rules! icons {
         pub enum Icon { $($variant),* }
 
         impl Icon {
-            fn path(self) -> &'static str {
+            pub fn path(self) -> &'static str {
                 match self { $(Icon::$variant => concat!("icons/", $file)),* }
             }
         }
