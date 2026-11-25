@@ -12,6 +12,8 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Result, anyhow};
 use libmpv2::Mpv;
+
+use crate::video::Snapshotter;
 use libmpv2::events::Event;
 
 /// Seconds of video each snapshot stands for.
@@ -106,7 +108,7 @@ impl Worker {
             return Ok(());
         };
         fs::create_dir_all(&self.dir)?;
-        let mpv = self.open()?;
+        let hidden = self.open()?;
         loop {
             // Only the latest request matters.
             while let Ok(newer) = requests.try_recv() {
@@ -114,7 +116,7 @@ impl Worker {
             }
             let path = slot_path(&self.dir, wanted);
             if !path.exists() {
-                match self.snapshot(&mpv, wanted, &path) {
+                match self.snapshot(&hidden.mpv, wanted, &path) {
                     Ok(()) => {
                         if let Ok(mut state) = self.state.lock() {
                             state.ready.insert(wanted);
@@ -130,15 +132,10 @@ impl Worker {
         }
     }
 
-    fn open(&self) -> Result<Mpv> {
-        let mpv = Mpv::with_initializer(|init| {
-            init.set_option("vo", "null")?;
-            init.set_option("audio", "no")?;
+    fn open(&self) -> Result<Snapshotter> {
+        let hidden = Snapshotter::new(|init| {
             init.set_option("sid", "no")?;
             init.set_option("sub-auto", "no")?;
-            crate::video::set_lua_option(&init, "load-scripts", "no")?;
-            crate::video::set_lua_option(&init, "ytdl", "no")?;
-            init.set_option("input-default-bindings", "no")?;
             init.set_option("pause", "yes")?;
             init.set_option("keep-open", "always")?;
             init.set_option("hwdec", "no")?;
@@ -158,10 +155,14 @@ impl Worker {
             Ok(())
         })
         .map_err(|e| anyhow!("starting the preview player: {e}"))?;
-        mpv.command("loadfile", &[&self.source])
+        hidden
+            .mpv
+            .command("loadfile", &[&self.source])
             .map_err(|e| anyhow!("opening the video for previews: {e}"))?;
-        wait_for(&mpv, OPEN_TIMEOUT, |e| matches!(e, Event::PlaybackRestart))?;
-        Ok(mpv)
+        wait_for(&hidden.mpv, OPEN_TIMEOUT, |e| {
+            matches!(e, Event::PlaybackRestart)
+        })?;
+        Ok(hidden)
     }
 
     fn snapshot(&self, mpv: &Mpv, slot: u32, path: &Path) -> Result<()> {
@@ -222,9 +223,11 @@ mod tests {
             dir: dir.path().to_path_buf(),
             state: Arc::default(),
         };
-        let mpv = worker.open().expect("the preview player opens the clip");
+        let hidden = worker.open().expect("the preview player opens the clip");
         let out = slot_path(dir.path(), 0);
-        worker.snapshot(&mpv, 0, &out).expect("a snapshot is taken");
+        worker
+            .snapshot(&hidden.mpv, 0, &out)
+            .expect("a snapshot is taken");
         assert_eq!(
             crate::test_clip::jpeg_size(&out),
             Some((WIDTH, WIDTH * 3 / 4))

@@ -99,7 +99,26 @@ impl Db {
         conn.busy_timeout(Duration::from_secs(5))?;
         conn.query_row("PRAGMA journal_mode = WAL", [], |_| Ok(()))?;
         conn.execute_batch(SCHEMA)?;
-        Ok(Self { conn })
+        let db = Self { conn };
+        db.renew_thumbs()?;
+        Ok(db)
+    }
+
+    /// Thumbnails made by an older way of making them are made again, once
+    /// (in the background, like new ones). 2: Dolby Vision and HDR frames
+    /// with the same colours as playback (profile 5 was green and purple).
+    fn renew_thumbs(&self) -> Result<()> {
+        const THUMBS_VERSION: u32 = 2;
+        let made_by = self
+            .setting("thumbs_version")?
+            .and_then(|v| v.parse::<u32>().ok())
+            .unwrap_or(1);
+        if made_by < THUMBS_VERSION {
+            self.conn
+                .execute("UPDATE items SET thumb = NULL WHERE thumb IS NOT NULL", [])?;
+            self.set_setting("thumbs_version", &THUMBS_VERSION.to_string())?;
+        }
+        Ok(())
     }
 
     /// Runs `f` in one transaction, which makes bulk scans much faster.
@@ -684,6 +703,24 @@ mod tests {
         assert!(item.watched && item.position == 0.0 && item.last_played.is_some());
         db.set_watched(id, false)?;
         assert!(!db.item(id)?.unwrap().watched);
+        Ok(())
+    }
+
+    #[test]
+    fn old_thumbnails_are_made_again_once() -> Result<()> {
+        let db = Db::open_in_memory()?;
+        db.conn.execute(
+            "INSERT INTO items (path, root, title, size, mtime, added) VALUES ('C:/a.mkv', 'C:/', 'a', 1, 0, 0)",
+            [],
+        )?;
+        let id = db.conn.last_insert_rowid();
+        db.set_thumb(id, Some(Path::new("C:/thumbs/1.jpg")))?;
+        db.set_setting("thumbs_version", "1")?;
+        db.renew_thumbs()?;
+        assert_eq!(db.pending_thumbs()?.len(), 1);
+        db.set_thumb(id, Some(Path::new("C:/thumbs/1.jpg")))?;
+        db.renew_thumbs()?;
+        assert!(db.pending_thumbs()?.is_empty());
         Ok(())
     }
 

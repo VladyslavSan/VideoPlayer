@@ -15,6 +15,50 @@ use mac::Host;
 #[cfg(windows)]
 use win::Host;
 
+/// A hidden mpv that only takes snapshots (the seek bar's previews, the
+/// library's thumbnails). On Windows it renders with mpv's GPU renderer
+/// into a window that's never shown, so snapshots of Dolby Vision and HDR
+/// video get the same colour handling as playback. Without a renderer mpv
+/// converts frames in software, which knows nothing of Dolby Vision:
+/// profile 5 came out green and purple. The window goes after the player.
+pub struct Snapshotter {
+    pub mpv: Mpv,
+    #[cfg(windows)]
+    _window: win::HiddenWindow,
+}
+
+impl Snapshotter {
+    /// `options` sets the rest; snapshots are taken with
+    /// `screenshot-to-file <path> video`.
+    pub fn new(options: impl FnOnce(&MpvInitializer) -> libmpv2::Result<()>) -> Result<Self> {
+        #[cfg(windows)]
+        let window = win::HiddenWindow::new(640, 360)?;
+        let mpv = Mpv::with_initializer(|init| {
+            #[cfg(windows)]
+            {
+                // Without a usable GPU, software as before.
+                init.set_option("vo", "gpu-next,null")?;
+                init.set_option("gpu-api", "d3d11")?;
+                init.set_option("wid", window.wid())?;
+            }
+            #[cfg(not(windows))]
+            init.set_option("vo", "null")?;
+            init.set_option("audio", "no")?;
+            init.set_option("config", "no")?;
+            set_lua_option(&init, "load-scripts", "no")?;
+            set_lua_option(&init, "ytdl", "no")?;
+            init.set_option("input-default-bindings", "no")?;
+            options(&init)
+        })
+        .map_err(|e| anyhow!("starting mpv for snapshots: {e}"))?;
+        Ok(Self {
+            mpv,
+            #[cfg(windows)]
+            _window: window,
+        })
+    }
+}
+
 /// The options every player instance gets, whatever draws its video.
 fn player_options(init: &MpvInitializer, http_header: Option<&str>) -> libmpv2::Result<()> {
     init.set_option("hwdec", "auto-safe")?;

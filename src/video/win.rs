@@ -113,3 +113,106 @@ impl Host {
         }
     }
 }
+
+/// A window that's never shown, for an mpv that renders only snapshots
+/// (the seek bar's previews): with a real renderer they get the same
+/// Dolby Vision and HDR handling as the video itself. It lives on its own
+/// thread, which handles its messages: mpv's window inside it sends some
+/// to its parent and waits for the answer.
+pub struct HiddenWindow {
+    /// The `HWND`, as a number: it's used only as mpv's `wid`.
+    hwnd: isize,
+    thread: Option<std::thread::JoinHandle<()>>,
+}
+
+unsafe extern "system" fn hidden_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRESULT {
+    use windows::Win32::UI::WindowsAndMessaging::{PostQuitMessage, WM_DESTROY};
+    if msg == WM_DESTROY {
+        unsafe { PostQuitMessage(0) };
+        return LRESULT(0);
+    }
+    unsafe { DefWindowProcW(hwnd, msg, wp, lp) }
+}
+
+impl HiddenWindow {
+    pub fn new(width: i32, height: i32) -> Result<Self> {
+        use windows::Win32::UI::WindowsAndMessaging::{
+            DispatchMessageW, GetMessageW, MSG, TranslateMessage, WS_EX_NOACTIVATE,
+            WS_EX_TOOLWINDOW, WS_POPUP,
+        };
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let thread = std::thread::Builder::new()
+            .name("hidden-window".into())
+            .spawn(move || {
+                let created = (|| -> Result<HWND> {
+                    static REGISTER: Once = Once::new();
+                    let instance: HINSTANCE = unsafe { GetModuleHandleW(None)? }.into();
+                    REGISTER.call_once(|| unsafe {
+                        RegisterClassW(&WNDCLASSW {
+                            lpfnWndProc: Some(hidden_proc),
+                            hInstance: instance,
+                            lpszClassName: w!("VideoPlayerHidden"),
+                            ..Default::default()
+                        });
+                    });
+                    Ok(unsafe {
+                        CreateWindowExW(
+                            WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE,
+                            w!("VideoPlayerHidden"),
+                            None,
+                            WS_POPUP,
+                            0,
+                            0,
+                            width,
+                            height,
+                            None,
+                            None,
+                            Some(instance),
+                            None,
+                        )?
+                    })
+                })();
+                let ok = created.is_ok();
+                let _ = sender.send(created.map(|hwnd| hwnd.0 as isize));
+                if !ok {
+                    return;
+                }
+                let mut msg = MSG::default();
+                while unsafe { GetMessageW(&mut msg, None, 0, 0) }.as_bool() {
+                    unsafe {
+                        let _ = TranslateMessage(&msg);
+                        DispatchMessageW(&msg);
+                    }
+                }
+            })?;
+        let hwnd = receiver
+            .recv()
+            .map_err(|_| anyhow!("the hidden window's thread stopped"))??;
+        Ok(Self {
+            hwnd,
+            thread: Some(thread),
+        })
+    }
+
+    /// For mpv's `wid` option.
+    pub fn wid(&self) -> i64 {
+        self.hwnd as i64
+    }
+}
+
+impl Drop for HiddenWindow {
+    fn drop(&mut self) {
+        use windows::Win32::UI::WindowsAndMessaging::{PostMessageW, WM_CLOSE};
+        unsafe {
+            let _ = PostMessageW(
+                Some(HWND(self.hwnd as *mut _)),
+                WM_CLOSE,
+                WPARAM(0),
+                LPARAM(0),
+            );
+        }
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
+    }
+}

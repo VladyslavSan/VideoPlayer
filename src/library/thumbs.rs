@@ -3,64 +3,60 @@
 
 use std::fs;
 use std::path::Path;
+use std::time::{Duration, Instant};
 
 use anyhow::{Result, anyhow, bail};
-use libmpv2::Mpv;
 use libmpv2::events::Event;
 
-const WIDTH: u32 = 640;
-const TIMEOUT_SECONDS: f64 = 20.0;
+use crate::video::Snapshotter;
 
-/// Writes a JPEG of the frame 20% into `video` to `out`.
+const WIDTH: u32 = 640;
+const TIMEOUT: Duration = Duration::from_secs(20);
+
+/// Writes a JPEG of the frame 20% into `video` to `out`. It's written under
+/// another name first, so a half-written file is never shown.
 pub fn generate(video: &Path, out: &Path) -> Result<()> {
-    let work = out.with_extension("work");
-    let _ = fs::remove_dir_all(&work);
-    fs::create_dir_all(&work)?;
-    let result = render_frame(video, &work).and_then(|()| {
-        let frame = fs::read_dir(&work)?
-            .filter_map(Result::ok)
-            .map(|e| e.path())
-            .find(|p| p.extension().is_some_and(|e| e == "jpg"))
-            .ok_or_else(|| anyhow!("mpv produced no frame"))?;
-        fs::rename(frame, out)?;
-        Ok(())
-    });
-    let _ = fs::remove_dir_all(&work);
+    let partial = out.with_extension("part.jpg");
+    let result = render_frame(video, &partial).and_then(|()| Ok(fs::rename(&partial, out)?));
+    if result.is_err() {
+        let _ = fs::remove_file(&partial);
+    }
     result
 }
 
-fn render_frame(video: &Path, outdir: &Path) -> Result<()> {
-    let mpv = Mpv::with_initializer(|init| {
-        init.set_option("vo", "image")?;
-        init.set_option("vo-image-format", "jpg")?;
-        init.set_option("vo-image-jpeg-quality", 85i64)?;
-        init.set_option("vo-image-outdir", outdir.to_string_lossy().as_ref())?;
+fn render_frame(video: &Path, out: &Path) -> Result<()> {
+    let hidden = Snapshotter::new(|init| {
         init.set_option("vf", format!("lavfi=[scale=w={WIDTH}:h=-2]").as_str())?;
         init.set_option("start", "20%")?;
-        init.set_option("frames", 1i64)?;
-        init.set_option("audio", "no")?;
+        init.set_option("pause", "yes")?;
+        init.set_option("keep-open", "always")?;
         init.set_option("sub", "no")?;
         init.set_option("hwdec", "no")?;
-        init.set_option("idle", "once")?;
-        init.set_option("config", "no")?;
-        crate::video::set_lua_option(&init, "load-scripts", "no")?;
+        init.set_option("screenshot-format", "jpg")?;
+        init.set_option("screenshot-jpeg-quality", 85i64)?;
         Ok(())
-    })
-    .map_err(|e| anyhow!("initialising mpv: {e}"))?;
-
+    })?;
+    let mpv = &hidden.mpv;
     let path = video.to_string_lossy();
     mpv.command("loadfile", &[path.as_ref()])
         .map_err(|e| anyhow!("loading {path}: {e}"))?;
 
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs_f64(TIMEOUT_SECONDS);
-    while std::time::Instant::now() < deadline {
-        match mpv.wait_event(1.0) {
-            Some(Ok(Event::EndFile(_) | Event::Shutdown)) => return Ok(()),
+    let deadline = Instant::now() + TIMEOUT;
+    loop {
+        let left = deadline.saturating_duration_since(Instant::now());
+        if left.is_zero() {
+            bail!("timed out after {}s", TIMEOUT.as_secs());
+        }
+        match mpv.wait_event(left.as_secs_f64()) {
+            Some(Ok(Event::PlaybackRestart)) => break,
+            Some(Ok(Event::EndFile(_) | Event::Shutdown)) => bail!("mpv couldn't open the video"),
             Some(Err(e)) => bail!("mpv: {e}"),
             _ => {}
         }
     }
-    bail!("timed out after {TIMEOUT_SECONDS}s")
+    mpv.command("screenshot-to-file", &[&out.to_string_lossy(), "video"])
+        .map_err(|e| anyhow!("taking the frame: {e}"))?;
+    Ok(())
 }
 
 #[cfg(test)]
