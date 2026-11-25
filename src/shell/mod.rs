@@ -396,7 +396,9 @@ pub struct Shell {
     /// Open release lists, by show and season.
     release_panels: HashMap<releases::PanelKey, releases::ReleasePanel>,
     /// The server whose streaming quality menu is open.
-    quality_menu: Option<i64>,
+    /// The streaming quality menu: for which server, and its quality when
+    /// the menu opened (the one checked, even as it fades out after a pick).
+    quality_menu: menu::Shown<(i64, Quality)>,
     /// The Settings page shown, and whether its sign-in form is open.
     settings_page: SettingsPage,
     adding_server: bool,
@@ -421,7 +423,7 @@ pub struct Shell {
     /// When the app last caught up on what was played lately.
     caught_up: Option<Instant>,
     /// A card's right-click menu, when open.
-    card_menu: Option<watched::CardMenu>,
+    card_menu: menu::Shown<watched::CardMenu>,
     /// Settings → Controls waiting for a key.
     key_capture: controls_page::KeyCapture,
     /// Changes the server hasn't got yet (see `offline`).
@@ -548,7 +550,7 @@ impl Shell {
             arr_pages: Default::default(),
             details: HashMap::new(),
             details_loading: HashSet::new(),
-            quality_menu: None,
+            quality_menu: menu::Shown::default(),
             settings_page: SettingsPage::default(),
             adding_server: false,
             reports: reports::Reports::default(),
@@ -561,7 +563,7 @@ impl Shell {
             cache_updates: HashMap::new(),
             cache_write_pending: false,
             caught_up: None,
-            card_menu: None,
+            card_menu: menu::Shown::default(),
             key_capture: Default::default(),
             undelivered: Vec::new(),
             undelivered_seq: 0,
@@ -1833,8 +1835,8 @@ impl Shell {
             }
         }
         match (&self.screen, key) {
-            (Screen::Settings, "escape") if self.quality_menu.is_some() => {
-                self.quality_menu = None;
+            (Screen::Settings, "escape") if self.quality_menu.current().is_some() => {
+                self.quality_menu.close();
                 cx.notify();
             }
             (Screen::Settings, "escape") if self.adding_server => {
@@ -3072,19 +3074,28 @@ impl Shell {
     /// a server in Settings → Library.
     fn quality_picker(&self, server: i64, window: &Window, cx: &mut Context<Self>) -> AnyElement {
         let current = self.quality_for(server);
-        let open = self.quality_menu == Some(server);
+        let mine = move |open: &(i64, Quality)| open.0 == server;
+        let label = self.changing_text(
+            format!("quality-{server}"),
+            format!("Streaming: {}", current.label()),
+            |label| div().child(label),
+        );
         let mut picker = div().relative().flex().child(
             menu::trigger(
                 SharedString::from(format!("quality-{server}")),
-                format!("Streaming: {}", current.label()),
-                open,
+                label,
+                self.quality_menu.lit(mine),
             )
             .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
-                this.quality_menu = if open { None } else { Some(server) };
+                if this.quality_menu.current().is_some_and(mine) {
+                    this.quality_menu.close();
+                } else {
+                    this.quality_menu.open((server, current));
+                }
                 cx.notify();
             })),
         );
-        if open {
+        for shown in self.quality_menu.drawn().iter().filter(|m| mine(m.value)) {
             let items = QUALITIES
                 .iter()
                 .enumerate()
@@ -3092,22 +3103,23 @@ impl Shell {
                     menu::item(
                         ("quality-choice", i),
                         quality.menu_label(),
-                        quality == current,
+                        quality == shown.value.1,
                     )
                     .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
                         this.set_quality(server, quality);
-                        this.quality_menu = None;
+                        this.quality_menu.close();
                         cx.notify();
                     }))
                     .into_any_element()
                 })
                 .collect();
             picker = picker.child(menu::popup(
+                shown,
                 false,
                 items,
                 window,
                 cx.listener(|this, _: &MouseDownEvent, _, cx| {
-                    this.quality_menu = None;
+                    this.quality_menu.close();
                     cx.notify();
                 }),
             ));

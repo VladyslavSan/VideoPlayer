@@ -22,11 +22,16 @@ pub(super) enum MenuTarget {
     Season(String, u16),
 }
 
-/// An open right-click menu, where the click was.
+/// A right-click menu, where the click was. Its choices are made when it
+/// opens, so they don't change as it fades out after one is picked.
 pub(super) struct CardMenu {
-    target: MenuTarget,
     at: Point<Pixels>,
+    choices: Vec<Choice>,
 }
+
+/// A choice in a card's menu: its label, the items to mark, and whether
+/// as watched.
+type Choice = (String, Vec<String>, bool);
 
 impl Shell {
     pub(super) fn open_card_menu(
@@ -35,20 +40,25 @@ impl Shell {
         at: Point<Pixels>,
         cx: &mut Context<Self>,
     ) {
-        self.card_menu = Some(CardMenu { target, at });
+        let choices = self.card_menu_choices(&target);
+        if choices.is_empty() {
+            self.close_card_menu(cx);
+            return;
+        }
+        self.card_menu.open(CardMenu { at, choices });
         cx.notify();
     }
 
     pub(super) fn close_card_menu(&mut self, cx: &mut Context<Self>) -> bool {
-        let open = self.card_menu.take().is_some();
+        let open = self.card_menu.close();
         if open {
             cx.notify();
         }
         open
     }
 
-    /// The choices for the open menu: (label, items to mark, watched).
-    fn card_menu_choices(&self, target: &MenuTarget) -> Vec<(String, Vec<String>, bool)> {
+    /// The choices for a card's menu.
+    fn card_menu_choices(&self, target: &MenuTarget) -> Vec<Choice> {
         let mut choices = Vec::new();
         match target {
             MenuTarget::Item(key) => {
@@ -111,32 +121,37 @@ impl Shell {
         choices
     }
 
+    /// The right-click menu, and any still fading out.
     pub(super) fn card_menu_view(
         &self,
         window: &Window,
         cx: &mut Context<Self>,
-    ) -> Option<AnyElement> {
-        let menu = self.card_menu.as_ref()?;
-        let items = self
-            .card_menu_choices(&menu.target)
-            .into_iter()
-            .enumerate()
-            .map(|(i, (label, keys, watched))| {
-                menu::item(("card-menu", i), label, false)
-                    .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
-                        this.card_menu = None;
-                        this.mark_watched(&keys, watched, cx);
-                    }))
-                    .into_any_element()
+    ) -> Vec<AnyElement> {
+        self.card_menu
+            .drawn()
+            .iter()
+            .map(|shown| {
+                let items = shown
+                    .value
+                    .choices
+                    .iter()
+                    .cloned()
+                    .enumerate()
+                    .map(|(i, (label, keys, watched))| {
+                        menu::item(("card-menu", i), label, false)
+                            .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
+                                this.card_menu.close();
+                                this.mark_watched(&keys, watched, cx);
+                            }))
+                            .into_any_element()
+                    })
+                    .collect();
+                let shell = cx.entity().downgrade();
+                menu::context(shown, shown.value.at, items, window, move |_, _, cx| {
+                    shell.update(cx, |this, cx| this.close_card_menu(cx)).ok();
+                })
             })
-            .collect::<Vec<_>>();
-        if items.is_empty() {
-            return None;
-        }
-        let shell = cx.entity().downgrade();
-        Some(menu::context(menu.at, items, window, move |_, _, cx| {
-            shell.update(cx, |this, cx| this.close_card_menu(cx)).ok();
-        }))
+            .collect()
     }
 
     /// Marks items watched or unwatched, here and on their servers. Either

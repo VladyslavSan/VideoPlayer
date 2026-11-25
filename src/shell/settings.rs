@@ -79,7 +79,7 @@ impl Shell {
         self.screen = Screen::Settings;
         self.settings_page = page;
         self.key_capture = Default::default();
-        self.quality_menu = None;
+        self.quality_menu.close();
         window.focus(&self.focus);
         cx.notify();
     }

@@ -20,8 +20,10 @@ use gpui::{
 use crate::jellyfin::Quality;
 use crate::library::{SubtitlePref, SubtitleTuning, TrackPrefs, WATCHED_FRACTION};
 use crate::media_session::{self, MediaCommand, MediaSession, NowPlaying};
+use crate::motion::Fade;
+use crate::ui::menu;
 use crate::video::{ExternalSubtitle, Segment, SegmentKind, Track, TrackKind, VideoSurface};
-use fade::{Fade, Notes, Swaps};
+use fade::{Notes, Swaps};
 
 pub use previews::Previews;
 pub use segments::merge as merge_segments;
@@ -238,8 +240,9 @@ pub struct Player {
     up_next: Option<Instant>,
     prefs: TrackPrefs,
     quality: Option<Quality>,
-    /// Whether the streaming quality menu is open (in the tracks panel).
-    quality_menu: bool,
+    /// The streaming quality menu (in the tracks panel), with the quality
+    /// when it opened (the one checked, even as it fades out after a pick).
+    quality_menu: menu::Shown<Quality>,
     /// When mpv's video output came up for the current source.
     video_ready_since: Option<Instant>,
     /// After `reload`, the new source; until mpv reports it, track and
@@ -465,7 +468,7 @@ impl Player {
             last_good: None,
             stall: None,
             panel: None,
-            quality_menu: false,
+            quality_menu: menu::Shown::default(),
             drag: None,
             scrub: None,
             seek_hover: None,
@@ -597,7 +600,7 @@ impl Player {
 
     /// Switches to `quality` (from the quality menu).
     fn choose_quality(&mut self, quality: Quality, cx: &mut Context<Self>) {
-        self.quality_menu = false;
+        self.quality_menu.close();
         if self.quality != Some(quality) {
             cx.emit(PlayerEvent::QualityChosen(quality));
         }
@@ -1225,8 +1228,9 @@ impl Player {
         }
         let key = event.keystroke.unparse();
         if key == "escape" {
-            if self.quality_menu {
-                self.quality_menu = false;
+            // The innermost thing open closes first.
+            if self.quality_menu.close() {
+                // Closed (fading out).
             } else if self.panel.is_some() {
                 self.panel = None;
             } else if window.is_fullscreen() {

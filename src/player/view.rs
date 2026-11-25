@@ -677,16 +677,22 @@ impl Player {
         window: &Window,
         cx: &mut Context<Self>,
     ) -> AnyElement {
-        let open = self.quality_menu;
+        let lit = self.quality_menu.lit(|_| true);
         let mut picker = div().relative().flex().child(
-            menu::trigger("quality", current.label(), open).on_click(cx.listener(
-                |this, _: &ClickEvent, _, cx| {
-                    this.quality_menu = !this.quality_menu;
-                    this.poke(cx);
-                },
-            )),
+            menu::trigger(
+                "quality",
+                self.swaps
+                    .draw("quality", current.label(), |label| div().child(label)),
+                lit,
+            )
+            .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
+                if !this.quality_menu.close() {
+                    this.quality_menu.open(current);
+                }
+                this.poke(cx);
+            })),
         );
-        if open {
+        for shown in self.quality_menu.drawn() {
             let items = QUALITIES
                 .iter()
                 .enumerate()
@@ -694,7 +700,7 @@ impl Player {
                     menu::item(
                         ("quality-choice", i),
                         quality.menu_label(),
-                        quality == current,
+                        quality == *shown.value,
                     )
                     .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
                         this.choose_quality(quality, cx);
@@ -704,11 +710,12 @@ impl Player {
                 })
                 .collect();
             picker = picker.child(menu::popup(
+                &shown,
                 true,
                 items,
                 window,
                 cx.listener(|this, _: &MouseDownEvent, _, cx| {
-                    this.quality_menu = false;
+                    this.quality_menu.close();
                     this.poke(cx);
                 }),
             ));
@@ -1387,7 +1394,7 @@ impl Render for Player {
         let visible = self.controls_visible();
         // The quality menu lives in the tracks panel and closes with it.
         if self.panel != Some(Panel::Tracks) {
-            self.quality_menu = false;
+            self.quality_menu.close();
         }
         self.update_fades(window);
 

@@ -1,90 +1,20 @@
 //! Fading the player's overlays in and out, so nothing on it pops.
 //!
 //! The overlays come and go with the mouse, and often turn back halfway
-//! (the bar starts fading out, the mouse moves): a `Fade` eases from
+//! (the bar starts fading out, the mouse moves): a `Fade` (`motion`) eases from
 //! wherever it is to where it's going, so a reversal never jumps. Its value
 //! is computed from the clock when the player draws; the player keeps
 //! drawing every frame while one is on its way (`moving`).
 
 use std::cell::RefCell;
 use std::collections::HashMap;
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
 use gpui::{
     Animation, AnimationExt, AnyElement, IntoElement, ParentElement, SharedString, Styled, div,
 };
 
-use crate::motion::{OVERLAY, ease_in_out};
-
-/// Something that's shown or not, fading between the two.
-#[derive(Debug, Clone, Copy)]
-pub struct Fade {
-    shown: bool,
-    /// Where it started from when it last turned.
-    from: f32,
-    at: Instant,
-}
-
-impl Fade {
-    pub fn new(shown: bool) -> Self {
-        Self {
-            shown,
-            from: if shown { 1.0 } else { 0.0 },
-            at: Instant::now(),
-        }
-    }
-
-    /// Starts fading in or out, from wherever it is now.
-    pub fn set(&mut self, shown: bool) {
-        if shown != self.shown {
-            self.from = self.value();
-            self.shown = shown;
-            self.at = Instant::now();
-        }
-    }
-
-    pub fn shown(&self) -> bool {
-        self.shown
-    }
-
-    /// How visible it is now: 0 (gone) to 1.
-    pub fn value(&self) -> f32 {
-        if !crate::motion::enabled() {
-            return self.target();
-        }
-        fade_value(self.from, self.target(), self.at.elapsed(), OVERLAY.time())
-    }
-
-    /// Still to be drawn: shown, or fading out.
-    pub fn on_screen(&self) -> bool {
-        self.shown || self.value() > 0.0
-    }
-
-    /// On its way in or out.
-    pub fn moving(&self) -> bool {
-        self.value() != self.target()
-    }
-
-    fn target(&self) -> f32 {
-        if self.shown { 1.0 } else { 0.0 }
-    }
-}
-
-/// From `from` toward `to`, `elapsed` into a fade that takes `full` to
-/// cross the whole way (a shorter way takes less).
-fn fade_value(from: f32, to: f32, elapsed: Duration, full: Duration) -> f32 {
-    let span = (to - from).abs();
-    let total = full.as_secs_f32() * span;
-    if total <= 0.0 {
-        return to;
-    }
-    let progress = elapsed.as_secs_f32() / total;
-    if progress >= 1.0 {
-        // Exactly there, so it stops counting as moving.
-        return to;
-    }
-    from + (to - from) * ease_in_out(progress.max(0.0))
-}
+use crate::motion::{Fade, OVERLAY, ease_in_out};
 
 /// Short notes in one place ("Volume 80%", "Loading…"): a new one fades
 /// in over the one before as that fades out.
@@ -217,25 +147,6 @@ impl Swaps {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    const FULL: Duration = Duration::from_millis(400);
-
-    #[test]
-    fn fades_ease_all_the_way() {
-        assert_eq!(fade_value(0.0, 1.0, Duration::ZERO, FULL), 0.0);
-        assert_eq!(fade_value(0.0, 1.0, FULL / 2, FULL), 0.5);
-        assert_eq!(fade_value(0.0, 1.0, FULL, FULL), 1.0);
-        assert_eq!(fade_value(1.0, 0.0, FULL * 2, FULL), 0.0);
-    }
-
-    #[test]
-    fn turning_back_halfway_takes_half_as_long() {
-        // From halfway out, back in: done in half the time, no jump.
-        assert_eq!(fade_value(0.5, 1.0, Duration::ZERO, FULL), 0.5);
-        assert_eq!(fade_value(0.5, 1.0, FULL / 2, FULL), 1.0);
-        assert_eq!(fade_value(0.3, 1.0, FULL, FULL), 1.0);
-        assert!(fade_value(0.5, 1.0, FULL / 4, FULL) > 0.5);
-    }
 
     #[test]
     fn notes_replace_each_other() {
