@@ -3159,8 +3159,8 @@ impl Render for Shell {
         self.card_actions.borrow_mut().clear();
         self.bounds_screen = Some(self.screen.clone());
         let content = self.page(&self.screen.clone(), window, cx);
-        // Each new page fades in, rising a little, over the page it replaces
-        // fading out, so one turns into the other.
+        // Each new page fades in, in place, over the page it replaces fading
+        // out, so one turns into the other.
         let leaving = self.leaving_page(window, cx);
         let content = if crate::motion::enabled() {
             let page_time = crate::motion::PAGE.time();
@@ -3177,11 +3177,7 @@ impl Render for Shell {
                 .with_animation(
                     ("page", self.page_generation),
                     Animation::new(page_time).with_easing(crate::motion::ease_in_out),
-                    |page, t| {
-                        page.opacity(t)
-                            .relative()
-                            .top(px((1.0 - t) * crate::motion::PAGE_RISE))
-                    },
+                    |page, t| page.opacity(t),
                 );
             div()
                 .relative()

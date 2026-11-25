@@ -58,9 +58,6 @@ pub fn duration(base: Duration) -> Duration {
     base.mul_f32(scale)
 }
 
-/// How far a page rises as it appears, in pixels.
-pub const PAGE_RISE: f32 = 14.0;
-
 /// Off with Windows' "Animation effects" or macOS's "Reduce motion", or
 /// with `VIDEO_PLAYER_NO_MOTION` set.
 pub fn enabled() -> bool {

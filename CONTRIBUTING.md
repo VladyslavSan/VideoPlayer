@@ -12,8 +12,9 @@ bug, however small or brief.
   patched GPUI does this for any `overflow_scroll` element and `uniform_list`); scrolling the
   app does itself (to a row, to the top, keyboard moves through a grid) eases there too.
 - **Smooth transitions.** Things appear, disappear, open, close and change size with an
-  animation, not a cut: pages rise and fade in, sections fold, overlays and bars fade. State
-  that swaps in place (a poster loading, a badge changing) fades rather than pops. Something
+  animation, not a cut: pages crossfade in place (nothing slides or rises in), sections fold,
+  overlays and bars fade. State that swaps in place (a poster loading, a badge changing) fades
+  rather than pops. Something
   that loads after its page opened fades in (`Shell::arriving`), and a "Loading…" note waits a
   moment before fading in (`Shell::waiting`), so a quick answer never flashes one.
 - **Standard timings.** Use the timings in `src/motion.rs` (`PAGE.time()`, `FOLD.time()`, …)
