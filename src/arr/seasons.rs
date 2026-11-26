@@ -16,6 +16,8 @@ pub struct SeasonSummary {
     pub missing: usize,
     /// Not aired yet (or no date).
     pub upcoming: usize,
+    /// When the next of those airs, if it has a date (Unix seconds).
+    pub next_airs: Option<i64>,
     /// Every episode of the season, for monitoring them all.
     pub episode_ids: Vec<i64>,
     pub monitored: bool,
@@ -25,9 +27,21 @@ pub struct SeasonSummary {
 }
 
 impl SeasonSummary {
-    /// Worth a line on the show's page: something to get or being got.
+    /// Worth a line on the show's page: something to get, being got, or
+    /// still to air.
     pub fn wanted(&self) -> bool {
-        self.missing > 0 || self.downloading > 0
+        self.missing > 0 || self.downloading > 0 || self.upcoming > 0
+    }
+
+    /// Some episodes have aired and more are to come, so releases come out
+    /// episode by episode rather than as a whole season.
+    pub fn is_airing(&self) -> bool {
+        self.aired > 0 && self.upcoming > 0
+    }
+
+    /// Every episode of the season, aired or not.
+    pub fn total(&self) -> usize {
+        self.episode_ids.len()
     }
 }
 
@@ -98,6 +112,7 @@ pub fn summarize(
                 downloaded: 0,
                 missing: 0,
                 upcoming: 0,
+                next_airs: None,
                 episode_ids: Vec::new(),
                 monitored: series
                     .seasons
@@ -115,6 +130,10 @@ pub fn summarize(
             season.missing += 1;
         } else {
             season.upcoming += 1;
+            let airs = episode.air_date_utc.as_deref().and_then(parse_utc);
+            if let Some(at) = airs.filter(|at| *at > now) {
+                season.next_airs = Some(season.next_airs.map_or(at, |next| next.min(at)));
+            }
         }
     }
     for season in seasons.values_mut() {
@@ -218,6 +237,9 @@ mod tests {
         );
         assert!(!one.wanted() && !one.monitored);
         assert_eq!((two.aired, two.missing, two.upcoming), (2, 2, 2));
+        assert_eq!(two.next_airs, future.and_then(parse_utc));
+        assert!(two.is_airing() && !one.is_airing());
+        assert_eq!((one.next_airs, two.total()), (None, 4));
         assert_eq!(two.episode_ids, vec![4, 5, 6, 7]);
         assert!(two.monitored && two.wanted());
         assert_eq!((two.downloading, two.progress), (1, Some(0.75)));

@@ -6,7 +6,7 @@ use std::time::{Duration, Instant};
 
 use gpui::SharedString;
 
-use crate::arr::SeasonSummary;
+use crate::arr::{self, SeasonSummary};
 use crate::shell::{ERROR, MUTED, TEXT};
 
 /// A Download asked for this recently still counts as searching.
@@ -59,11 +59,7 @@ pub(super) fn season_status(
     request: Option<&Request>,
     now: Instant,
 ) -> SeasonStatus {
-    let missing = if season.downloaded == 0 {
-        format!("{} not downloaded", episodes(season.missing))
-    } else {
-        format!("{} of {} missing", season.missing, episodes(season.aired))
-    };
+    let missing = missing_text(season);
     let (text, color, button) = if season.downloading > 0 {
         let progress = season
             .progress
@@ -90,25 +86,90 @@ pub(super) fn season_status(
                     None,
                 )
             }
-            _ if season.aired == 0 && season.monitored => (
-                "Not aired yet · Sonarr will get it when it airs".to_string(),
-                MUTED,
-                None,
-            ),
-            _ if season.aired == 0 => ("Not aired yet".to_string(), MUTED, Some("Download")),
-            _ if season.missing == 0 => ("Downloaded".to_string(), MUTED, None),
-            _ if season.monitored => (
-                format!("{missing} · Sonarr is watching for releases"),
-                MUTED,
-                Some("Search Again"),
-            ),
-            _ => (missing, MUTED, Some("Download")),
+            _ => {
+                let (text, button) = settled_status(season, missing);
+                (text, MUTED, button)
+            }
         }
     };
     SeasonStatus {
         text,
         color,
         button,
+    }
+}
+
+/// "8 episodes not downloaded", "3 of 8 episodes missing".
+fn missing_text(season: &SeasonSummary) -> String {
+    if season.downloaded == 0 {
+        format!("{} not downloaded", episodes(season.missing))
+    } else {
+        format!("{} of {} missing", season.missing, episodes(season.aired))
+    }
+}
+
+/// What a season says when nothing is downloading or was just asked for.
+fn settled_status(season: &SeasonSummary, missing: String) -> (String, Option<&'static str>) {
+    let next_airs = season.next_airs.map(arr::format_date);
+    if season.aired == 0 {
+        let not_aired = next_airs.map_or_else(
+            || "Not aired yet".to_string(),
+            |date| format!("Airs {date}"),
+        );
+        return if season.monitored {
+            (
+                format!("{not_aired} · Sonarr will get it when it airs"),
+                None,
+            )
+        } else {
+            (not_aired, Some("Download"))
+        };
+    }
+    if !season.is_airing() {
+        return match (season.missing, season.monitored) {
+            (0, _) => ("Downloaded".to_string(), None),
+            (_, true) => (
+                format!("{missing} · Sonarr is watching for releases"),
+                Some("Search Again"),
+            ),
+            (_, false) => (missing, Some("Download")),
+        };
+    }
+    airing_status(season, missing, next_airs)
+}
+
+/// A season with episodes still to air has no whole-season release yet,
+/// so it says why its episodes come one at a time.
+fn airing_status(
+    season: &SeasonSummary,
+    missing: String,
+    next_airs: Option<String>,
+) -> (String, Option<&'static str>) {
+    let next = next_airs
+        .map(|date| format!(" · next airs {date}"))
+        .unwrap_or_default();
+    let out = format!(
+        "{} of {} out, all downloaded{next}",
+        season.aired,
+        season.total()
+    );
+    match (season.missing, season.monitored) {
+        (0, true) => (
+            format!("{out} · Sonarr will get the rest as they air"),
+            None,
+        ),
+        (0, false) => (
+            format!("{out} · Sonarr isn't watching for the rest"),
+            Some("Get the Rest"),
+        ),
+        (_, monitored) => (
+            format!("{missing} · still airing, so releases come one episode at a time{next}"),
+            Some(if monitored {
+                "Search Again"
+            } else {
+                "Download"
+            }),
+        ),
     }
 }
 
@@ -134,6 +195,7 @@ mod tests {
             downloaded,
             missing: aired - downloaded,
             upcoming: 0,
+            next_airs: None,
             episode_ids: Vec::new(),
             monitored: false,
             downloading: 0,
@@ -246,6 +308,60 @@ mod tests {
             "Not aired yet · Sonarr will get it when it airs"
         );
         assert_eq!(status.button, None);
+    }
+
+    /// 6 of 10 episodes aired, `downloaded` of them on disk, the next one
+    /// airing on 28 Dec 2020.
+    fn airing(downloaded: usize, monitored: bool) -> SeasonSummary {
+        SeasonSummary {
+            upcoming: 4,
+            next_airs: Some(1_609_120_800),
+            episode_ids: (1..=10).collect(),
+            monitored,
+            ..season(6, downloaded)
+        }
+    }
+
+    #[test]
+    fn a_season_still_airing_says_why_it_has_no_whole_season_release() {
+        let now = Instant::now();
+        let status = season_status(&airing(6, true), None, now);
+        assert_eq!(
+            status.text,
+            "6 of 10 out, all downloaded · next airs 28 Dec 2020 · Sonarr will get the rest as they air"
+        );
+        assert_eq!(status.button, None);
+        let status = season_status(&airing(6, false), None, now);
+        assert_eq!(
+            status.text,
+            "6 of 10 out, all downloaded · next airs 28 Dec 2020 · Sonarr isn't watching for the rest"
+        );
+        assert_eq!(status.button, Some("Get the Rest"));
+        let status = season_status(&airing(4, true), None, now);
+        assert_eq!(
+            status.text,
+            "2 of 6 episodes missing · still airing, so releases come one episode at a time · next airs 28 Dec 2020"
+        );
+        assert_eq!(status.button, Some("Search Again"));
+        assert_eq!(
+            season_status(&airing(4, false), None, now).button,
+            Some("Download")
+        );
+    }
+
+    #[test]
+    fn a_season_not_aired_says_when_it_airs() {
+        let announced = SeasonSummary {
+            upcoming: 8,
+            next_airs: Some(1_609_120_800),
+            monitored: true,
+            ..season(0, 0)
+        };
+        let status = season_status(&announced, None, Instant::now());
+        assert_eq!(
+            status.text,
+            "Airs 28 Dec 2020 · Sonarr will get it when it airs"
+        );
     }
 
     #[test]
