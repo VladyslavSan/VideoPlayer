@@ -1,290 +1,287 @@
-//! Local media library: scanning folders, parsing names, and persisting
-//! items and watch progress.
+//! The media library: local folders and Jellyfin servers, what's in them,
+//! and what has been watched. `Library` is the model that owns it all and
+//! keeps it in step with the servers; views draw from a `Catalog` snapshot
+//! and ask the `Library` for changes.
 
+mod catalog;
 pub mod db;
+mod folders;
+mod item;
+mod live;
+mod outbox;
 pub mod parse;
+mod profile;
+mod remote;
+mod reports;
 pub mod scan;
+mod sync;
 pub mod thumbs;
 
-use std::collections::BTreeMap;
-use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::{SystemTime, UNIX_EPOCH};
 
+use anyhow::Result;
+use gpui::{Context, EventEmitter, SharedString};
+
+use crate::jellyfin::Server;
+use crate::secrets;
+
+pub use catalog::Catalog;
 pub use db::Db;
+pub use item::{
+    Item, MIN_RESUME_SECONDS, Section, Source, SubtitlePref, SubtitleTuning, TrackPrefs,
+    WATCHED_FRACTION, next_up,
+};
+pub use outbox::Change;
+pub use profile::{Paths, Profile};
+pub use reports::{AfterReport, RemoteItem, Report};
+pub use sync::Stop;
 
-/// Saved positions shorter than this are treated as "not started".
-pub const MIN_RESUME_SECONDS: f64 = 10.0;
-/// Fraction of the runtime after which an item counts as watched (Jellyfin's
-/// default too, so local and server state agree).
-pub const WATCHED_FRACTION: f64 = 0.9;
-
-/// Remembered audio and subtitle choices, as language codes.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct TrackPrefs {
-    pub audio: Option<String>,
-    pub subtitle: Option<SubtitlePref>,
+/// The time now, in Unix seconds.
+pub fn now() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|since| since.as_secs() as i64)
+        .unwrap_or(0)
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum SubtitlePref {
-    Off,
-    Language(String),
+/// What the library tells whoever subscribes to it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Event {
+    /// The servers signed in to may have changed; every fetch says so too.
+    ServersChanged,
 }
 
-impl TrackPrefs {
-    /// `self`, with gaps filled from `fallback` (for example a show's
-    /// choices over the general ones).
-    pub fn or(self, fallback: TrackPrefs) -> TrackPrefs {
-        TrackPrefs {
-            audio: self.audio.or(fallback.audio),
-            subtitle: self.subtitle.or(fallback.subtitle),
-        }
-    }
-}
-
-/// Subtitle delay and size the viewer set for a show (or a movie), applied
-/// again when it's played next. Unlike track choices, there's no general
-/// fallback: a delay fits one release, not everything.
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub struct SubtitleTuning {
-    /// Seconds; positive shows subtitles later.
-    pub delay: f64,
-    /// 1.0 is the normal size.
-    pub scale: f64,
-}
-
-impl Default for SubtitleTuning {
-    fn default() -> Self {
-        Self {
-            delay: 0.0,
-            scale: 1.0,
-        }
-    }
-}
-
-impl SubtitleTuning {
-    pub fn is_default(&self) -> bool {
-        *self == Self::default()
-    }
-}
-
-/// Where an item lives and how to play it.
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub enum Source {
-    /// A file found by scanning a local folder; `id` is its database row.
-    Local { id: i64, path: PathBuf },
-    /// An item on a signed-in Jellyfin server (`server` is our row id).
-    Jellyfin { server: i64, id: String },
-}
-
-/// A library on a Jellyfin server ("Movies", "Anime Series", ...), which
-/// gets its own tab.
-#[derive(Debug, Clone, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+/// Everything there is to watch, kept in step with its folders and servers.
 pub struct Library {
-    pub name: String,
-    /// Where the server lists it among the user's libraries.
-    pub order: u16,
-    /// Browsed by show (a TV library) rather than by title.
-    pub shows: bool,
+    profile: Profile,
+    catalog: Arc<Catalog>,
+    /// The one notice the header shows: what went wrong last.
+    error: Option<SharedString>,
+    scanning: folders::Scanning,
+    fetching: remote::Fetching,
+    live: live::Live,
+    play_states: sync::PlayStates,
+    /// Changes the servers haven't got yet.
+    outbox: outbox::Outbox,
+    reports: reports::Reports,
 }
 
-#[derive(Debug, Clone, PartialEq)]
-pub struct Item {
-    /// The Jellyfin library it's in; None for local files (and for items
-    /// cached before libraries were tracked).
-    pub library: Option<Arc<Library>>,
-    pub source: Source,
-    /// Movie title, or episode title.
-    pub title: String,
-    pub year: Option<u16>,
-    pub show: Option<String>,
-    pub season: Option<u16>,
-    pub episode: Option<u16>,
-    pub duration: Option<f64>,
-    pub position: f64,
-    pub watched: bool,
-    pub last_played: Option<i64>,
-    pub thumb: Option<PathBuf>,
-    /// When it joined the library (Unix seconds), for "recently added".
-    pub added: Option<i64>,
-}
+impl EventEmitter<Event> for Library {}
 
-impl Item {
-    /// Stable identifier, unique across sources (used for UI element ids).
-    pub fn key(&self) -> String {
-        match &self.source {
-            Source::Local { id, .. } => format!("local-{id}"),
-            Source::Jellyfin { server, id } => format!("jf-{server}-{id}"),
-        }
+impl Library {
+    /// The library as it was left: the database's items, each server's
+    /// cached library, and the changes still to send.
+    pub fn new(profile: Profile, cx: &mut Context<Self>) -> Self {
+        let mut library = Self {
+            profile,
+            catalog: Arc::default(),
+            error: None,
+            scanning: folders::Scanning::default(),
+            fetching: remote::Fetching::default(),
+            live: live::Live::default(),
+            play_states: sync::PlayStates::default(),
+            outbox: outbox::Outbox::default(),
+            reports: reports::Reports::default(),
+        };
+        library.reload(cx);
+        library.load_cached_remote(cx);
+        library.load_outbox(cx);
+        library
     }
 
-    #[cfg(test)]
-    pub fn local_id(&self) -> Option<i64> {
-        match self.source {
-            Source::Local { id, .. } => Some(id),
-            Source::Jellyfin { .. } => None,
-        }
+    /// What the library holds now. Cheap: views keep one to draw from, and
+    /// take it again when the library notifies.
+    pub fn catalog(&self) -> Arc<Catalog> {
+        self.catalog.clone()
     }
 
-    pub fn is_episode(&self) -> bool {
-        self.show.is_some()
+    /// The catalog, to change. Views hold the old one until they hear of
+    /// it, so this copies it: change it once per update, not per item.
+    fn catalog_mut(&mut self, cx: &mut Context<Self>) -> &mut Catalog {
+        cx.notify();
+        Arc::make_mut(&mut self.catalog)
     }
 
-    /// Playback progress in 0..=1, if the item has been started.
-    pub fn progress(&self) -> Option<f32> {
-        match self.duration {
-            Some(d) if d > 0.0 && self.position >= MIN_RESUME_SECONDS => {
-                Some((self.position / d).clamp(0.0, 1.0) as f32)
+    /// Re-reads local items, folders and servers from the database.
+    fn reload(&mut self, cx: &mut Context<Self>) {
+        let db = &self.profile.db;
+        let loaded = (|| anyhow::Ok((db.items()?, db.roots()?, db.servers()?)))();
+        let (local, roots, mut servers) = match loaded {
+            Ok(loaded) => loaded,
+            Err(e) => {
+                self.error = Some(format!("Couldn't read the library: {e}").into());
+                return;
             }
-            _ => None,
+        };
+        if let Err(e) = attach_tokens(&self.profile, &mut servers) {
+            self.error = Some(format!("Couldn't read saved sign-ins: {e:#}").into());
+        }
+        let held = &self.catalog;
+        if held.local() == local && held.roots() == roots && held.servers() == servers {
+            return;
+        }
+        let catalog = self.catalog_mut(cx);
+        catalog.local = local;
+        catalog.roots = roots;
+        catalog.servers = servers;
+    }
+
+    /// The app has opened: brings the library up to date in the background.
+    pub fn start(&mut self, cx: &mut Context<Self>) {
+        self.refresh(cx);
+        self.generate_thumbnails(cx);
+    }
+
+    /// Looks through the folders and fetches the servers' libraries again.
+    pub fn refresh(&mut self, cx: &mut Context<Self>) {
+        self.error = None;
+        self.rescan(cx);
+        self.refresh_remote(cx);
+    }
+
+    /// What went wrong last, for the header.
+    pub fn error(&self) -> Option<&SharedString> {
+        self.error.as_ref()
+    }
+
+    /// Shows `error` in the header, in place of any other.
+    pub fn set_error(&mut self, error: impl Into<SharedString>, cx: &mut Context<Self>) {
+        self.error = Some(error.into());
+        cx.notify();
+    }
+
+    pub fn clear_error(&mut self, cx: &mut Context<Self>) {
+        if self.error.take().is_some() {
+            cx.notify();
         }
     }
 
-    pub fn resume_position(&self) -> f64 {
-        if self.position >= MIN_RESUME_SECONDS {
-            self.position
+    /// Whether the folders are being scanned or a server's library fetched.
+    pub fn is_loading(&self) -> bool {
+        self.scanning.scanning || self.is_fetching()
+    }
+
+    /// Whether a server's library is being fetched.
+    pub fn is_fetching(&self) -> bool {
+        !self.fetching.loading.is_empty()
+    }
+
+    /// What the library is busy with, for the header.
+    pub fn status(&self) -> Option<SharedString> {
+        let progress = Progress {
+            scanning: self.scanning.scanning,
+            fetching: self.is_fetching(),
+            artwork_left: self.fetching.artwork_left,
+            thumbnails_left: self.scanning.thumbnails_left,
+            // Only worth saying while the server can't be reached.
+            undelivered: if self.reports.is_failing() {
+                self.outbox.len()
+            } else {
+                0
+            },
+        };
+        progress.status().map(Into::into)
+    }
+}
+
+/// Fills in each server's token from the credential store. A token that
+/// an older version left in the database is moved there first.
+fn attach_tokens(profile: &Profile, servers: &mut [Server]) -> Result<()> {
+    for server in servers {
+        let account = server.token_account(&profile.device_id);
+        if server.token.is_empty() {
+            server.token = secrets::load(&account)?.unwrap_or_default();
         } else {
-            0.0
+            secrets::save(&account, &server.token)?;
+            profile.db.clear_token(server.id)?;
         }
     }
-
-    /// Short label such as `S1 · E4`.
-    pub fn episode_label(&self) -> Option<String> {
-        Some(format!("S{} · E{}", self.season?, self.episode?))
-    }
-
-    /// Sort key for watching a show in order: seasons in order, specials
-    /// (season 0) last, then episode number.
-    pub fn watch_order(&self) -> (bool, u16, Option<u16>, String) {
-        let season = self.season.unwrap_or(0);
-        (season == 0, season, self.episode, self.title.to_lowercase())
-    }
-
-    /// Title for headings: the movie title, or `Show · S1 · E4`.
-    pub fn display_title(&self) -> String {
-        match (&self.show, self.episode_label()) {
-            (Some(show), Some(label)) => format!("{show} · {label}"),
-            _ => self.title.clone(),
-        }
-    }
+    Ok(())
 }
 
-/// The next episode of each show being watched: the most recently played
-/// episode if it wasn't finished (and has no resume point, or it would be
-/// continued instead), else the first unwatched one after it. Paired
-/// with when the show was last watched, for sorting.
-pub fn next_up<'a>(items: impl Iterator<Item = &'a Item>) -> Vec<(Option<i64>, &'a Item)> {
-    let mut shows: BTreeMap<&str, Vec<&Item>> = BTreeMap::new();
-    for item in items {
-        if let Some(show) = &item.show {
-            shows.entry(show.as_str()).or_default().push(item);
+/// How far the library's background work has come.
+#[derive(Debug, Clone, Copy, Default)]
+struct Progress {
+    scanning: bool,
+    fetching: bool,
+    artwork_left: usize,
+    thumbnails_left: usize,
+    /// Changes waiting for a server that can't be reached.
+    undelivered: usize,
+}
+
+impl Progress {
+    /// The one line the header shows: the first of these under way.
+    fn status(self) -> Option<String> {
+        if self.scanning {
+            Some("Scanning…".into())
+        } else if self.fetching {
+            Some("Loading Jellyfin library…".into())
+        } else if self.artwork_left > 0 {
+            Some(format!("Downloading artwork ({} left)", self.artwork_left))
+        } else if self.thumbnails_left > 0 {
+            Some(format!(
+                "Generating thumbnails ({} left)",
+                self.thumbnails_left
+            ))
+        } else if self.undelivered > 0 {
+            let count = self.undelivered;
+            let plural = if count == 1 { "" } else { "s" };
+            Some(format!(
+                "Offline: {count} change{plural} to send when the server answers"
+            ))
+        } else {
+            None
         }
     }
-    shows
-        .into_values()
-        .filter_map(|mut episodes| {
-            episodes.sort_by_key(|e| e.watch_order());
-            let (last_index, last) = episodes
-                .iter()
-                .enumerate()
-                .filter(|(_, e)| e.last_played.is_some())
-                .max_by_key(|(_, e)| e.last_played)?;
-            if last.progress().is_some() {
-                return None; // still in progress: it's continued, not next
-            }
-            // Starting from the last one itself: one that was left in its
-            // first minutes has no resume point (Jellyfin drops positions
-            // under 5%), but it isn't finished either.
-            let next = episodes[last_index..].iter().find(|e| !e.watched)?;
-            Some((last.last_played, *next))
-        })
-        .collect()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    fn episode(show: &str, season: u16, number: u16) -> Item {
-        Item {
-            library: None,
-            source: Source::Jellyfin {
-                server: 1,
-                id: format!("{show}-{season}-{number}"),
-            },
-            title: format!("Episode {number}"),
-            year: None,
-            show: Some(show.into()),
-            season: Some(season),
-            episode: Some(number),
-            duration: Some(1000.0),
-            position: 0.0,
-            watched: false,
-            last_played: None,
-            thumb: None,
-            added: None,
-        }
-    }
-
-    fn keys(list: &[(Option<i64>, &Item)]) -> Vec<String> {
-        list.iter().map(|(_, i)| i.key()).collect()
+    #[test]
+    fn the_header_names_the_first_thing_under_way() {
+        let mut progress = Progress {
+            scanning: true,
+            fetching: true,
+            artwork_left: 3,
+            thumbnails_left: 2,
+            undelivered: 1,
+        };
+        assert_eq!(progress.status().as_deref(), Some("Scanning…"));
+        progress.scanning = false;
+        assert_eq!(
+            progress.status().as_deref(),
+            Some("Loading Jellyfin library…")
+        );
+        progress.fetching = false;
+        assert_eq!(
+            progress.status().as_deref(),
+            Some("Downloading artwork (3 left)")
+        );
+        progress.artwork_left = 0;
+        assert_eq!(
+            progress.status().as_deref(),
+            Some("Generating thumbnails (2 left)")
+        );
     }
 
     #[test]
-    fn next_up_follows_the_last_finished_episode() {
-        let mut items = [
-            episode("A", 1, 1),
-            episode("A", 1, 2),
-            episode("A", 2, 1),
-            episode("A", 0, 1), // special: watched last
-            episode("B", 1, 1),
-            episode("B", 1, 2),
-            episode("C", 1, 1),
-        ];
-        // A: finished S1E2 most recently -> S2E1 is next.
-        items[0].watched = true;
-        items[0].last_played = Some(100);
-        items[1].watched = true;
-        items[1].last_played = Some(200);
-        // B: E1 half-watched -> continued, not "next".
-        items[4].position = 500.0;
-        items[4].last_played = Some(300);
-        // C: never played -> nothing.
-        let next = next_up(items.iter());
-        assert_eq!(keys(&next), vec!["jf-1-A-2-1"]);
-        assert_eq!(next[0].0, Some(200));
-
-        // Finishing the last regular episode leads to the specials.
-        items[2].watched = true;
-        items[2].last_played = Some(400);
-        assert_eq!(keys(&next_up(items.iter())), vec!["jf-1-A-0-1"]);
-
-        // Everything watched: nothing next.
-        items[3].watched = true;
-        items[3].last_played = Some(500);
-        assert!(next_up(items.iter()).is_empty());
-    }
-
-    #[test]
-    fn rewatching_an_early_episode_skips_watched_ones() {
-        let mut items = [episode("A", 1, 1), episode("A", 1, 2), episode("A", 1, 3)];
-        for item in &mut items {
-            item.watched = true;
-        }
-        items[2].watched = false;
-        items[0].last_played = Some(900); // rewatched E1 last
-        items[1].last_played = Some(100);
-        assert_eq!(keys(&next_up(items.iter())), vec!["jf-1-A-1-3"]);
-    }
-
-    #[test]
-    fn an_episode_left_early_is_still_next() {
-        let mut items = [episode("A", 1, 1), episode("A", 1, 2), episode("A", 1, 3)];
-        items[0].watched = true;
-        items[0].last_played = Some(100);
-        // Opened E2 and closed it after a few seconds: no resume point, not
-        // watched. It's still the one to watch, not E3.
-        items[1].last_played = Some(200);
-        assert_eq!(keys(&next_up(items.iter())), vec!["jf-1-A-1-2"]);
+    fn the_header_counts_the_changes_waiting_for_the_server() {
+        let waiting = |undelivered| Progress {
+            undelivered,
+            ..Progress::default()
+        };
+        assert_eq!(
+            waiting(1).status().as_deref(),
+            Some("Offline: 1 change to send when the server answers")
+        );
+        assert_eq!(
+            waiting(4).status().as_deref(),
+            Some("Offline: 4 changes to send when the server answers")
+        );
+        assert_eq!(waiting(0).status(), None);
     }
 }

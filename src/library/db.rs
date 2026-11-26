@@ -67,6 +67,7 @@ pub struct FileInfo {
     pub parsed: Parsed,
 }
 
+#[derive(Debug)]
 pub struct Db {
     conn: Connection,
 }

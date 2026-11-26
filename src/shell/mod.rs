@@ -1,494 +1,125 @@
-//! App shell: the library screens (local folders and Jellyfin), the Jellyfin
-//! sign-in screen, and switching to and from the player.
+//! The app's window: which page is showing and the fade from one to the
+//! next, the bar and sidebar around the pages, the keyboard, and the open
+//! video in place of it all. The pages and the player are views of their
+//! own; the shell arranges them and does what they ask through events.
 
-use std::cell::{Cell, RefCell};
-use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
-use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::rc::Rc;
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use anyhow::{Context as _, Result, bail};
+use anyhow::Result;
 use gpui::{
-    Animation, AnimationExt as _, AnyElement, Bounds, ClickEvent, Context, ElementId, Entity,
-    FocusHandle, Focusable, FontWeight, KeyDownEvent, MouseButton, MouseDownEvent,
-    PathPromptOptions, Pixels, ScrollHandle, ScrollStrategy, SharedString, Subscription,
-    UniformListScrollHandle, Window, canvas, div, point, prelude::*, px, rgb, rgba,
+    AnyElement, App, Context, Entity, FocusHandle, PathPromptOptions, Window, div, prelude::*, px,
+    rgb,
 };
 
-use crate::introdb;
-use crate::jellyfin::{
-    self, Client, ImageRef, PlaySession, PlaybackInfo, PlaybackReport, QUALITIES, Quality, Server,
-    discovery,
-};
-use crate::library::{Db, Item, Source, SubtitleTuning, TrackPrefs, scan, thumbs};
-use crate::media_session::MediaSession;
-use crate::player::{self, Episode, Playback, Player, PlayerEvent, SegmentSource};
-use crate::secrets;
-use crate::ui::menu;
+use crate::arr::Kind;
+use crate::arr::connections::{Apps, Id};
+use crate::arr::downloads::Downloads;
+use crate::library::{Library, Paths, Profile};
 use crate::ui::text_input::TextInput;
 
-mod arr_page;
-mod arr_settings;
-mod arriving;
+mod arr;
 mod browse;
-mod controls_page;
+mod cards;
 mod details;
 mod downloads;
 mod episode_list;
-mod finder;
-mod found_page;
+mod header;
 mod keynav;
-mod live;
-mod offline;
-mod pictures;
+mod keys;
+mod navigation;
+mod page_motion;
+mod playback;
 mod posters;
-mod releases;
-mod reports;
-mod resize;
+mod preferences;
+mod season_block;
+mod seasons;
 mod settings;
+mod setup;
+mod sidebar;
+mod sliders;
 mod sonarr;
-mod sound_settings;
-mod sync;
-mod tracked_page;
-mod watched;
-use browse::{Grid, Sort};
-use details::Details;
-use settings::SettingsPage;
+mod switches;
+mod test_captures;
+mod transition;
+mod widgets;
+use browse::{Grid, Scope};
+use cards::Cards;
+use header::HEADER_HEIGHT;
+use navigation::{Navigation, Screen};
+use page_motion::Motion;
+use playback::{NowPlaying, StartAt};
+use preferences::Preferences;
+use settings::Settings;
+use setup::{Models, Parts};
 
 const BG: u32 = 0x0b0d12;
 const TEXT: u32 = 0xf4f5f7;
 const MUTED: u32 = 0x8f98a8;
 const ACCENT: u32 = 0x4c8dff;
 const ERROR: u32 = 0xff7a7a;
-/// The bar at the top (search, Refresh, Settings). It floats over the page,
-/// which scrolls on underneath it, seen through the bar.
-const HEADER_HEIGHT: f32 = 80.0;
-/// The bar is near solid at the top and fades out to nothing at its
-/// bottom edge (or at the sort bar's, on a library grid).
-const BAR_TOP_OPACITY: f32 = 0.97;
-/// Where the bar starts to fade, as a share of the header's height.
-const BAR_FADE_START: f32 = 0.3;
-/// The opacity where the header meets a sort bar below it.
-const BAR_JOIN_OPACITY: f32 = 0.6;
 
-/// Frosted glass: the page is blurred under the bars, under a light tint.
-/// Only GPUI's Windows renderer blurs so far; elsewhere the bars fade.
-const FROSTED: bool = cfg!(target_os = "windows");
-/// How soft the page under the bars gets (the blur's standard deviation).
-const FROST_BLUR: f32 = 20.0;
-/// The tint over the blur.
-const FROST_TINT: f32 = 0.4;
-/// The faint line under frosted bars.
-const FROST_EDGE: u32 = 0xffffff12;
-
-/// The bars' own background: a light tint over the frost, or a fade.
-fn bar_background(start: f32, from: f32, to: f32) -> gpui::Background {
-    if FROSTED {
-        bar_tint(FROST_TINT).into()
-    } else {
-        bar_fade(start, from, to)
+/// Removes a folder of pictures from Sonarr and Radarr that nothing reads.
+fn remove_old_pictures(old_pictures: PathBuf, cx: &mut App) {
+    if old_pictures.exists() {
+        cx.background_executor()
+            .spawn(async move {
+                let _ = std::fs::remove_dir_all(old_pictures);
+            })
+            .detach();
     }
 }
 
-/// The page colour at `opacity`, for the fading bar.
-fn bar_tint(opacity: f32) -> gpui::Hsla {
-    let mut color: gpui::Hsla = rgb(BG).into();
-    color.a = opacity;
-    color
-}
-
-/// A top-to-bottom fade of the page colour, `from` (solid until `start`,
-/// a share of the height) to `to`.
-fn bar_fade(start: f32, from: f32, to: f32) -> gpui::Background {
-    gpui::linear_gradient(
-        180.0,
-        gpui::linear_color_stop(bar_tint(from), start),
-        gpui::linear_color_stop(bar_tint(to), 1.0),
-    )
-}
-const CARD_WIDTH: f32 = 256.0;
-const CARD_HEIGHT: f32 = 144.0;
-const CONTINUE_LIMIT: usize = 12;
-const VOLUME_SETTING: &str = "volume";
-const GENERAL_PREFS: &str = "general";
-const DISCOVERY_WAIT: Duration = Duration::from_millis(1500);
-/// Switching back to the app catches up on what was played elsewhere, if
-/// it hasn't for this long...
-const CATCH_UP_ON_FOCUS_AFTER: Duration = Duration::from_secs(15);
-/// ...and fetches the whole library again if it's older than this.
-const REFRESH_ON_FOCUS_AFTER: Duration = Duration::from_secs(30 * 60);
-const PLACEHOLDER_COLORS: [u32; 6] = [0x2b3a55, 0x3d2b55, 0x2b5547, 0x55402b, 0x552b3a, 0x2b4d55];
-
-/// Where the library database and thumbnails live.
-#[derive(Clone)]
-pub struct Paths {
-    pub db: PathBuf,
-    pub thumbs: PathBuf,
-    /// Diagnostics of release builds, which have no console.
-    #[cfg_attr(debug_assertions, allow(dead_code))]
-    pub log: PathBuf,
-}
-
-impl Paths {
-    /// `%LOCALAPPDATA%\VideoPlayer`, or `VIDEO_PLAYER_DATA_DIR` if set.
-    pub fn resolve() -> Result<Self> {
-        let base = match std::env::var_os("VIDEO_PLAYER_DATA_DIR") {
-            Some(dir) => PathBuf::from(dir),
-            None => dirs::data_local_dir()
-                .context("no local app data directory")?
-                .join("VideoPlayer"),
+/// Asks for folders and adds the ones picked to the library.
+fn pick_folders(library: Entity<Library>, cx: &mut App) {
+    let picked = cx.prompt_for_paths(PathPromptOptions {
+        files: false,
+        directories: true,
+        multiple: true,
+        prompt: Some("Add to Library".into()),
+    });
+    cx.spawn(async move |cx| {
+        let Ok(Ok(Some(folders))) = picked.await else {
+            return;
         };
-        Ok(Self {
-            db: base.join("library.db"),
-            thumbs: base.join("thumbs"),
-            log: base.join("app.log"),
-        })
-    }
-
-    /// Seek bar preview pictures of the video playing (temporary).
-    pub fn previews(&self) -> PathBuf {
-        self.db.with_file_name("previews")
-    }
-
-    /// Pictures from Sonarr, Radarr and the metadata sites. (Their old
-    /// folder, `arr`, may hold ones that show up green; see
-    /// `arr::readable`.)
-    pub fn arr_pictures(&self) -> PathBuf {
-        self.thumbs.join("arr-pictures")
-    }
-
-    /// Where the library last fetched from a server is kept.
-    pub fn library_cache(&self, server: i64) -> PathBuf {
-        self.db.with_file_name(format!("jellyfin-{server}.json"))
-    }
+        library
+            .update(cx, |library, cx| library.add_folders(&folders, cx))
+            .ok();
+    })
+    .detach();
 }
 
-/// A control on the see-through bar, on a solid backing of the page's
-/// colour so it looks the same whatever passes underneath.
-fn solid(control: AnyElement) -> AnyElement {
-    div()
-        .flex_none()
-        .rounded_md()
-        .bg(rgb(BG))
-        .child(control)
-        .into_any_element()
-}
-
-/// A fresh id for a Jellyfin play session.
-fn new_session_id() -> String {
-    use std::hash::{BuildHasher, RandomState};
-    let nanos = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_nanos())
-        .unwrap_or_default();
-    format!(
-        "{:016x}{:016x}",
-        RandomState::new().hash_one(nanos),
-        RandomState::new().hash_one(std::process::id())
-    )
-}
-
-/// Where to stream an item from at `quality`.
-fn stream_url(client: &Client, item_id: &str, session: &PlaySession, quality: Quality) -> String {
-    match quality {
-        Quality::Original => client.stream_url(item_id),
-        Quality::Bitrate(bitrate) => client.transcode_url(item_id, session, bitrate),
-    }
-}
-
-fn now() -> i64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs() as i64)
-        .unwrap_or(0)
-}
-
-#[derive(Clone, PartialEq)]
-enum Screen {
-    /// Every source together.
-    Home,
-    /// One source's page: a Jellyfin server, or None for local folders.
-    Source(browse::Origin),
-    /// A library's grid of movies, or of shows.
-    Movies(browse::Shelf),
-    Shows(browse::Shelf),
-    Show(String),
-    /// A movie's details page, by item key.
-    Details(String),
-    /// What Sonarr and Radarr are downloading.
-    Downloads,
-    /// A server's Sonarr or Radarr: adding to it, and what it's doing.
-    Arr(i64, crate::arr::Kind),
-    /// A show or movie from Sonarr's or Radarr's list that Jellyfin doesn't
-    /// have: getting it. By server, app and the app's id for it.
-    Tracked(i64, crate::arr::Kind, i64),
-    /// A search result neither Jellyfin nor the app has: what the search
-    /// found. By server, app and its TVDB (shows) or TMDB (movies) id.
-    Found(i64, crate::arr::Kind, i64),
-    Settings,
-}
-
-/// The page being left, fading out under the new one: drawn as it was,
-/// scrolled where it was, until the new page has faded in.
-struct Leaving {
-    screen: Screen,
-    started: Instant,
-    content_scroll: ScrollHandle,
-    grid_scroll: UniformListScrollHandle,
-    arr_scroll: UniformListScrollHandle,
-}
-
-/// A scroll handle at the same place as `handle`, for drawing a page that
-/// no longer moves.
-fn frozen(handle: &ScrollHandle) -> ScrollHandle {
-    let copy = ScrollHandle::new();
-    copy.set_offset(handle.offset());
-    copy
-}
-
-fn frozen_list(handle: &UniformListScrollHandle) -> UniformListScrollHandle {
-    let copy = UniformListScrollHandle::new();
-    copy.0
-        .borrow()
-        .base_handle
-        .set_offset(handle.0.borrow().base_handle.offset());
-    copy
-}
-
-/// A season folding open or shut, from when; `id` restarts the animation.
-struct Fold {
-    opening: bool,
-    started: Instant,
-    id: u64,
-}
-
-/// What a poster card shows.
-struct Card {
-    id: SharedString,
-    thumb: Option<PathBuf>,
-    title: String,
-    subtitle: Option<String>,
-    progress: Option<f32>,
-    watched: bool,
-    /// Ringed: the episode a show page was opened at.
-    highlight: bool,
-    /// What its right-click menu acts on.
-    menu: Option<watched::MenuTarget>,
-}
-
-/// Cards drawn in a frame: element id and where.
-type CardBounds = Rc<RefCell<Vec<(SharedString, Bounds<Pixels>)>>>;
-
-/// What Enter does on a card: the same as clicking it.
-type CardAction = Rc<dyn Fn(&mut Shell, &mut Window, &mut Context<Shell>)>;
-
-/// Room kept between the card picked with the keyboard and the page's edge.
-const CURSOR_MARGIN: f32 = 24.0;
-
-fn item_card_id(prefix: &str, item: &Item) -> SharedString {
-    format!("{prefix}-{}", item.key()).into()
-}
-
-/// Where an item's subtitle delay and size are remembered: episodes share
-/// their show's, a movie keeps its own.
-fn tuning_scope(item: &Item) -> String {
-    match &item.show {
-        Some(show) => format!("show:{show}"),
-        None => format!("item:{}", item.key()),
-    }
-}
-
-fn show_card_id(prefix: &str, show: &str) -> SharedString {
-    format!("{prefix}-show-{show}").into()
-}
-
-/// How long a show page opened at an episode keeps it in place while the
-/// page above it settles.
-const FOCUS_SCROLL_SETTLE: Duration = Duration::from_millis(1500);
-
-struct FocusScroll {
-    until: Instant,
-    /// The offset last set; a different one means the viewer scrolled.
-    applied: Option<Pixels>,
-}
-
-/// What clicking a card's text (below the picture) does, if it differs
-/// from clicking the picture.
-type TextClick = Box<dyn Fn(&mut Shell, &mut Window, &mut Context<Shell>)>;
-
-struct ActivePlayer {
-    view: Entity<Player>,
-    /// None when playing a file passed on the command line.
-    source: Option<Source>,
-    position: f64,
-    duration: f64,
-    /// The show being watched, whose track choices are remembered.
-    show: Option<String>,
-    /// Where subtitle delay and size are remembered: the show, or the movie
-    /// (`tuning_scope`). None for a file from the command line.
-    tuning_scope: Option<String>,
-    /// Jellyfin playback: the session reports and transcoding belong to.
-    session: Option<PlaySession>,
-    /// The item's streams, to rebuild the subtitle list when the quality
-    /// changes (a transcoded stream needs more of them as files).
-    playback_info: Option<PlaybackInfo>,
-    /// Set while paused (Jellyfin playback).
-    pause: Option<sync::Pause>,
-    _subscription: Subscription,
-}
-
-struct ConnectForm {
-    url: Entity<TextInput>,
-    user: Entity<TextInput>,
-    password: Entity<TextInput>,
-    busy: bool,
-    searching: bool,
-    found: Vec<discovery::Found>,
-    error: Option<SharedString>,
-}
-
+/// The root view: it arranges the pages and the player, and holds handles
+/// to them and to the models they draw from, not their state.
 pub struct Shell {
-    db: Db,
-    paths: Paths,
-    device_id: String,
-    local: Vec<Item>,
-    remote: Vec<Item>,
-    roots: Vec<PathBuf>,
-    servers: Vec<Server>,
-    screen: Screen,
-    /// The library tab to go back to from a show page.
-    tab: Screen,
-    movie_sort: Sort,
-    show_sort: Sort,
-    search: Entity<TextInput>,
-    /// The name fields on the Sonarr and Radarr pages (in `Kind::ALL` order).
-    arr_search: [Entity<TextInput>; 2],
-    /// Library titles, for finding what a download is of.
-    title_index: RefCell<Option<Rc<downloads::TitleIndex>>>,
-    /// What the Sonarr and Radarr pages have and show.
-    arr_pages: arr_page::ArrPages,
-    /// Details pages' extra information, by item key or `show:<name>`.
-    details: HashMap<String, Details>,
-    details_loading: HashSet<String>,
-    player: Option<ActivePlayer>,
-    scanning: bool,
-    loading_servers: HashSet<i64>,
-    /// Servers to fetch again when their current fetch ends, because
-    /// something changed (playback stopped) after it began.
-    refetch_servers: HashSet<i64>,
-    thumbs_running: bool,
-    thumbs_left: usize,
-    artwork_left: usize,
-    error: Option<SharedString>,
+    /// The screen showing, its scrolling, and the page being left.
+    navigation: Navigation,
+    /// Where the keyboard goes on the pages.
     focus: FocusHandle,
-    form: ConnectForm,
-    /// Sonarr and Radarr connections, and their Settings forms.
-    arr: arr_settings::ArrForms,
-    /// What Sonarr says about shows (by name), which are being asked,
-    /// and the Download buttons pressed (show, season).
-    sonarr: HashMap<String, sonarr::SonarrView>,
-    sonarr_loading: HashSet<String>,
-    sonarr_requests: HashMap<(String, u32), sonarr::Request>,
-    /// Downloads asked for on a movie's page, by server and Radarr id.
-    movie_requests: HashMap<(i64, i64), tracked_page::MovieRequest>,
-    downloads: downloads::Downloads,
-    finder: finder::Finder,
-    /// Open release lists, by show and season.
-    release_panels: HashMap<releases::PanelKey, releases::ReleasePanel>,
-    /// The server whose streaming quality menu is open.
-    /// The streaming quality menu: for which server, and its quality when
-    /// the menu opened (the one checked, even as it fades out after a pick).
-    quality_menu: menu::Shown<(i64, Quality)>,
-    /// The Settings page shown, and whether its sign-in form is open.
-    settings_page: SettingsPage,
-    adding_server: bool,
-    reports: reports::Reports,
-    /// The item whose resume point is being asked from the server.
-    starting: Option<String>,
-    /// When the Jellyfin libraries were last fetched.
-    remote_refreshed: Option<Instant>,
-    /// Each signed-in server's change notifications, with the token used.
-    live: HashMap<i64, (String, crate::jellyfin::live::Watcher)>,
-    /// A fetch because of server changes is waiting to run.
-    live_refresh_pending: bool,
-    /// Items were added or removed while a video played: fetch the library
-    /// when it stops.
-    library_stale: bool,
-    /// When each item's play state (by key) was last learned from its
-    /// server outside a library fetch.
-    fresh: HashMap<String, Instant>,
-    /// Pushed play states not yet written to each server's cached library.
-    cache_updates: HashMap<i64, Vec<jellyfin::ItemUserData>>,
-    cache_write_pending: bool,
-    /// When the app last caught up on what was played lately.
-    caught_up: Option<Instant>,
-    /// A card's right-click menu, when open.
-    card_menu: menu::Shown<watched::CardMenu>,
-    /// Settings → Controls waiting for a key.
-    key_capture: controls_page::KeyCapture,
-    /// Changes the server hasn't got yet (see `offline`).
-    undelivered: Vec<offline::Undelivered>,
-    undelivered_seq: u64,
-    delivering: bool,
-    /// The scrolling page (everything but the virtualized grids).
-    content_scroll: ScrollHandle,
-    /// The screen the page was last drawn for; a new one starts at the top.
-    scrolled_screen: Option<Screen>,
-    /// The seasons open on each show's page (the rest are folded).
-    open_seasons: HashMap<String, BTreeSet<u16>>,
-    /// Seasons being folded open or shut (show, season), for the animation,
-    /// and each open season's height as last drawn.
-    folds: HashMap<(String, u16), Fold>,
-    season_heights: Rc<RefCell<HashMap<(String, u16), f32>>>,
-    fold_count: u64,
-    /// Cards across, as last laid out (for a season's height while it folds).
-    columns_hint: Cell<usize>,
-    /// Counts screen changes; each new page fades in.
-    page_generation: usize,
-    /// What the page has shown so far, for fading in what comes later.
-    revealed: RefCell<arriving::Revealed>,
-    /// Cards' pictures, for dissolving each in when it arrives.
-    pictures: RefCell<pictures::Pictures>,
-    /// Boxes easing to a new height.
-    heights: resize::Heights,
-    /// What search results' pages know beyond the search.
-    found: found_page::FoundPages,
-    leaving: Option<Leaving>,
-    /// How bright posters are at rest and lit.
-    poster_light: Cell<posters::Light>,
-    card_hover: RefCell<posters::Hover>,
-    /// Where Settings' sliders were drawn, and the one being dragged.
-    slider_tracks: Rc<posters::Tracks>,
-    slider_drag: Option<&'static str>,
-    /// While the page being left is drawn: its cards aren't the arrow keys'
-    /// to move between. (Its bars are drawn before the new page's, which
-    /// block the mouse from them.)
-    drawing_leaving: Cell<bool>,
-    /// On a show page: the episode it was opened at (by item key), ringed.
-    focus_episode: Option<String>,
-    /// Where the focused episode's card was last drawn, and whether the
-    /// page should still scroll to it.
-    focus_bounds: Rc<Cell<Option<Bounds<Pixels>>>>,
-    /// Scrolling to that card, while the page settles.
-    focus_scroll: Option<FocusScroll>,
-    /// The system's media controls, set up with the first video.
-    media: Option<Rc<MediaSession>>,
-    /// The card picked with the arrow keys (its element id), if any.
-    cursor: Option<SharedString>,
-    /// Each screen's cursor when it was left, to put back on return.
-    cursors: Vec<(Screen, SharedString)>,
-    /// Every card drawn in the last frame, and the screen it was drawn for.
-    card_bounds: CardBounds,
-    bounds_screen: Option<Screen>,
-    /// What Enter does for each card being drawn.
-    card_actions: RefCell<HashMap<SharedString, CardAction>>,
-    /// Sideways scrolling of the rows on the home page, by row id.
-    row_scroll: RefCell<HashMap<SharedString, ScrollHandle>>,
-    /// Scrolling of the library grids.
-    grid_scroll: UniformListScrollHandle,
-    /// Bring the cursor's card into view once it has been drawn.
-    reveal_cursor: bool,
+    /// The search field in the bar at the top.
+    search: Entity<TextInput>,
+    /// What animates on the page being drawn; shared with what draws on it.
+    motion: Rc<Motion>,
+    /// The page's cards, for the arrow keys; shared with what draws them.
+    cards: Rc<Cards>,
+    /// Everything there is to watch, and its syncing with the servers.
+    library: Entity<Library>,
+    /// The servers' Sonarr and Radarr connections, as of their last change.
+    apps: Rc<Apps>,
+    /// What Sonarr says about shows, and what was asked of it for them.
+    shows: Entity<sonarr::Shows>,
+    /// What Sonarr and Radarr are downloading, kept current.
+    downloads: Entity<Downloads>,
+    /// The library's own pages.
+    library_pages: Entity<browse::Pages>,
+    /// The Sonarr and Radarr pages.
+    arr: Entity<arr::Pages>,
+    /// The Downloads page.
+    downloads_page: Entity<downloads::Page>,
+    /// The Settings screen.
+    settings: Entity<Settings>,
+    /// The video that's open, if one is.
+    playback: Entity<NowPlaying>,
 }
 
 impl Shell {
@@ -499,20 +130,18 @@ impl Shell {
         cx: &mut Context<Self>,
     ) -> Result<Self> {
         crate::net::init(paths.db.with_file_name("addresses.json"));
-        let db = Db::open(&paths.db)?;
-        let poster_light = posters::Light::load(&db);
-        let device_id = db.device_id()?;
+        let profile = Profile::open(paths)?;
+        let poster_light = Preferences::of(&profile.db).poster_light();
+        let models = Models::new(&profile, cx);
+        // Whatever changes here may change who is looking at the downloads,
+        // and which show's page is open.
+        cx.observe_self(|this, cx| {
+            this.tell_downloads_attention(cx);
+            this.tell_open_show(cx);
+        })
+        .detach();
         let focus = cx.focus_handle();
         focus.focus(window);
-        let form = ConnectForm {
-            url: cx.new(|cx| TextInput::new("http://192.168.1.10:8096", false, cx)),
-            user: cx.new(|cx| TextInput::new("Username", false, cx)),
-            password: cx.new(|cx| TextInput::new("Password", true, cx)),
-            busy: false,
-            searching: false,
-            found: Vec::new(),
-            error: None,
-        };
         let search = cx.new(|cx| TextInput::new("Search", false, cx));
         // Re-render results as the query changes.
         cx.observe(&search, |this, _, cx| {
@@ -520,104 +149,53 @@ impl Shell {
             cx.notify();
         })
         .detach();
-        let arr_search = crate::arr::Kind::ALL.map(|kind| {
-            let noun = match kind {
-                crate::arr::Kind::Sonarr => "show",
-                crate::arr::Kind::Radarr => "movie",
-            };
-            let input = cx.new(|cx| TextInput::new(format!("Name of the {noun}"), false, cx));
-            cx.observe(&input, |this, _, cx| {
-                this.search_changed(cx);
-                cx.notify();
-            })
-            .detach();
-            input
-        });
-        let mut shell = Self {
-            db,
-            paths,
-            device_id,
-            local: Vec::new(),
-            remote: Vec::new(),
-            roots: Vec::new(),
-            servers: Vec::new(),
-            screen: Screen::Home,
-            tab: Screen::Home,
-            movie_sort: Sort::Title,
-            show_sort: Sort::RecentlyWatched,
-            search,
-            arr_search,
-            title_index: RefCell::new(None),
-            arr_pages: Default::default(),
-            details: HashMap::new(),
-            details_loading: HashSet::new(),
-            quality_menu: menu::Shown::default(),
-            settings_page: SettingsPage::default(),
-            adding_server: false,
-            reports: reports::Reports::default(),
-            starting: None,
-            remote_refreshed: None,
-            live: HashMap::new(),
-            live_refresh_pending: false,
-            library_stale: false,
-            fresh: HashMap::new(),
-            cache_updates: HashMap::new(),
-            cache_write_pending: false,
-            caught_up: None,
-            card_menu: menu::Shown::default(),
-            key_capture: Default::default(),
-            undelivered: Vec::new(),
-            undelivered_seq: 0,
-            delivering: false,
-            content_scroll: ScrollHandle::new(),
-            scrolled_screen: None,
-            open_seasons: HashMap::new(),
-            folds: HashMap::new(),
-            season_heights: Rc::default(),
-            fold_count: 0,
-            columns_hint: Cell::new(4),
-            page_generation: 0,
-            revealed: RefCell::default(),
-            pictures: RefCell::default(),
-            heights: resize::Heights::default(),
-            found: found_page::FoundPages::default(),
-            leaving: None,
-            poster_light: Cell::new(poster_light),
-            card_hover: RefCell::default(),
-            slider_tracks: Rc::default(),
-            slider_drag: None,
-            drawing_leaving: Cell::new(false),
-            focus_episode: None,
-            focus_bounds: Rc::default(),
-            focus_scroll: None,
-            media: None,
-            cursor: None,
-            cursors: Vec::new(),
-            card_bounds: Rc::default(),
-            bounds_screen: None,
-            card_actions: RefCell::default(),
-            row_scroll: RefCell::default(),
-            grid_scroll: UniformListScrollHandle::new(),
-            reveal_cursor: false,
-            player: None,
-            scanning: false,
-            loading_servers: HashSet::new(),
-            refetch_servers: HashSet::new(),
-            thumbs_running: false,
-            thumbs_left: 0,
-            artwork_left: 0,
-            error: None,
+        let motion: Rc<Motion> = Rc::default();
+        let cards = Rc::new(Cards::new(motion.clone(), poster_light));
+        let old_pictures = profile.paths.thumbs.join("arr");
+        let parts = Parts {
+            profile,
+            models,
+            motion,
+            cards,
             focus,
-            form,
-            arr: HashMap::new(),
-            sonarr: HashMap::new(),
-            sonarr_loading: HashSet::new(),
-            sonarr_requests: HashMap::new(),
-            movie_requests: HashMap::new(),
-            downloads: Default::default(),
-            finder: Default::default(),
-            release_panels: HashMap::new(),
         };
+        let downloads_page = parts.downloads_page(cx);
+        let arr = parts.arr_pages(cx);
+        let library_pages = parts.library_pages(window, cx);
+        let settings = parts.settings(cx);
+        let playback = parts.playback(window, cx);
+        let models = parts.models;
+        let shell = Self {
+            apps: models.connections.read(cx).apps(),
+            library: models.library,
+            shows: models.shows,
+            downloads: models.downloads,
+            navigation: Navigation::new(),
+            search,
+            focus: parts.focus,
+            motion: parts.motion,
+            cards: parts.cards,
+            library_pages,
+            arr,
+            downloads_page,
+            settings,
+            playback,
+        };
+        shell.watch_window(window, cx);
+        if let Some(dir) = crate::test_window::capture_dir() {
+            shell.serve_test_captures(dir, window, cx);
+        }
+        shell.library.update(cx, |library, cx| library.start(cx));
+        remove_old_pictures(old_pictures, cx);
+        if let Some(file) = source {
+            let playback = shell.playback.clone();
+            playback.update(cx, |playback, cx| playback.play_file(file, window, cx));
+        }
+        Ok(shell)
+    }
+
+    /// Hears the window: its close button, and the viewer coming back to it.
+    fn watch_window(&self, window: &mut Window, cx: &mut Context<Self>) {
         // Closing the window while a video is open still reports it.
         let this = cx.weak_entity();
         window.on_window_should_close(cx, move |_, cx| {
@@ -627,1316 +205,209 @@ impl Shell {
         // Coming back to the app picks up changes made elsewhere (watched on
         // the TV, marked watched on the web), in case some weren't pushed.
         cx.observe_window_activation(window, |this, window, cx| {
-            if !window.is_window_active() || this.player.is_some() {
+            if !window.is_window_active() || this.playback.read(cx).is_open() {
                 return;
             }
-            let older = |at: Option<Instant>, than| at.is_none_or(|at| at.elapsed() >= than);
-            if older(this.remote_refreshed, REFRESH_ON_FOCUS_AFTER) {
-                this.refresh_remote(cx);
-            } else if older(this.caught_up, CATCH_UP_ON_FOCUS_AFTER)
-                && older(this.remote_refreshed, CATCH_UP_ON_FOCUS_AFTER)
-            {
-                this.catch_up(cx);
-            }
-        })
-        .detach();
-        if let Some(dir) = crate::test_window::capture_dir() {
-            shell.serve_test_captures(dir, window, cx);
-        }
-        shell.reload();
-        shell.load_cached_remote();
-        shell.load_undelivered(cx);
-        shell.refresh(cx);
-        shell.generate_thumbs(cx);
-        let old_pictures = shell.paths.thumbs.join("arr");
-        if old_pictures.exists() {
-            cx.background_executor()
-                .spawn(async move {
-                    let _ = std::fs::remove_dir_all(old_pictures);
-                })
-                .detach();
-        }
-        if let Some(source) = source {
-            let title = Path::new(&source)
-                .file_name()
-                .map(|n| n.to_string_lossy().into_owned())
-                .unwrap_or_else(|| source.clone());
-            let playback = Playback {
-                title: title.into(),
-                subtitle: None,
-                episodes: Vec::new(),
-                current: None,
-                prefs: shell.track_prefs(None),
-                tuning: SubtitleTuning::default(),
-                quality: None,
-                thumb: None,
-            };
-            shell.start_player(source, None, playback, 0.0, None, window, cx);
-        }
-        Ok(shell)
-    }
-
-    /// Test runs: screenshots on request, taken by the app itself (see
-    /// `test_window::capture_dir`).
-    fn serve_test_captures(&self, dir: PathBuf, window: &mut Window, cx: &mut Context<Self>) {
-        cx.spawn_in(window, async move |this, cx| {
-            loop {
-                cx.background_executor()
-                    .timer(Duration::from_millis(100))
-                    .await;
-                let request = dir.join("request");
-                let Ok(name) = fs::read_to_string(&request) else {
-                    continue;
-                };
-                let _ = fs::remove_file(&request);
-                let name = name.trim().to_string();
-                gpui::frame_capture::capture_next_frame(dir.join(format!("{name}.ui.png")));
-                let served = this.update_in(cx, |this, window, cx| {
-                    if let Some(active) = &this.player {
-                        let video = dir.join(format!("{name}.video.png"));
-                        active.view.read(cx).screenshot(&video);
-                    }
-                    window.refresh();
-                    cx.notify();
-                });
-                if served.is_err() {
-                    break;
-                }
-            }
+            this.library.update(cx, |library, cx| library.came_back(cx));
         })
         .detach();
     }
 
-    fn items(&self) -> impl Iterator<Item = &Item> {
-        self.local.iter().chain(self.remote.iter())
-    }
-
-    /// Re-reads local items, folders and servers from the database.
-    fn reload(&mut self) {
-        let loaded =
-            (|| Ok::<_, anyhow::Error>((self.db.items()?, self.db.roots()?, self.db.servers()?)))();
-        match loaded {
-            Ok((items, roots, mut servers)) => {
-                self.local = items;
-                self.roots = roots;
-                if let Err(e) = self.attach_tokens(&mut servers) {
-                    self.error = Some(format!("Couldn't read saved sign-ins: {e:#}").into());
-                }
-                self.servers = servers;
+    /// What the Sonarr and Radarr pages ask for: another page.
+    fn on_arr_event(&mut self, event: &arr::Event, cx: &mut Context<Self>) {
+        match event {
+            arr::Event::TrackedOpened { app, id } => {
+                let screen = Screen::Tracked(app.server, app.kind, *id);
+                self.navigation.open(screen);
             }
-            Err(e) => self.error = Some(format!("Couldn't read the library: {e}").into()),
-        }
-    }
-
-    /// Fills in each server's token from the credential store. A token that
-    /// an older version left in the database is moved there first.
-    fn attach_tokens(&self, servers: &mut [Server]) -> Result<()> {
-        for server in servers {
-            let account = server.token_account(&self.device_id);
-            if server.token.is_empty() {
-                server.token = secrets::load(&account)?.unwrap_or_default();
-            } else {
-                secrets::save(&account, &server.token)?;
-                self.db.clear_token(server.id)?;
+            arr::Event::FoundOpened { app, key } => {
+                let screen = Screen::Found(app.server, app.kind, *key);
+                self.navigation.open(screen);
             }
-        }
-        Ok(())
-    }
-
-    fn refresh(&mut self, cx: &mut Context<Self>) {
-        self.error = None;
-        self.rescan(cx);
-        self.refresh_remote(cx);
-    }
-
-    // ---- local folders ----
-
-    fn rescan(&mut self, cx: &mut Context<Self>) {
-        if self.scanning || self.roots.is_empty() {
-            return;
-        }
-        self.scanning = true;
-        let roots = self.roots.clone();
-        let db_path = self.paths.db.clone();
-        cx.spawn(async move |this, cx| {
-            let errors: Vec<String> = cx
-                .background_executor()
-                .spawn(async move {
-                    // SQLite connections aren't shared across threads; open one here.
-                    let db = match Db::open(&db_path) {
-                        Ok(db) => db,
-                        Err(e) => return vec![e.to_string()],
-                    };
-                    roots
-                        .iter()
-                        .filter_map(|root| scan::scan_root(&db, root).err())
-                        .map(|e| e.to_string())
-                        .collect()
-                })
-                .await;
-            this.update(cx, |this, cx| {
-                this.scanning = false;
-                if !errors.is_empty() {
-                    this.error = Some(errors.join("; ").into());
-                }
-                this.reload();
-                this.generate_thumbs(cx);
-                cx.notify();
-            })
-            .ok();
-        })
-        .detach();
-        cx.notify();
-    }
-
-    /// Generates missing local thumbnails one at a time in the background.
-    fn generate_thumbs(&mut self, cx: &mut Context<Self>) {
-        if self.thumbs_running {
-            return;
-        }
-        let pending = self.db.pending_thumbs().unwrap_or_default();
-        if pending.is_empty() {
-            return;
-        }
-        self.thumbs_running = true;
-        self.thumbs_left = pending.len();
-        let dir = self.paths.thumbs.clone();
-        cx.spawn(async move |this, cx| {
-            for (id, video) in pending {
-                let out = dir.join(format!("{id}.jpg"));
-                let target = out.clone();
-                let result = cx
-                    .background_executor()
-                    .spawn(async move {
-                        fs::create_dir_all(target.parent().unwrap())?;
-                        thumbs::generate(&video, &target)
-                    })
-                    .await;
-                let alive = this.update(cx, |this, cx| {
-                    if let Err(e) = &result {
-                        eprintln!("[thumbs] item {id}: {e}");
-                    }
-                    let thumb = result.is_ok().then_some(out.as_path());
-                    if let Err(e) = this.db.set_thumb(id, thumb) {
-                        eprintln!("[thumbs] saving item {id}: {e}");
-                    }
-                    this.thumbs_left = this.thumbs_left.saturating_sub(1);
-                    this.reload();
-                    cx.notify();
-                });
-                if alive.is_err() {
-                    return;
-                }
-            }
-            this.update(cx, |this, cx| {
-                this.thumbs_running = false;
-                // Pick up anything a scan added while this batch ran.
-                this.generate_thumbs(cx);
-                cx.notify();
-            })
-            .ok();
-        })
-        .detach();
-    }
-
-    fn add_folder(&mut self, cx: &mut Context<Self>) {
-        let picked = cx.prompt_for_paths(PathPromptOptions {
-            files: false,
-            directories: true,
-            multiple: true,
-            prompt: Some("Add to Library".into()),
-        });
-        cx.spawn(async move |this, cx| {
-            let Ok(Ok(Some(paths))) = picked.await else {
-                return;
-            };
-            this.update(cx, |this, cx| {
-                for path in paths {
-                    if let Err(e) = this.db.add_root(&path) {
-                        this.error = Some(format!("Couldn't add {}: {e}", path.display()).into());
-                    }
-                }
-                this.reload();
-                this.rescan(cx);
-            })
-            .ok();
-        })
-        .detach();
-    }
-
-    // ---- Jellyfin ----
-
-    fn client(&self, server: i64) -> Option<Client> {
-        let server = self.servers.iter().find(|s| s.id == server)?;
-        Some(Client::for_server(server, &self.device_id))
-    }
-
-    /// Fetches every server's library; artwork follows in the background.
-    fn refresh_remote(&mut self, cx: &mut Context<Self>) {
-        self.remote_refreshed = Some(Instant::now());
-        self.sync_live(cx);
-        self.sync_arr(cx);
-        for server in self.servers.clone() {
-            if server.token.is_empty() {
-                // Removed from the credential store outside the app.
-                self.error = Some(
-                    format!(
-                        "{}: signed out; sign in again in Settings → Library",
-                        server.name
-                    )
-                    .into(),
-                );
-                continue;
-            }
-            if !self.loading_servers.insert(server.id) {
-                self.refetch_servers.insert(server.id);
-                continue;
-            }
-            let client = Client::for_server(&server, &self.device_id);
-            let thumbs = self.paths.thumbs.clone();
-            let cache = self.paths.library_cache(server.id);
-            let started = Instant::now();
-            cx.spawn(async move |this, cx| {
-                let user_id = server.user_id.clone();
-                let server_row = server.id;
-                let fetch_client = client.clone();
-                let fetched = cx
-                    .background_executor()
-                    .spawn(async move {
-                        let items = fetch_client.library(&user_id)?;
-                        if let Err(e) = jellyfin::save_library_cache(&cache, &items) {
-                            eprintln!("[jellyfin] saving the library cache: {e:#}");
-                        }
-                        Ok::<_, anyhow::Error>(
-                            items
-                                .iter()
-                                .map(|b| (b.to_item(server_row, &thumbs), b.card_image()))
-                                .collect::<Vec<_>>(),
-                        )
-                    })
-                    .await;
-                this.update(cx, |this, cx| {
-                    this.loading_servers.remove(&server.id);
-                    match fetched {
-                        Ok(entries) => {
-                            // Back online: the "offline" notice goes.
-                            if this
-                                .error
-                                .as_ref()
-                                .is_some_and(|e| e.starts_with(&format!("{} ", server.name)) || e.starts_with(&format!("{}:", server.name)))
-                            {
-                                this.error = None;
-                            }
-                            let kept = this.fresher_than(server.id, started);
-                            this.remote.retain(|i| {
-                                !matches!(&i.source, Source::Jellyfin { server: s, .. } if *s == server.id)
-                            });
-                            let mut wanted = Vec::new();
-                            for (item, image) in entries {
-                                if item.thumb.is_none()
-                                    && let Some(image) = image
-                                {
-                                    wanted.push((item.key(), image));
-                                }
-                                this.remote.push(item);
-                            }
-                            this.restore_fresh(kept);
-                            this.fetch_artwork(client, wanted, cx);
-                        }
-                        Err(e) => {
-                            eprintln!("[jellyfin] {}: {e:#}", server.name);
-                            let cached = this.remote.iter().any(|i| {
-                                matches!(&i.source, Source::Jellyfin { server: s, .. } if *s == server.id)
-                            });
-                            this.error = Some(
-                                if cached {
-                                    format!("{} is offline; showing the saved library", server.name)
-                                } else {
-                                    format!("{}: {e:#}", server.name)
-                                }
-                                .into(),
-                            );
-                        }
-                    }
-                    if this.refetch_servers.remove(&server.id) {
-                        this.refresh_remote(cx);
-                    }
-                    cx.notify();
-                })
-                .ok();
-            })
-            .detach();
+            arr::Event::LibraryOpened { target } => self.open_target(target, cx),
+            arr::Event::NameTyped => self.search_changed(cx),
         }
         cx.notify();
     }
 
-    /// Shows each server's last fetched library right away; the refresh
-    /// that follows replaces it.
-    fn load_cached_remote(&mut self) {
-        for server in &self.servers {
-            let path = self.paths.library_cache(server.id);
-            if !path.exists() {
-                continue;
-            }
-            match jellyfin::load_library_cache(&path) {
-                Ok(items) => self.remote.extend(
-                    items
-                        .iter()
-                        .map(|b| b.to_item(server.id, &self.paths.thumbs)),
-                ),
-                Err(e) => eprintln!("[jellyfin] reading {}: {e:#}", path.display()),
+    fn on_settings_event(&mut self, event: &settings::Event, cx: &mut Context<Self>) {
+        match *event {
+            settings::Event::FirstLibraryAdded => self.navigation.open(Screen::Home),
+            settings::Event::PosterLightChanged { light } => self.cards.set_light(light),
+            settings::Event::MediaSkipButtonsChanged { on } => {
+                self.playback.read(cx).set_media_skip_buttons(on);
             }
         }
-    }
-
-    fn fetch_artwork(
-        &mut self,
-        client: Client,
-        wanted: Vec<(String, ImageRef)>,
-        cx: &mut Context<Self>,
-    ) {
-        // Episodes can share artwork (a show backdrop), so download each file once.
-        let mut by_file: BTreeMap<PathBuf, (ImageRef, Vec<String>)> = BTreeMap::new();
-        for (key, image) in wanted {
-            let path = image.cache_path(&self.paths.thumbs);
-            by_file
-                .entry(path)
-                .or_insert_with(|| (image, Vec::new()))
-                .1
-                .push(key);
-        }
-        if by_file.is_empty() {
-            return;
-        }
-        self.artwork_left += by_file.len();
-        cx.spawn(async move |this, cx| {
-            for (path, (image, keys)) in by_file {
-                let target = path.clone();
-                let download = client.clone();
-                let result = cx
-                    .background_executor()
-                    .spawn(async move {
-                        fs::create_dir_all(target.parent().unwrap())?;
-                        download.download_image(&image, &target)
-                    })
-                    .await;
-                let alive = this.update(cx, |this, cx| {
-                    this.artwork_left = this.artwork_left.saturating_sub(1);
-                    match result {
-                        Ok(()) => {
-                            for item in this.remote.iter_mut().filter(|i| keys.contains(&i.key())) {
-                                item.thumb = Some(path.clone());
-                            }
-                        }
-                        Err(e) => eprintln!("[jellyfin] artwork {}: {e:#}", path.display()),
-                    }
-                    cx.notify();
-                });
-                if alive.is_err() {
-                    return;
-                }
-            }
-        })
-        .detach();
-    }
-
-    fn discover(&mut self, cx: &mut Context<Self>) {
-        self.form.searching = true;
-        cx.spawn(async move |this, cx| {
-            let found = cx
-                .background_executor()
-                .spawn(async move { discovery::discover(DISCOVERY_WAIT) })
-                .await;
-            this.update(cx, |this, cx| {
-                this.form.searching = false;
-                let url_empty = this.form.url.read(cx).text().is_empty();
-                if url_empty && let Some(first) = found.first() {
-                    let address = first.address.clone();
-                    this.form
-                        .url
-                        .update(cx, |input, cx| input.set_text(address, cx));
-                }
-                this.form.found = found;
-                cx.notify();
-            })
-            .ok();
-        })
-        .detach();
-    }
-
-    fn connect(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if self.form.busy {
-            return;
-        }
-        let url = jellyfin::normalize_url(&self.form.url.read(cx).text());
-        let user = self.form.user.read(cx).text().trim().to_string();
-        let password = self.form.password.read(cx).text();
-        if url == "http://" || user.is_empty() {
-            self.form.error = Some("Enter the server address and your username.".into());
-            cx.notify();
-            return;
-        }
-        self.form.busy = true;
-        self.form.error = None;
-        let device_id = self.device_id.clone();
-        let focus = self.focus.clone();
-        cx.spawn_in(window, async move |this, cx| {
-            let result = cx
-                .background_executor()
-                .spawn(async move {
-                    let mut client = Client::new(&url, &device_id);
-                    let info = client.public_info()?;
-                    let auth = client.login(&user, &password)?;
-                    if auth.server_id != info.id {
-                        bail!("the server answered with an unexpected id");
-                    }
-                    let server = Server {
-                        id: 0,
-                        url: client.base().to_string(),
-                        name: info.server_name,
-                        server_id: auth.server_id,
-                        user_id: auth.user.id,
-                        user_name: auth.user.name,
-                        token: auth.access_token,
-                    };
-                    secrets::save(&server.token_account(&device_id), &server.token)?;
-                    Ok(server)
-                })
-                .await;
-            this.update_in(cx, |this, window, cx| {
-                this.form.busy = false;
-                match result.and_then(|server| this.db.save_server(&server)) {
-                    Ok(_) => {
-                        this.form
-                            .password
-                            .update(cx, |input, cx| input.set_text("", cx));
-                        // A first library goes straight to Home; another
-                        // server shows up in the Settings list.
-                        let first = this.servers.is_empty() && this.roots.is_empty();
-                        this.reload();
-                        this.adding_server = false;
-                        if first {
-                            this.screen = Screen::Home;
-                        }
-                        window.focus(&focus);
-                        this.refresh_remote(cx);
-                    }
-                    Err(e) => this.form.error = Some(format!("{e:#}").into()),
-                }
-                cx.notify();
-            })
-            .ok();
-        })
-        .detach();
         cx.notify();
     }
 
-    fn sign_out(&mut self, server_id: i64, cx: &mut Context<Self>) {
-        if let Some(client) = self.client(server_id) {
-            // Best effort: invalidate the token on the server too.
-            cx.background_executor()
-                .spawn(async move {
-                    let _ = client.logout();
-                })
-                .detach();
-        }
-        let server = self.servers.iter().find(|s| s.id == server_id).cloned();
-        if let Some(server) = &server {
-            self.forget_arr(server);
-        }
-        let account = server.map(|s| s.token_account(&self.device_id));
-        let removed = account
-            .map_or(Ok(()), |account| secrets::delete(&account))
-            .and_then(|()| self.db.remove_server(server_id));
-        if let Err(e) = removed {
-            self.error = Some(format!("Couldn't sign out: {e:#}").into());
-        }
-        let _ = fs::remove_file(self.paths.library_cache(server_id));
-        self.remote.retain(
-            |i| !matches!(&i.source, Source::Jellyfin { server, .. } if *server == server_id),
-        );
-        self.reload();
-        self.sync_live(cx);
-        self.sync_arr(cx);
+    /// Shows Settings, on the page it last showed.
+    fn open_settings(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.navigation.open(Screen::Settings);
+        self.settings
+            .update(cx, |settings, cx| settings.opened(window, cx));
         cx.notify();
     }
 
-    fn focus_next_field(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let fields = [&self.form.url, &self.form.user, &self.form.password];
-        let current = fields
-            .iter()
-            .position(|f| f.focus_handle(cx).is_focused(window));
-        let next = current.map(|i| (i + 1) % fields.len()).unwrap_or(0);
-        window.focus(&fields[next].focus_handle(cx));
-    }
-
-    // ---- playback ----
-
-    /// Plays an item from where it was left off. For a Jellyfin item, that's
-    /// asked from the server first: the library here may be minutes old (it
-    /// refreshes in the background) or the item may have been watched
-    /// elsewhere since.
-    fn play(&mut self, key: &str, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(item) = self.items().find(|i| i.key() == key).cloned() else {
-            return;
-        };
-        let Source::Jellyfin { server, id } = &item.source else {
-            return self.play_at(item, false, window, cx);
-        };
-        let (Some(client), Some(user_id)) = (self.client(*server), self.user_id(*server)) else {
-            return self.play_at(item, false, window, cx);
-        };
-        if self.starting.is_some() {
-            return;
-        }
-        self.starting = Some(item.key());
-        let id = id.clone();
-        cx.spawn_in(window, async move |this, cx| {
-            let fresh = cx
-                .background_executor()
-                .spawn(async move { client.user_data(&user_id, &id) })
-                .await;
-            this.update_in(cx, |this, window, cx| {
-                this.starting = None;
-                let mut item = item;
-                match fresh {
-                    Ok(data) => {
-                        item.position = jellyfin::ticks_to_seconds(data.playback_position_ticks);
-                        item.watched = data.played;
-                        if let Some(cached) = this.remote.iter_mut().find(|i| i.key() == item.key())
-                        {
-                            cached.position = item.position;
-                            cached.watched = item.watched;
-                        }
-                    }
-                    Err(e) => eprintln!("[jellyfin] resume point: {e:#}; using the saved one"),
-                }
-                if this.player.is_none() {
-                    this.play_at(item, false, window, cx);
-                    cx.notify();
-                }
-            })
-            .ok();
-        })
-        .detach();
-    }
-
-    fn play_from_start(&mut self, key: &str, window: &mut Window, cx: &mut Context<Self>) {
-        let item = self.items().find(|i| i.key() == key).cloned();
-        if let Some(item) = item {
-            self.play_at(item, true, window, cx)
-        }
-    }
-
-    /// Plays the next episode right away, from the saved resume point.
-    fn play_next_now(&mut self, key: &str, window: &mut Window, cx: &mut Context<Self>) {
-        let item = self.items().find(|i| i.key() == key).cloned();
-        if let Some(item) = item {
-            self.play_at(item, false, window, cx)
-        }
-    }
-
-    fn user_id(&self, server: i64) -> Option<String> {
-        self.servers
-            .iter()
-            .find(|s| s.id == server)
-            .map(|s| s.user_id.clone())
-    }
-
-    /// Plays an item from where it was left off, or from the start.
-    fn play_at(&mut self, item: Item, restart: bool, window: &mut Window, cx: &mut Context<Self>) {
-        let key = item.key();
-        // Episodes: the show on top, the episode beside it; movies: title and year.
-        let (title, subtitle): (SharedString, Option<SharedString>) = match &item.show {
-            Some(show) => (
-                show.clone().into(),
-                Some(match item.episode_label() {
-                    Some(label) => format!("{label} · {}", item.title).into(),
-                    None => item.title.clone().into(),
-                }),
-            ),
-            None => (
-                item.title.clone().into(),
-                item.year.map(|y| y.to_string().into()),
-            ),
-        };
-        let (episodes, current) = self.episodes_around(&item);
-        let scope = tuning_scope(&item);
-        let tuning = self.db.subtitle_tuning(&scope).unwrap_or_else(|e| {
-            eprintln!("[library] reading subtitle tuning: {e}");
-            SubtitleTuning::default()
-        });
-        let playback = Playback {
-            title,
-            subtitle,
-            episodes,
-            current,
-            prefs: self.track_prefs(item.show.as_deref()),
-            tuning,
-            quality: None,
-            thumb: item.thumb.clone(),
-        };
-        let start = if restart { 0.0 } else { item.resume_position() };
-        eprintln!("[play] {} ({key}) from {start:.1}s", item.display_title());
-        match &item.source {
-            Source::Local { path, .. } => {
-                if !path.exists() {
-                    self.error = Some(format!("{} is not available", path.display()).into());
-                    cx.notify();
-                    return;
-                }
-                let url = path.to_string_lossy().into_owned();
-                self.start_player(
-                    url,
-                    None,
-                    playback,
-                    start,
-                    Some(item.source.clone()),
-                    window,
-                    cx,
-                );
-            }
-            Source::Jellyfin { server, id } => {
-                let Some(client) = self.client(*server) else {
-                    self.error = Some("That server is no longer signed in.".into());
-                    cx.notify();
-                    return;
-                };
-                let quality = self.quality_for(*server);
-                let session = PlaySession {
-                    id: new_session_id(),
-                    transcoding: quality.transcodes(),
-                };
-                let url = stream_url(&client, id, &session, quality);
-                let header = client.stream_header();
-                let playback = Playback {
-                    quality: Some(quality),
-                    ..playback
-                };
-                self.start_player(
-                    url,
-                    header,
-                    playback,
-                    start,
-                    Some(item.source.clone()),
-                    window,
-                    cx,
-                );
-                if let Some(active) = &mut self.player {
-                    active.session = Some(session.clone());
-                    self.report(
-                        &item.source,
-                        PlaybackReport::Started,
-                        start,
-                        Some(session),
-                        cx,
-                    );
-                    self.load_server_extras(client, *server, id.clone(), cx);
-                }
-            }
-        }
-        if let Some(active) = &mut self.player {
-            active.show = item.show.clone();
-            active.tuning_scope = Some(scope);
-        }
-    }
-
-    /// The show's episodes in watching order (seasons in order, specials
-    /// last) and where `item` sits among them. Empty for movies.
-    fn episodes_around(&self, item: &Item) -> (Vec<Episode>, Option<usize>) {
-        let Some(show) = &item.show else {
-            return (Vec::new(), None);
-        };
-        let mut items: Vec<&Item> = self
-            .items()
-            .filter(|i| i.show.as_ref() == Some(show))
-            .collect();
-        items.sort_by_key(|i| i.watch_order());
-        let key = item.key();
-        let current = items.iter().position(|i| i.key() == key);
-        let episodes = items
-            .into_iter()
-            .map(|i| Episode {
-                key: i.key(),
-                season: i.season.unwrap_or(0),
-                number: i.episode,
-                title: i.title.clone(),
-                watched: i.watched,
-                progress: i.progress(),
-                thumb: i.thumb.clone(),
-            })
-            .collect();
-        (episodes, current)
-    }
-
-    /// Remembered track choices: the show's own, then the general ones.
-    fn track_prefs(&self, show: Option<&str>) -> TrackPrefs {
-        let load = |scope: &str| self.db.track_prefs(scope).unwrap_or_default();
-        let general = load(GENERAL_PREFS);
-        match show {
-            Some(show) => load(&format!("show:{show}")).or(general),
-            None => general,
-        }
-    }
-
-    /// Where a track choice made now is remembered: for the current show
-    /// (if it's an episode) and as the general preference.
-    fn pref_scopes(&self) -> Vec<String> {
-        let show = self.player.as_ref().and_then(|p| p.show.clone());
-        let mut scopes = vec![GENERAL_PREFS.to_string()];
-        scopes.extend(show.map(|s| format!("show:{s}")));
-        scopes
-    }
-
-    /// The streaming quality chosen for a server (Original by default).
-    fn quality_for(&self, server: i64) -> Quality {
-        self.db
-            .setting(&format!("quality:{server}"))
-            .ok()
-            .flatten()
-            .map(|v| Quality::from_setting(&v))
-            .unwrap_or(Quality::Original)
-    }
-
-    fn set_quality(&mut self, server: i64, quality: Quality) {
-        if let Err(e) = self
-            .db
-            .set_setting(&format!("quality:{server}"), &quality.to_setting())
-        {
-            eprintln!("[library] saving quality: {e}");
-        }
-    }
-
-    /// Switches the playing Jellyfin video to another quality, keeping the
-    /// position: a new play session replaces the old one on the server.
-    fn change_quality(&mut self, quality: Quality, cx: &mut Context<Self>) {
-        let Some(active) = &self.player else {
-            return;
-        };
-        let Some(Source::Jellyfin { server, id }) = active.source.clone() else {
-            return;
-        };
-        self.set_quality(server, quality);
-        let Some(client) = self.client(server) else {
-            return;
-        };
-        let Some(active) = &mut self.player else {
-            return;
-        };
-        let old = active.session.clone();
-        let session = PlaySession {
-            id: new_session_id(),
-            transcoding: quality.transcodes(),
-        };
-        let url = stream_url(&client, &id, &session, quality);
-        let position = active.view.read(cx).position();
-        let subtitles = active
-            .playback_info
-            .as_ref()
-            .map(|i| i.subtitle_files(client.base(), &id, session.transcoding))
-            .unwrap_or_default();
-        active.view.update(cx, |player, cx| {
-            player.reload(&url, position, subtitles, quality, cx)
-        });
-        active.session = Some(session.clone());
-        eprintln!("[jellyfin] quality {} ({})", quality.label(), session.id);
-        // The old session stops (ending its transcode) and the new one starts.
-        let source = Source::Jellyfin { server, id };
-        let paused = active.pause.is_some();
-        self.queue_report(
-            &source,
-            PlaybackReport::Stopped,
-            position,
-            paused,
-            old,
-            false,
-            cx,
-        );
-        self.queue_report(
-            &source,
-            PlaybackReport::Started,
-            position,
-            paused,
-            Some(session),
-            false,
-            cx,
-        );
-        self.restart_pause(cx);
-    }
-
-    fn saved_volume(&self) -> f64 {
-        self.db
-            .setting(VOLUME_SETTING)
-            .ok()
-            .flatten()
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(100.0)
-    }
-
-    /// Asks the server for what it knows beyond the file itself: subtitle
-    /// files stored beside the video, and intro/credits markers. The player
-    /// takes them once the video has loaded.
-    fn load_server_extras(
-        &mut self,
-        client: Client,
-        server: i64,
-        item_id: String,
-        cx: &mut Context<Self>,
-    ) {
-        let Some(user_id) = self
-            .servers
-            .iter()
-            .find(|s| s.id == server)
-            .map(|s| s.user_id.clone())
-        else {
-            return;
-        };
-        let source = Source::Jellyfin {
-            server,
-            id: item_id.clone(),
-        };
-        let base = client.base().to_string();
-        let (client_for_lookup, user_id_for_lookup, source_for_lookup) =
-            (client.clone(), user_id.clone(), source.clone());
-        cx.spawn(async move |this, cx| {
-            let fetch_id = item_id.clone();
-            let (info, segments) = cx
-                .background_executor()
-                .spawn(async move {
-                    (
-                        client.playback_info(&user_id, &fetch_id),
-                        client.media_segments(&fetch_id),
-                    )
-                })
-                .await;
-            let info = info
-                .map_err(|e| eprintln!("[jellyfin] listing subtitles: {e:#}"))
-                .ok();
-            // Older servers have no segments API; that's fine.
-            let segments = segments.unwrap_or_default();
-            this.update(cx, |this, cx| {
-                // Only for the video they were fetched for.
-                if let Some(active) = &mut this.player
-                    && active.source.as_ref() == Some(&source)
-                {
-                    let transcoding = active.session.as_ref().is_some_and(|s| s.transcoding);
-                    let subtitles = info
-                        .as_ref()
-                        .map(|i| i.subtitle_files(&base, &item_id, transcoding))
-                        .unwrap_or_default();
-                    eprintln!(
-                        "[jellyfin] {} subtitle file(s), {} segment(s)",
-                        subtitles.len(),
-                        segments.len()
-                    );
-                    active.playback_info = info;
-                    active.view.update(cx, |player, _| {
-                        player.add_external_subtitles(subtitles);
-                        player.add_segments(SegmentSource::Server, segments);
-                    });
-                }
-            })
-            .ok();
-        })
-        .detach();
-        self.load_online_segments(client_for_lookup, user_id_for_lookup, source_for_lookup, cx);
-    }
-
-    /// Intro, recap and credits times from TheIntroDB and IntroDB, by the
-    /// show's (or movie's) ids on the server. They fill in whatever kinds
-    /// the server itself has no markers for.
-    fn load_online_segments(
-        &mut self,
-        client: Client,
-        user_id: String,
-        source: Source,
-        cx: &mut Context<Self>,
-    ) {
-        let Source::Jellyfin { id, .. } = &source else {
-            return;
-        };
-        let id = id.clone();
-        cx.spawn(async move |this, cx| {
-            let segments = cx
-                .background_executor()
-                .spawn(async move {
-                    let lookup = client.intro_lookup(&user_id, &id)?;
-                    let segments = introdb::fetch(&lookup);
-                    eprintln!("[segments] {} from the intro databases", segments.len());
-                    anyhow::Ok(segments)
-                })
-                .await;
-            let segments = match segments {
-                Ok(s) => s,
-                Err(e) => return eprintln!("[segments] looking up ids: {e:#}"),
-            };
-            this.update(cx, |this, cx| {
-                if let Some(active) = &mut this.player
-                    && active.source.as_ref() == Some(&source)
-                {
-                    active.view.update(cx, |player, _| {
-                        player.add_segments(SegmentSource::Online, segments);
-                    });
-                }
-            })
-            .ok();
-        })
-        .detach();
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    fn start_player(
-        &mut self,
-        url: String,
-        http_header: Option<String>,
-        playback: Playback,
-        start: f64,
-        source: Option<Source>,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        let video = match player::open_video(window, &url, start, http_header.as_deref()) {
-            Ok(video) => video,
-            Err(e) => {
-                self.error = Some(format!("Couldn't play {}: {e}", playback.title).into());
-                cx.notify();
-                return;
-            }
-        };
-        self.error = None;
-        let volume = self.saved_volume();
-        let sound_on = self.sound_on();
-        let sound = self.sound_settings();
-        let controls = self.controls();
-        if self.media.is_none() && crate::test_window::media_controls() {
-            match MediaSession::new(window) {
-                Ok(media) => {
-                    media.set_skip_buttons(self.media_skip_buttons());
-                    self.media = Some(Rc::new(media));
-                }
-                Err(e) => eprintln!("[media] system media controls unavailable: {e:#}"),
-            }
-        }
-        let media = self.media.clone();
-        // Previews open the video a second time: not for transcoded streams,
-        // which are for connections too slow for that.
-        let previews = playback
-            .quality
-            .is_none_or(|q| !q.transcodes())
-            .then(|| player::Previews::start(&url, http_header.as_deref(), self.paths.previews()));
-        let view = cx.new(|cx| {
-            let mut player = Player::new(video, playback, volume, media, window, cx);
-            player.set_controls(controls);
-            player.start_sound(sound_on, sound);
-            if let Some(previews) = previews {
-                player.set_previews(previews);
-            }
-            player
-        });
-        let subscription = cx.subscribe_in(&view, window, |this, _, event, window, cx| {
-            this.on_player_event(event, window, cx)
-        });
-        self.player = Some(ActivePlayer {
-            view,
-            source,
-            position: start,
-            duration: 0.0,
-            show: None,
-            tuning_scope: None,
-            session: None,
-            playback_info: None,
-            pause: None,
-            _subscription: subscription,
-        });
+    /// Shows Settings → Library with the sign-in form open.
+    fn open_connect(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.navigation.open(Screen::Settings);
+        self.settings
+            .update(cx, |settings, cx| settings.open_sign_in(window, cx));
         cx.notify();
     }
 
-    fn on_player_event(
+    /// Goes back from a page (or Settings) to the tab it was opened from.
+    fn leave_page(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.navigation.back_to_tab();
+        window.focus(&self.focus);
+        cx.notify();
+    }
+
+    /// What the library's pages ask for: another page, or a video.
+    fn on_library_event(
         &mut self,
-        event: &PlayerEvent,
+        event: &browse::Event,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
         match event {
-            PlayerEvent::Progress {
-                position,
-                duration,
-                paused,
-            } => {
-                let Some(active) = self.player.as_mut() else {
-                    return;
-                };
-                active.position = *position;
-                active.duration = *duration;
-                match active.source.clone() {
-                    Some(Source::Local { id, .. }) => {
-                        if let Err(e) = self.db.save_progress(id, *position, *duration) {
-                            eprintln!("[library] saving progress: {e}");
-                        }
-                    }
-                    Some(Source::Jellyfin { .. }) => self.playback_progress(*position, *paused, cx),
-                    None => {}
+            browse::Event::TabOpened { screen } => self.set_tab(screen.clone(), cx),
+            browse::Event::ShowOpened { name, episode } => {
+                self.navigation.forget_episode();
+                self.navigation.open(Screen::Show(name.clone()));
+                if let Some(key) = episode {
+                    self.navigation.open_at_episode(key.clone());
                 }
             }
-            PlayerEvent::Exit => {
-                if window.is_fullscreen() {
-                    window.toggle_fullscreen();
-                }
-                self.finish_playback(cx);
+            browse::Event::DetailsOpened { key } => {
+                self.navigation.open(Screen::Details(key.clone()));
+            }
+            browse::Event::Played { key, start_at } => match start_at {
+                StartAt::ResumePoint => self.play(key, window, cx),
+                StartAt::Beginning => self.play_from_start(key, window, cx),
+            },
+            browse::Event::ConnectAsked => self.open_connect(window, cx),
+        }
+        cx.notify();
+    }
+
+    /// The text in the search field, trimmed.
+    fn search_query(&self, cx: &Context<Self>) -> String {
+        self.search.read(cx).text().trim().to_string()
+    }
+
+    /// After each change to the search field, or to the name field on a
+    /// Sonarr or Radarr page: has the name looked up in the apps.
+    fn search_changed(&mut self, cx: &mut Context<Self>) {
+        let query = self.search_query(cx);
+        let open = match *self.navigation.screen() {
+            Screen::Arr(server, kind) => Some(Id { server, kind }),
+            _ => None,
+        };
+        self.arr
+            .update(cx, |arr, cx| arr.search_changed(query, open, cx));
+    }
+
+    /// The search's results: the library's, then Sonarr's and Radarr's.
+    fn search_results(&self, query: &str, cx: &mut Context<Self>) -> Vec<AnyElement> {
+        let pages = &self.library_pages;
+        let mut sections = pages.update(cx, |pages, cx| pages.search_matches(query, cx));
+        let found = self.arr.update(cx, |arr, cx| arr.search_sections(cx));
+        if sections.is_empty() {
+            sections.push(browse::nothing_matches(query, !found.is_empty()));
+        }
+        sections.extend(found);
+        sections
+    }
+
+    /// Tells Sonarr's shows which show's page is open, if one is and no
+    /// video plays: that one is kept current.
+    fn tell_open_show(&mut self, cx: &mut Context<Self>) {
+        let open = match self.navigation.screen() {
+            _ if self.playback.read(cx).is_open() => None,
+            Screen::Show(name) => Some(name.clone()),
+            Screen::Tracked(server, Kind::Sonarr, id) => Some(sonarr::tracked_show(*server, *id)),
+            _ => None,
+        };
+        self.shows.update(cx, |shows, _| shows.set_open(open));
+    }
+
+    /// Plays an item from where it was left off.
+    fn play(&mut self, key: &str, window: &mut Window, cx: &mut Context<Self>) {
+        self.playback
+            .update(cx, |playback, cx| playback.play(key, window, cx));
+    }
+
+    fn play_from_start(&mut self, key: &str, window: &mut Window, cx: &mut Context<Self>) {
+        self.playback.update(cx, |playback, cx| {
+            playback.play_saved(key, StartAt::Beginning, window, cx)
+        });
+    }
+
+    /// The player closed: the library is back, with the keyboard.
+    fn on_playback_event(
+        &mut self,
+        event: &playback::Event,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        match event {
+            playback::Event::Closed => {
                 self.focus.focus(window);
                 cx.notify();
             }
-            PlayerEvent::QualityChosen(quality) => self.change_quality(*quality, cx),
-            PlayerEvent::SoundChosen(on, profile) => self.sound_chosen(*on, *profile),
-            PlayerEvent::AudioChosen(lang) => {
-                for scope in self.pref_scopes() {
-                    if let Err(e) = self.db.save_audio_pref(&scope, lang) {
-                        eprintln!("[library] saving audio choice: {e}");
-                    }
-                }
-            }
-            PlayerEvent::SubtitleChosen(pref) => {
-                for scope in self.pref_scopes() {
-                    if let Err(e) = self.db.save_subtitle_pref(&scope, pref) {
-                        eprintln!("[library] saving subtitle choice: {e}");
-                    }
-                }
-            }
-            PlayerEvent::SubtitleTuned(tuning) => {
-                if let Some(scope) = self.player.as_ref().and_then(|p| p.tuning_scope.as_ref())
-                    && let Err(e) = self.db.save_subtitle_tuning(scope, *tuning)
-                {
-                    eprintln!("[library] saving subtitle tuning: {e}");
-                }
-            }
-            PlayerEvent::Play(key) => {
-                // Straight to the next video; fullscreen stays as it is.
-                self.finish_playback(cx);
-                self.play_next_now(key, window, cx);
-                if self.player.is_none() {
-                    if window.is_fullscreen() {
-                        window.toggle_fullscreen();
-                    }
-                    self.focus.focus(window);
-                }
-                cx.notify();
-            }
         }
     }
 
-    /// Ends the current video: saves the volume, records progress, tells the
-    /// server, and re-reads the library so watched state shows up.
-    fn finish_playback(&mut self, cx: &mut Context<Self>) {
-        // Paused (perhaps for long, perhaps while watching on the TV): the
-        // paused position mustn't overwrite what happened elsewhere.
-        let paused = self.finish_paused(cx);
-        // Dropping the view shuts mpv down and destroys its window.
-        let Some(active) = self.player.take() else {
-            return;
-        };
-        if let Some(media) = &self.media {
-            media.hide();
-        }
-        // Remember the volume for next time, but never start silent.
-        let volume = active.view.read(cx).volume();
-        if volume >= 1.0
-            && let Err(e) = self.db.set_setting(VOLUME_SETTING, &format!("{volume:.0}"))
-        {
-            eprintln!("[library] saving volume: {e}");
-        }
-        // The player's own position is the freshest (progress events come
-        // every few seconds). A finished video is reported at its full
-        // runtime, so the server marks it watched even when it was left
-        // during the end credits, before the server's own 90% mark.
-        let player = active.view.read(cx);
-        let (position, duration, finished) = if player.duration() > 0.0 {
-            (player.position(), player.duration(), player.finished())
-        } else {
-            (active.position, active.duration, false)
-        };
-        let reported = if finished { duration } else { position };
-        match &active.source {
-            Some(Source::Local { id, .. }) => {
-                if duration > 0.0
-                    && let Err(e) = self.db.save_progress(*id, reported, duration)
-                {
-                    eprintln!("[library] saving progress: {e}");
-                }
-            }
-            Some(Source::Jellyfin { .. }) if paused => {}
-            Some(source @ Source::Jellyfin { .. }) => {
-                // Update the card now; reading it back after "stopped"
-                // confirms it.
-                if let Some(item) = self.remote.iter_mut().find(|i| &i.source == source) {
-                    item.position = if finished { 0.0 } else { position };
-                    item.watched |= finished;
-                    item.last_played = Some(now());
-                }
-                eprintln!(
-                    "[jellyfin] stopped at {position:.0}/{duration:.0} s{}",
-                    if finished { " (watched)" } else { "" }
-                );
-                self.report(
-                    source,
-                    PlaybackReport::Stopped,
-                    reported,
-                    active.session.clone(),
-                    cx,
-                );
-                // The cached library is what the next start shows first.
-                if let Source::Jellyfin { server, id } = source {
-                    let (cache, id) = (self.paths.library_cache(*server), id.clone());
-                    self.queue_task(
-                        "updating the library cache",
-                        move || jellyfin::cache_play_state(&cache, &id, position, finished, now()),
-                        cx,
-                    );
-                }
-            }
-            None => {}
-        }
-        self.reload();
-        if std::mem::take(&mut self.library_stale) {
-            self.refresh_remote(cx);
-        }
+    /// The window's close button (see `NowPlaying::close_requested`).
+    fn close_requested(&mut self, cx: &mut Context<Self>) -> bool {
+        self.playback
+            .update(cx, |playback, cx| playback.close_requested(cx))
     }
-
-    fn on_key(&mut self, event: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
-        if self.capture_key(event, cx) {
-            return cx.stop_propagation();
-        }
-        let key = event.keystroke.key.as_str();
-        if key == "escape" && self.close_card_menu(cx) {
-            return cx.stop_propagation();
-        }
-        let browsing = !matches!(self.screen, Screen::Settings);
-        let modifiers = &event.keystroke.modifiers;
-        let plain = !(modifiers.control || modifiers.alt || modifiers.platform || modifiers.shift);
-        if browsing && plain {
-            let searching = self.search.focus_handle(cx).is_focused(window);
-            match keynav::Direction::from_key(key) {
-                // From the search field, Down goes into the results.
-                Some(keynav::Direction::Down) if searching => {
-                    window.focus(&self.focus);
-                    self.cursor = None;
-                    if self.move_cursor(keynav::Direction::Down, window, cx) {
-                        return cx.stop_propagation();
-                    }
-                }
-                Some(direction) if !searching && self.move_cursor(direction, window, cx) => {
-                    return cx.stop_propagation();
-                }
-                _ => {}
-            }
-            if key == "enter" && !searching {
-                if self.activate_cursor(window, cx) {
-                    return cx.stop_propagation();
-                }
-                // A movie's page has no cards: Enter is its Play button.
-                if let Screen::Details(item) = self.screen.clone() {
-                    self.play(&item, window, cx);
-                    return cx.stop_propagation();
-                }
-            }
-        }
-        match (&self.screen, key) {
-            (Screen::Settings, "escape") if self.quality_menu.current().is_some() => {
-                self.quality_menu.close();
-                cx.notify();
-            }
-            (Screen::Settings, "escape") if self.adding_server => {
-                self.adding_server = false;
-                self.form.error = None;
-                window.focus(&self.focus);
-                cx.notify();
-            }
-            (Screen::Settings, "enter" | "tab") if self.focused_arr(window, cx).is_some() => {
-                if let Some(id) = self.focused_arr(window, cx) {
-                    if key == "enter" {
-                        self.save_arr(id, cx);
-                    } else {
-                        self.focus_next_arr_field(id, window, cx);
-                    }
-                }
-            }
-            (Screen::Settings, "enter") if self.adding_server => self.connect(window, cx),
-            (Screen::Settings, "tab") if self.adding_server => self.focus_next_field(window, cx),
-
-            (Screen::Settings, "escape")
-            | (
-                Screen::Show(_) | Screen::Details(_) | Screen::Tracked(..) | Screen::Found(..),
-                "escape" | "backspace",
-            ) => {
-                self.screen = self.tab.clone();
-                window.focus(&self.focus);
-                cx.notify();
-            }
-            (
-                Screen::Home
-                | Screen::Source(_)
-                | Screen::Movies(_)
-                | Screen::Shows(_)
-                | Screen::Downloads
-                | Screen::Arr(..),
-                "escape",
-            ) => {
-                // Clear the search and leave the field.
-                self.search.update(cx, |input, cx| input.set_text("", cx));
-                if let Screen::Arr(_, kind) = self.screen {
-                    self.arr_input(kind)
-                        .clone()
-                        .update(cx, |input, cx| input.set_text("", cx));
-                }
-                window.focus(&self.focus);
-                cx.notify();
-            }
-            (
-                Screen::Home
-                | Screen::Source(_)
-                | Screen::Movies(_)
-                | Screen::Shows(_)
-                | Screen::Downloads
-                | Screen::Arr(..),
-                "f",
-            ) if event.keystroke.modifiers.secondary() => {
-                window.focus(&self.search.focus_handle(cx));
-                cx.notify();
-            }
-            _ => {}
-        }
-    }
-
-    // ---- rendering ----
 
     /// A screen's page, below the header.
-    fn page(&mut self, screen: &Screen, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
+    fn page(&self, screen: &Screen, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
         let query = self.search_query(cx);
-        let on_tab = matches!(
-            screen,
-            Screen::Home
-                | Screen::Source(_)
-                | Screen::Movies(_)
-                | Screen::Shows(_)
-                | Screen::Downloads
-                | Screen::Arr(..)
-        );
+        let (pages, navigation) = (&self.library_pages, &self.navigation);
         let body: Result<Vec<AnyElement>, AnyElement> = match screen.clone() {
-            _ if on_tab && !query.is_empty() => Ok(self.search_results(&query, cx)),
-            Screen::Home => Ok(self.home(None, cx)),
-            Screen::Source(origin) => Ok(self.home(Some(origin), cx)),
+            _ if screen.is_tab() && !query.is_empty() => Ok(self.search_results(&query, cx)),
+            Screen::Home => Ok(pages.update(cx, |pages, cx| {
+                pages.home(Scope::Everything, navigation, cx)
+            })),
+            Screen::Source(origin) => {
+                let scope = Scope::Source(origin);
+                Ok(pages.update(cx, |pages, cx| pages.home(scope, navigation, cx)))
+            }
             ref screen @ (Screen::Movies(_) | Screen::Shows(_)) => {
                 let grid = Grid::of(screen).expect("a library tab");
-                Err(self.library_grid(grid, window, cx))
+                let scroll = navigation.grid_scroll();
+                Err(pages.update(cx, |pages, cx| pages.library_grid(grid, scroll, window, cx)))
             }
-            Screen::Show(name) => Ok(self.show_page(&name, window, cx)),
-            Screen::Details(key) => Ok(self.details_page(&key, window, cx)),
+            Screen::Show(name) => Ok(pages.update(cx, |pages, cx| {
+                pages.show_page(&name, navigation, window, cx)
+            })),
+            Screen::Details(key) => {
+                Ok(pages.update(cx, |pages, cx| pages.details_page(&key, window, cx)))
+            }
             Screen::Tracked(server, kind, id) => {
-                Ok(self.tracked_page(server, kind, id, window, cx))
+                let app = Id { server, kind };
+                let arr = &self.arr;
+                Ok(arr.update(cx, |arr, cx| arr.tracked_page(app, id, window, cx)))
             }
-            Screen::Found(server, kind, key) => Ok(self.found_page(server, kind, key, window, cx)),
-            Screen::Downloads => Ok(self.downloads_page(cx)),
-            Screen::Arr(server, kind) => Err(self.arr_page(server, kind, window, cx)),
-            Screen::Settings => Err(self.settings_view(window, cx)),
+            Screen::Found(server, kind, key) => {
+                let app = Id { server, kind };
+                let arr = &self.arr;
+                Ok(arr.update(cx, |arr, cx| arr.found_page(app, key, window, cx)))
+            }
+            Screen::Downloads => Ok(self.downloads_page.update(cx, |page, cx| page.page(cx))),
+            Screen::Arr(server, kind) => {
+                let app = Id { server, kind };
+                let scroll = self.navigation.content_scroll();
+                let arr = &self.arr;
+                Err(arr.update(cx, |arr, cx| arr.list_page(app, scroll, window, cx)))
+            }
+            Screen::Settings => Err(self.settings.clone().into_any_element()),
         };
         // Sections scroll as one page; the grids scroll (and virtualize) themselves.
         match body {
@@ -1946,7 +417,7 @@ impl Shell {
                     .flex_1()
                     .min_h(px(0.0))
                     .overflow_y_scroll()
-                    .track_scroll(&self.content_scroll)
+                    .track_scroll(self.navigation.content_scroll())
                     .px_8()
                     .pt(px(HEADER_HEIGHT))
                     .pb_10()
@@ -1968,1267 +439,72 @@ impl Shell {
         }
     }
 
-    fn button(
-        &self,
-        id: impl Into<ElementId>,
-        label: impl Into<SharedString>,
-        cx: &mut Context<Self>,
-        action: impl Fn(&mut Self, &mut Window, &mut Context<Self>) + 'static,
-    ) -> AnyElement {
-        div()
-            .id(id.into())
-            .flex_none()
-            .px_3()
-            .py_1p5()
-            .rounded_md()
-            .text_sm()
-            .bg(rgba(0xffffff14))
-            .hover(|s| s.bg(rgba(0xffffff26)))
-            .cursor_pointer()
-            .child(label.into())
-            .on_click(cx.listener(move |this, _: &ClickEvent, window, cx| action(this, window, cx)))
-            .into_any_element()
-    }
-
-    /// The screen whose page is being drawn: the one being left while it
-    /// fades out, otherwise the current one.
-    fn page_screen(&self) -> Screen {
-        match &self.leaving {
-            Some(leaving) if self.drawing_leaving.get() => leaving.screen.clone(),
-            _ => self.screen.clone(),
-        }
-    }
-
-    /// Whether a library grid's sort bar sits under the header.
-    fn sort_bar_below(&self, cx: &Context<Self>) -> bool {
-        (Grid::of(&self.screen).is_some() || matches!(self.screen, Screen::Arr(..)))
-            && self.search_query(cx).is_empty()
-    }
-
-    /// The blur under the header (and the sort bar, if there is one): one
-    /// layer, drawn after the page and before either bar, so each bar's
-    /// buttons stay out of the other's blur.
-    fn frost(&self, cx: &Context<Self>) -> Option<AnyElement> {
-        if !FROSTED {
-            return None;
-        }
-        let sort_bar = self.sort_bar_below(cx);
-        let height = HEADER_HEIGHT
-            + if sort_bar {
-                browse::SORT_BAR_HEIGHT
-            } else {
-                0.0
-            };
-        let frost = gpui::canvas(
-            |_, _, _| (),
-            move |bounds, _, window, _| {
-                let blur = |rect| {
-                    gpui::quad(
-                        rect,
-                        px(0.0),
-                        gpui::backdrop_blur(px(FROST_BLUR)),
-                        px(0.0),
-                        gpui::transparent_black(),
-                        gpui::BorderStyle::default(),
-                    )
-                };
-                let header = Bounds::new(
-                    bounds.origin,
-                    gpui::size(bounds.size.width, px(HEADER_HEIGHT)),
-                );
-                // One layer: both blurs are drawn together, from the page
-                // as it was, so there's no seam where they meet. It reaches
-                // as far as the blur reads, so it comes after all of that.
-                window.paint_layer(bounds.dilate(px(FROST_BLUR * 3.0)), |window| {
-                    window.paint_quad(blur(header));
-                    if sort_bar {
-                        // The sort bar spans the grid, beside the sidebar.
-                        let left = px(browse::SIDEBAR_WIDTH);
-                        window.paint_quad(blur(Bounds::new(
-                            point(bounds.origin.x + left, bounds.origin.y + px(HEADER_HEIGHT)),
-                            gpui::size(bounds.size.width - left, px(browse::SORT_BAR_HEIGHT)),
-                        )));
-                    }
-                });
-            },
-        );
-        Some(
-            div()
-                .absolute()
-                .top_0()
-                .left_0()
-                .right_0()
-                .h(px(height))
-                .child(frost.size_full())
-                .into_any_element(),
-        )
-    }
-
-    fn header(&self, cx: &mut Context<Self>) -> AnyElement {
-        let heading =
-            |text: SharedString| div().text_2xl().font_weight(FontWeight::BOLD).child(text);
-        let back = |this: &Self, cx: &mut Context<Self>| {
-            solid(this.button("home", "‹ Library", cx, |this, window, cx| {
-                this.screen = this.tab.clone();
-                window.focus(&this.focus);
-                cx.notify();
-            }))
-        };
-        let title: AnyElement = match &self.screen {
-            Screen::Home
-            | Screen::Source(_)
-            | Screen::Movies(_)
-            | Screen::Shows(_)
-            | Screen::Downloads
-            | Screen::Arr(..) => solid(self.search_field()),
-            Screen::Show(_) | Screen::Details(_) | Screen::Tracked(..) | Screen::Found(..) => {
-                back(self, cx)
+    /// Whether the screen showing no longer exists: a library tab whose
+    /// library went, or a page of a Sonarr or Radarr no longer set up.
+    fn screen_is_gone(&self, cx: &App) -> bool {
+        let catalog = self.library.read(cx).catalog();
+        match self.navigation.screen() {
+            Screen::Movies(_) | Screen::Shows(_) => {
+                !browse::library_screens(&catalog).contains(self.navigation.screen())
             }
-            Screen::Settings => div()
-                .flex()
-                .items_center()
-                .gap_3()
-                .child(back(self, cx))
-                .child(heading("Settings".into()))
-                .into_any_element(),
-        };
-        let status = if self.scanning {
-            Some(SharedString::from("Scanning…"))
-        } else if !self.loading_servers.is_empty() {
-            Some("Loading Jellyfin library…".into())
-        } else if self.artwork_left > 0 {
-            Some(format!("Downloading artwork ({} left)", self.artwork_left).into())
-        } else if self.thumbs_left > 0 {
-            Some(format!("Generating thumbnails ({} left)", self.thumbs_left).into())
-        } else if !self.undelivered.is_empty() && self.reports.is_failing() {
-            let n = self.undelivered.len();
-            Some(
-                format!(
-                    "Offline: {n} change{} to send when the server answers",
-                    if n == 1 { "" } else { "s" }
-                )
-                .into(),
-            )
-        } else {
-            None
-        };
-        let can_refresh = !self.roots.is_empty() || !self.servers.is_empty();
-        // On a library grid the sort bar carries the fade on below.
-        let sort_bar_below = self.sort_bar_below(cx);
-        let fades_to = if sort_bar_below {
-            BAR_JOIN_OPACITY
-        } else {
-            0.0
-        };
-        div()
-            .id("header")
-            .absolute()
-            .top_0()
-            .left_0()
-            .right_0()
-            .h(px(HEADER_HEIGHT))
-            .bg(bar_background(BAR_FADE_START, BAR_TOP_OPACITY, fades_to))
-            .when(FROSTED && !sort_bar_below, |bar| {
-                bar.border_b_1().border_color(rgba(FROST_EDGE))
-            })
-            // Clicks on the bar itself don't reach the page under it.
-            .occlude()
-            .flex()
-            .items_center()
-            .justify_between()
-            .gap_4()
-            .px_8()
-            .child(div().flex_none().child(title))
-            .child(
-                // Status and error text give way (truncated) before the
-                // tabs or buttons do.
-                div()
-                    .flex()
-                    .flex_1()
-                    .min_w(px(0.0))
-                    .justify_end()
-                    .items_center()
-                    .gap_3()
-                    .children(status.map(|s| {
-                        div()
-                            .min_w(px(0.0))
-                            .text_sm()
-                            .text_color(rgb(MUTED))
-                            .truncate()
-                            .child(s)
-                    }))
-                    .children(self.error.clone().map(|e| {
-                        div()
-                            .min_w(px(0.0))
-                            .text_sm()
-                            .text_color(rgb(ERROR))
-                            .truncate()
-                            .child(e)
-                    }))
-                    .children(can_refresh.then(|| {
-                        solid(self.button("refresh", "Refresh", cx, |this, _, cx| this.refresh(cx)))
-                    }))
-                    .children((self.screen != Screen::Settings).then(|| {
-                        solid(self.button("settings", "Settings", cx, |this, window, cx| {
-                            this.open_settings(this.settings_page, window, cx)
-                        }))
-                    })),
-            )
-            .into_any_element()
+            Screen::Source(origin) => !browse::sources(&catalog)
+                .iter()
+                .any(|source| source.origin == *origin),
+            Screen::Downloads => self.apps.connected_ids().is_empty(),
+            Screen::Arr(server, kind)
+            | Screen::Tracked(server, kind, _)
+            | Screen::Found(server, kind, _) => {
+                let app = Id {
+                    server: *server,
+                    kind: *kind,
+                };
+                self.apps.client(app).is_none()
+            }
+            _ => false,
+        }
     }
 
-    /// A poster card. Clicking it calls `on_click`; with `on_text_click`,
-    /// the title and subtitle below the picture act on their own (like a
-    /// link to the show under an episode).
-    fn card(
-        &self,
-        card: Card,
-        on_text_click: Option<TextClick>,
-        cx: &mut Context<Self>,
-        on_click: impl Fn(&mut Self, &mut Window, &mut Context<Self>) + 'static,
-    ) -> AnyElement {
-        let Card {
-            id,
-            thumb,
-            title,
-            subtitle,
-            progress,
-            watched,
-            highlight,
-            menu,
-        } = card;
-        let text_id = ElementId::NamedChild(Box::new(id.clone().into()), "text".into());
-        let selected = self.cursor.as_ref() == Some(&id);
-        let lit = if selected {
-            1.0
-        } else {
-            self.card_hover.borrow().level(&id)
-        };
-        let brightness = self.poster_light.get().at(lit);
-        let hover_id = id.clone();
-        let on_click: CardAction = Rc::new(on_click);
-        let leaving = self.drawing_leaving.get();
-        if !leaving {
-            self.card_actions
-                .borrow_mut()
-                .insert(id.clone(), on_click.clone());
+    /// The page with the sidebar on its left. Settings has its own sidebar.
+    fn beside_sidebar(&self, content: AnyElement, cx: &mut Context<Self>) -> AnyElement {
+        if *self.navigation.screen() == Screen::Settings {
+            return content;
         }
-        let registry = self.card_bounds.clone();
-        let key = id.clone();
-        let color = PLACEHOLDER_COLORS
-            [title.bytes().map(usize::from).sum::<usize>() % PLACEHOLDER_COLORS.len()];
-        let initial: String = title.chars().next().map(String::from).unwrap_or_default();
-        let placeholder = move || {
-            div()
-                .size_full()
-                .flex()
-                .items_center()
-                .justify_center()
-                .bg(rgb(color))
-                .text_3xl()
-                .font_weight(FontWeight::BOLD)
-                .text_color(rgba(0xffffffb0))
-                .child(initial.clone())
-                .into_any_element()
-        };
-        let art = self.card_picture(&id, thumb, placeholder, cx);
-
         div()
-            .id(id)
-            .relative()
-            .flex_none()
-            .w(px(CARD_WIDTH))
             .flex()
-            .flex_col()
-            .gap_2()
-            .cursor_pointer()
-            .on_hover(cx.listener(move |this, hovered: &bool, _, cx| {
-                this.card_hover.borrow_mut().set(&hover_id, *hovered);
-                cx.notify();
-            }))
-            .child(
-                // Records where the card is, for the arrow keys.
-                canvas(
-                    move |b, _, _| {
-                        if !leaving {
-                            registry.borrow_mut().push((key, b));
-                        }
-                    },
-                    |_, _, _, _| {},
-                )
-                .absolute()
-                .top_0()
-                .left_0()
-                .size_full(),
-            )
+            .flex_1()
+            .min_h(px(0.0))
+            .child(self.sidebar(cx))
             .child(
                 div()
-                    .relative()
-                    .w_full()
-                    .h(px(CARD_HEIGHT))
-                    .rounded_lg()
-                    .overflow_hidden()
-                    .bg(rgb(color))
-                    .when(highlight || selected, |d| {
-                        d.border_2().border_color(rgb(ACCENT))
-                    })
-                    .child(art)
-                    .child(posters::shade(brightness))
-                    .children(highlight.then(|| {
-                        // Records where the card is, so the page can scroll to it.
-                        let bounds = self.focus_bounds.clone();
-                        canvas(move |b, _, _| bounds.set(Some(b)), |_, _, _, _| {})
-                            .absolute()
-                            .top_0()
-                            .left_0()
-                            .size_full()
-                    }))
-                    .children(progress.map(|p| {
-                        div()
-                            .absolute()
-                            .bottom_0()
-                            .left_0()
-                            .right_0()
-                            .h_1()
-                            .bg(rgba(0x00000099))
-                            .child(div().h_full().w(gpui::relative(p)).bg(rgb(ACCENT)))
-                    }))
-                    .children(watched.then(|| {
-                        div()
-                            .absolute()
-                            .top_2()
-                            .right_2()
-                            .px_2()
-                            .rounded_md()
-                            .text_xs()
-                            .bg(rgba(0x000000a0))
-                            .child("Watched")
-                    })),
-            )
-            .child(
-                div()
-                    .id(text_id)
                     .flex()
                     .flex_col()
-                    .gap_2()
-                    .child(
-                        div()
-                            .text_sm()
-                            .font_weight(FontWeight::MEDIUM)
-                            .truncate()
-                            .child(title),
-                    )
-                    .child(
-                        div()
-                            .h(px(16.0))
-                            .text_xs()
-                            .text_color(rgb(MUTED))
-                            .truncate()
-                            .child(subtitle.unwrap_or_default()),
-                    )
-                    .when_some(on_text_click, |d, on_text_click| {
-                        d.hover(|s| s.underline()).on_click(cx.listener(
-                            move |this, _: &ClickEvent, window, cx| {
-                                // Instead of the card's own action.
-                                cx.stop_propagation();
-                                on_text_click(this, window, cx)
-                            },
-                        ))
-                    }),
-            )
-            .on_click(
-                cx.listener(move |this, _: &ClickEvent, window, cx| on_click(this, window, cx)),
-            )
-            .when_some(menu, |d, target| {
-                d.on_mouse_down(
-                    MouseButton::Right,
-                    cx.listener(move |this, event: &MouseDownEvent, _, cx| {
-                        cx.stop_propagation();
-                        this.open_card_menu(target.clone(), event.position, cx);
-                    }),
-                )
-            })
-            .into_any_element()
-    }
-
-    /// Moves the keyboard cursor; false if there's nothing to move between.
-    fn move_cursor(
-        &mut self,
-        direction: keynav::Direction,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) -> bool {
-        let grid = Grid::of(&self.screen).filter(|_| self.search_query(cx).is_empty());
-        if let Some(grid) = grid {
-            let ids: Vec<SharedString> = if grid.shows {
-                self.shows(&grid)
-                    .iter()
-                    .map(|s| show_card_id("all", &s.name))
-                    .collect()
-            } else {
-                self.movies(&grid)
-                    .iter()
-                    .map(|m| item_card_id("movie", m))
-                    .collect()
-            };
-            let columns = browse::columns(window);
-            let current = self
-                .cursor
-                .as_ref()
-                .and_then(|c| ids.iter().position(|id| id == c));
-            let next = match current {
-                // Start at the first card in view.
-                None => {
-                    let view = self.grid_scroll.0.borrow().base_handle.bounds();
-                    self.first_card_in(view)
-                        .and_then(|first| ids.iter().position(|id| *id == first))
-                        .or((!ids.is_empty()).then_some(0))
-                }
-                Some(i) => keynav::grid_step(i, ids.len(), columns, direction),
-            };
-            if let Some(next) = next.filter(|n| *n < ids.len()) {
-                self.cursor = Some(ids[next].clone());
-                self.grid_scroll
-                    .scroll_to_item(next / columns, ScrollStrategy::Top);
-            }
-            cx.notify();
-            return !ids.is_empty();
-        }
-
-        let cards = self.card_bounds.borrow().clone();
-        if cards.is_empty() {
-            return false;
-        }
-        let rect = |b: &Bounds<Pixels>| keynav::Rect {
-            left: f32::from(b.left()),
-            top: f32::from(b.top()),
-            right: f32::from(b.right()),
-            bottom: f32::from(b.bottom()),
-        };
-        let current = self
-            .cursor
-            .as_ref()
-            .and_then(|c| cards.iter().position(|(id, _)| id == c));
-        let next = match current {
-            Some(i) => {
-                let rects: Vec<keynav::Rect> = cards.iter().map(|(_, b)| rect(b)).collect();
-                keynav::nearest(rects[i], &rects, direction)
-            }
-            None => self
-                .first_card_in(self.content_scroll.bounds())
-                .and_then(|first| cards.iter().position(|(id, _)| *id == first)),
-        };
-        if let Some(next) = next {
-            let (id, bounds) = cards[next].clone();
-            self.cursor = Some(id);
-            self.reveal(bounds);
-        }
-        cx.notify();
-        true
-    }
-
-    /// The top-left card drawn within `view`, where the cursor starts.
-    fn first_card_in(&self, view: Bounds<Pixels>) -> Option<SharedString> {
-        self.card_bounds
-            .borrow()
-            .iter()
-            .filter(|(_, b)| {
-                b.bottom() > view.top() + px(HEADER_HEIGHT)
-                    && b.top() < view.bottom()
-                    && b.left() >= view.left() - px(1.0)
-            })
-            .min_by(|(_, a), (_, b)| {
-                (a.top(), a.left())
-                    .partial_cmp(&(b.top(), b.left()))
-                    .unwrap_or(std::cmp::Ordering::Equal)
-            })
-            .map(|(id, _)| id.clone())
-    }
-
-    /// Scrolls the page, and the row the card is in, so `card` is in view.
-    fn reveal(&self, card: Bounds<Pixels>) {
-        let margin = px(CURSOR_MARGIN);
-        let handle = &self.content_scroll;
-        let (view, offset, max) = (handle.bounds(), handle.offset(), handle.max_offset());
-        let mut y = offset.y;
-        let top = view.top() + px(HEADER_HEIGHT) + margin;
-        if card.top() < top {
-            y += top - card.top();
-        } else if card.bottom() > view.bottom() - margin {
-            y -= card.bottom() - (view.bottom() - margin);
-        }
-        let y = y.clamp(-max.height, px(0.0));
-        if y != offset.y {
-            handle.set_offset(point(offset.x, y));
-        }
-        let center = card.top() + card.size.height / 2.0;
-        for row in self.row_scroll.borrow().values() {
-            let view = row.bounds();
-            if center < view.top() || center > view.bottom() {
-                continue;
-            }
-            let (offset, max) = (row.offset(), row.max_offset());
-            let mut x = offset.x;
-            if card.left() < view.left() {
-                x += view.left() - card.left();
-            } else if card.right() > view.right() {
-                x -= card.right() - view.right();
-            }
-            let x = x.clamp(-max.width, px(0.0));
-            if x != offset.x {
-                row.set_offset(point(x, offset.y));
-            }
-        }
-    }
-
-    /// Enter on the keyboard cursor: what clicking its card does.
-    fn activate_cursor(&mut self, window: &mut Window, cx: &mut Context<Self>) -> bool {
-        let action = self
-            .cursor
-            .as_ref()
-            .and_then(|c| self.card_actions.borrow().get(c).cloned());
-        match action {
-            Some(action) => {
-                action(self, window, cx);
-                true
-            }
-            None => false,
-        }
-    }
-
-    fn item_card(
-        &self,
-        prefix: &str,
-        item: &Item,
-        show_context: bool,
-        cx: &mut Context<Self>,
-    ) -> AnyElement {
-        let (title, subtitle) = match (show_context, &item.show, item.episode_label()) {
-            (true, Some(show), Some(label)) => {
-                (show.clone(), Some(format!("{label} · {}", item.title)))
-            }
-            (false, Some(_), _) => (
-                format!("{}. {}", item.episode.unwrap_or(0), item.title),
-                None,
-            ),
-            _ => (item.title.clone(), item.year.map(|y| y.to_string())),
-        };
-        let key = item.key();
-        let card = Card {
-            id: item_card_id(prefix, item),
-            thumb: item.thumb.clone(),
-            title,
-            subtitle,
-            progress: item.progress(),
-            watched: item.watched,
-            highlight: !show_context && self.focus_episode.as_ref() == Some(&key),
-            menu: Some(watched::MenuTarget::Item(key.clone())),
-        };
-        // An episode shown with its show's name (Continue Watching, search):
-        // the name leads to the show, at this episode.
-        let text_click: Option<TextClick> = (show_context && item.is_episode()).then(|| {
-            let key = key.clone();
-            Box::new(
-                move |this: &mut Self, _: &mut Window, cx: &mut Context<Self>| {
-                    this.open_show_at(&key, cx)
-                },
-            ) as TextClick
-        });
-        let open_details = !item.is_episode() && prefix != "continue";
-        self.card(card, text_click, cx, move |this, window, cx| {
-            if open_details {
-                this.open_details(key.clone(), cx)
-            } else {
-                this.play(&key, window, cx)
-            }
-        })
-    }
-
-    fn section(title: &str, body: impl IntoElement) -> AnyElement {
-        div()
-            .flex()
-            .flex_col()
-            .gap_3()
-            .pt_6()
-            .child(
-                div()
-                    .text_lg()
-                    .font_weight(FontWeight::SEMIBOLD)
-                    .child(title.to_string()),
-            )
-            .child(body)
-            .into_any_element()
-    }
-
-    fn grid(cards: Vec<AnyElement>) -> AnyElement {
-        div()
-            .flex()
-            .flex_wrap()
-            .gap_5()
-            .children(cards)
-            .into_any_element()
-    }
-
-    fn empty_state(&self, cx: &mut Context<Self>) -> AnyElement {
-        let message = if self.scanning || !self.loading_servers.is_empty() {
-            "Loading your library…"
-        } else if self.roots.is_empty() && self.servers.is_empty() {
-            "Connect a Jellyfin server or add a folder with movies or TV shows."
-        } else {
-            "No videos found yet."
-        };
-        div()
-            .flex()
-            .flex_col()
-            .items_center()
-            .gap_4()
-            .pt(px(160.0))
-            .child(
-                div()
-                    .text_xl()
-                    .font_weight(FontWeight::SEMIBOLD)
-                    .child("Your library is empty"),
-            )
-            .child(div().text_color(rgb(MUTED)).child(message))
-            .child(
-                div()
-                    .flex()
-                    .gap_3()
-                    .child(self.button(
-                        "jellyfin-empty",
-                        "Connect Jellyfin",
-                        cx,
-                        |this, window, cx| this.open_connect(window, cx),
-                    ))
-                    .child(self.button("add-empty", "Add Folder", cx, |this, _, cx| {
-                        this.add_folder(cx)
-                    })),
-            )
-            .into_any_element()
-    }
-
-    /// The show page of an episode's show, scrolled to that episode, which
-    /// is ringed.
-    fn open_show_at(&mut self, key: &str, cx: &mut Context<Self>) {
-        let Some((show, season)) = self
-            .items()
-            .find(|i| i.key() == key)
-            .and_then(|i| Some((i.show.clone()?, i.season.unwrap_or(0))))
-        else {
-            return;
-        };
-        self.open_show(show.clone(), cx);
-        // The episode's season is open, so it can be shown.
-        self.open_seasons.entry(show).or_default().insert(season);
-        self.focus_episode = Some(key.to_string());
-        self.focus_bounds.set(None);
-        self.focus_scroll = Some(FocusScroll {
-            until: Instant::now() + FOCUS_SCROLL_SETTLE,
-            applied: None,
-        });
-    }
-
-    /// The page just left starts fading out (keeping where it was
-    /// scrolled), unless motion is off or Settings, with its own layout,
-    /// is either side.
-    fn start_leaving(&mut self, cx: &mut Context<Self>) {
-        let arr_scroll = self.arr_pages.left_scroll.take();
-        let Some(old) = self.scrolled_screen.clone() else {
-            return;
-        };
-        if !crate::motion::enabled() || old == Screen::Settings || self.screen == Screen::Settings {
-            self.leaving = None;
-            return;
-        }
-        self.leaving = Some(Leaving {
-            screen: old,
-            started: Instant::now(),
-            content_scroll: frozen(&self.content_scroll),
-            grid_scroll: frozen_list(&self.grid_scroll),
-            arr_scroll: arr_scroll.unwrap_or_else(|| frozen_list(&self.arr_pages.scroll)),
-        });
-        // Gone once the new page has faded in.
-        let generation = self.page_generation;
-        let page_time = crate::motion::PAGE.time();
-        cx.spawn(async move |this, cx| {
-            cx.background_executor().timer(page_time).await;
-            this.update(cx, |this, cx| {
-                if this.page_generation == generation {
-                    this.leaving = None;
-                    cx.notify();
-                }
-            })
-            .ok();
-        })
-        .detach();
-    }
-
-    /// The page being left, drawn with its own scroll positions.
-    fn leaving_page(&mut self, window: &mut Window, cx: &mut Context<Self>) -> Option<AnyElement> {
-        let leaving = self.leaving.as_mut()?;
-        if leaving.started.elapsed() >= crate::motion::PAGE.time() {
-            self.leaving = None;
-            return None;
-        }
-        let screen = leaving.screen.clone();
-        let leaving = self.leaving.as_mut()?;
-        std::mem::swap(&mut self.content_scroll, &mut leaving.content_scroll);
-        std::mem::swap(&mut self.grid_scroll, &mut leaving.grid_scroll);
-        std::mem::swap(&mut self.arr_pages.scroll, &mut leaving.arr_scroll);
-        self.drawing_leaving.set(true);
-        let page = self.page(&screen, window, cx);
-        self.drawing_leaving.set(false);
-        let leaving = self.leaving.as_mut()?;
-        std::mem::swap(&mut self.content_scroll, &mut leaving.content_scroll);
-        std::mem::swap(&mut self.grid_scroll, &mut leaving.grid_scroll);
-        std::mem::swap(&mut self.arr_pages.scroll, &mut leaving.arr_scroll);
-        Some(page)
-    }
-
-    /// Scrolling for the page about to be drawn: a new screen starts at the
-    /// top; a show page opened at an episode scrolls to it. The card's
-    /// position is only known once it's been drawn, and the page above it
-    /// can still grow (the show's details arrive), so the scroll is redone
-    /// each frame for a moment, unless the viewer scrolls first.
-    fn update_scroll(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if self.scrolled_screen.as_ref() != Some(&self.screen) {
-            self.page_generation += 1;
-            self.revealed.borrow_mut().page_opened();
-            self.heights.page_opened();
-            self.start_leaving(cx);
-            if let (Some(old), Some(cursor)) = (self.scrolled_screen.take(), self.cursor.take()) {
-                self.cursors.retain(|(screen, _)| *screen != old);
-                self.cursors.push((old, cursor));
-                if self.cursors.len() > 20 {
-                    self.cursors.remove(0);
-                }
-            }
-            self.cursor = self
-                .cursors
-                .iter()
-                .find(|(screen, _)| *screen == self.screen)
-                .map(|(_, cursor)| cursor.clone());
-            self.reveal_cursor = self.cursor.is_some();
-            self.scrolled_screen = Some(self.screen.clone());
-            self.content_scroll.set_offset(point(px(0.0), px(0.0)));
-        }
-        if self.reveal_cursor {
-            self.reveal_restored_cursor(window);
-        }
-        let Some(focus) = &mut self.focus_scroll else {
-            return;
-        };
-        let handle = &self.content_scroll;
-        let offset = handle.offset();
-        let scrolled_away = focus.applied.is_some_and(|y| y != offset.y);
-        if Instant::now() >= focus.until || scrolled_away {
-            self.focus_scroll = None;
-            return;
-        }
-        window.request_animation_frame();
-        let Some(card) = self.focus_bounds.get() else {
-            return; // not drawn yet
-        };
-        let (viewport, max) = (handle.bounds(), handle.max_offset());
-        // Room above the card for its season's heading.
-        const ABOVE: f32 = 64.0;
-        let in_content = card.top() - offset.y;
-        let y =
-            (viewport.top() + px(HEADER_HEIGHT + ABOVE) - in_content).clamp(-max.height, px(0.0));
-        if y != offset.y {
-            handle.set_offset(point(offset.x, y));
-        }
-        focus.applied = Some(y);
-    }
-
-    /// Brings a cursor put back on return into view: in a grid by its
-    /// index, on a page once the page has been drawn.
-    fn reveal_restored_cursor(&mut self, window: &mut Window) {
-        let Some(cursor) = self.cursor.clone() else {
-            self.reveal_cursor = false;
-            return;
-        };
-        if let Some(grid) = Grid::of(&self.screen) {
-            let columns = browse::columns(window);
-            let index = if grid.shows {
-                let shows = self.shows(&grid);
-                shows
-                    .iter()
-                    .position(|s| show_card_id("all", &s.name) == cursor)
-            } else {
-                self.movies(&grid)
-                    .iter()
-                    .position(|m| item_card_id("movie", m) == cursor)
-            };
-            if let Some(index) = index {
-                self.grid_scroll
-                    .scroll_to_item(index / columns, ScrollStrategy::Center);
-            }
-            self.reveal_cursor = false;
-            return;
-        }
-        if self.bounds_screen.as_ref() != Some(&self.screen) {
-            window.request_animation_frame();
-            return;
-        }
-        let card = self
-            .card_bounds
-            .borrow()
-            .iter()
-            .find(|(id, _)| *id == cursor)
-            .map(|(_, b)| *b);
-        if let Some(card) = card {
-            self.reveal(card);
-        }
-        self.reveal_cursor = false;
-    }
-
-    fn show_page(
-        &self,
-        show: &str,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) -> Vec<AnyElement> {
-        let mut seasons: BTreeMap<u16, Vec<&Item>> = BTreeMap::new();
-        for item in self.items().filter(|i| i.show.as_deref() == Some(show)) {
-            seasons
-                .entry(item.season.unwrap_or(0))
-                .or_default()
-                .push(item);
-        }
-        let header = self.show_header(show, window, cx);
-        // Seasons Sonarr could still get join the list in order.
-        let sonarr: BTreeMap<u16, &crate::arr::SeasonSummary> = self
-            .sonarr_seasons(show)
-            .into_iter()
-            .filter_map(|s| Some((u16::try_from(s.number).ok()?, s)))
-            .collect();
-        let mut numbers: Vec<u16> = seasons.keys().chain(sonarr.keys()).copied().collect();
-        numbers.sort_unstable();
-        numbers.dedup();
-        let blocks: Vec<AnyElement> = numbers
-            .into_iter()
-            .map(|number| {
-                let episodes = seasons.remove(&number).unwrap_or_default();
-                let listed = if episodes.is_empty() {
-                    self.sonarr_episodes(show, number)
-                } else {
-                    Vec::new()
-                };
-                self.season_block(
-                    show,
-                    number,
-                    episodes,
-                    sonarr.get(&number).copied(),
-                    listed,
-                    cx,
-                )
-            })
-            .collect();
-        let list = div()
-            .flex()
-            .flex_col()
-            .gap_2()
-            .children(blocks)
-            .children(self.sonarr_notes(show));
-        vec![header, Self::section("Seasons", list)]
-    }
-
-    /// One season on a show's page: a row that opens and closes it (with
-    /// what Sonarr says about it), and its episodes when open.
-    fn season_block(
-        &self,
-        show: &str,
-        number: u16,
-        mut episodes: Vec<&Item>,
-        sonarr: Option<&crate::arr::SeasonSummary>,
-        listed: Vec<episode_list::EpisodeLine>,
-        cx: &mut Context<Self>,
-    ) -> AnyElement {
-        episodes.sort_by_key(|e| e.episode);
-        let have = !episodes.is_empty();
-        // Without Jellyfin's episodes, what Sonarr (or its metadata) lists.
-        let listing = !have && !listed.is_empty();
-        let foldable = have || listing;
-        let open = foldable
-            && self
-                .open_seasons
-                .get(show)
-                .is_some_and(|open| open.contains(&number));
-        let title = if number == 0 {
-            "Specials".to_string()
-        } else {
-            format!("Season {number}")
-        };
-        let unwatched = episodes.iter().filter(|e| !e.watched).count();
-        let summary = match (episodes.len(), unwatched) {
-            (0, _) if listing && sonarr.is_none() => Some(match listed.len() {
-                1 => "1 episode".to_string(),
-                n => format!("{n} episodes"),
-            }),
-            (0, _) => None,
-            (1, 0) => Some("1 episode · watched".to_string()),
-            (n, 0) => Some(format!("{n} episodes · all watched")),
-            (1, _) => Some("1 episode".to_string()),
-            (n, u) if u == n => Some(format!("{n} episodes")),
-            (n, u) => Some(format!("{n} episodes · {u} unwatched")),
-        };
-        let (status, buttons) = match sonarr {
-            Some(season) => {
-                let (text, color, buttons) = self.sonarr_season_controls(show, season, cx);
-                (Some((text, color)), buttons)
-            }
-            None => (None, Vec::new()),
-        };
-        let toggle_show = show.to_string();
-        let menu_target = watched::MenuTarget::Season(show.to_string(), number);
-        let label = div()
-            .id(SharedString::from(format!("season-{number}")))
-            .when(have, |d| {
-                d.on_mouse_down(
-                    MouseButton::Right,
-                    cx.listener(move |this, event: &MouseDownEvent, _, cx| {
-                        cx.stop_propagation();
-                        this.open_card_menu(menu_target.clone(), event.position, cx);
-                    }),
-                )
-            })
-            .flex()
-            .items_center()
-            .gap_3()
-            .flex_1()
-            .min_w(px(0.0))
-            .py_3()
-            .when(foldable, |d| {
-                d.cursor_pointer()
-                    .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
-                        let open = this.open_seasons.entry(toggle_show.clone()).or_default();
-                        let opening = !open.remove(&number);
-                        if opening {
-                            open.insert(number);
-                        }
-                        this.fold_count += 1;
-                        this.folds.insert(
-                            (toggle_show.clone(), number),
-                            Fold {
-                                opening,
-                                started: Instant::now(),
-                                id: this.fold_count,
-                            },
-                        );
-                        cx.notify();
-                    }))
-            })
-            .child(
-                div()
-                    .w(px(14.0))
-                    .flex_none()
-                    .text_color(rgb(MUTED))
-                    .child(if !foldable {
-                        ""
-                    } else if open {
-                        "▾"
-                    } else {
-                        "▸"
-                    }),
-            )
-            .child(
-                div()
-                    .flex_none()
-                    .font_weight(FontWeight::SEMIBOLD)
-                    .child(title),
-            )
-            .children(summary.map(|s| div().flex_none().text_sm().text_color(rgb(MUTED)).child(s)))
-            .children(status.map(|(text, color)| {
-                let status = div()
+                    .flex_1()
                     .min_w(px(0.0))
-                    .truncate()
-                    .text_sm()
-                    .text_color(rgb(color))
-                    .child(if have { format!("· {text}") } else { text });
-                if have {
-                    self.arriving(format!("season-status-{show}-{number}"), status)
-                } else {
-                    status.into_any_element()
-                }
-            }));
-        // Sonarr's say about a season Jellyfin has comes in after it; a
-        // season only Sonarr knows of comes in whole (below).
-        let buttons: Vec<AnyElement> = if have {
-            buttons
-                .into_iter()
-                .enumerate()
-                .map(|(n, button)| {
-                    self.arriving(
-                        format!("season-button-{show}-{number}-{n}"),
-                        div().flex_none().child(button),
-                    )
-                })
-                .collect()
-        } else {
-            buttons
-        };
-        let row = div()
-            .flex()
-            .items_center()
-            .gap_3()
-            .px_4()
-            .rounded_lg()
-            .bg(rgba(0xffffff0a))
-            .hover(|s| s.bg(rgba(0xffffff12)))
-            .child(label)
-            .children(buttons);
-        let panel = sonarr.and_then(|s| self.release_panel(show, s.number, cx));
-        // Folding: the episodes grow from nothing (or shrink to it) while
-        // fading, as one motion over their real height (measured each time
-        // they're drawn); a closing season stays drawn until it's folded
-        // away. All spacing is inside the folding part, so it ends at zero.
-        let key = (show.to_string(), number);
-        let fold_time = crate::motion::FOLD.time();
-        let fold = self.folds.get(&key).filter(|_| crate::motion::enabled());
-        let closing = fold.is_some_and(|f| !f.opening && f.started.elapsed() < fold_time);
-        let height = self
-            .season_heights
-            .borrow()
-            .get(&key)
-            .copied()
-            .unwrap_or_else(|| {
-                // Not drawn yet: a guess, corrected after the first frame.
-                if listing {
-                    return 24.0 + listed.len() as f32 * 76.0;
-                }
-                let rows = episodes.len().div_ceil(self.columns_hint.get().max(1));
-                24.0 + rows as f32 * (CARD_HEIGHT + 56.0)
-            });
-        let grid = (open || (foldable && closing)).then(|| {
-            let content = if listing {
-                episode_list::episode_rows(&listed)
-            } else {
-                let cards = episodes
-                    .into_iter()
-                    .map(|e| self.item_card("episode", e, false, cx))
-                    .collect();
-                Self::grid(cards)
-            };
-            let heights = self.season_heights.clone();
-            let inner = div().relative().pt_2().pb_4().child(content).child(
-                canvas(
-                    move |bounds, _, _| {
-                        heights
-                            .borrow_mut()
-                            .insert(key, f32::from(bounds.size.height));
-                    },
-                    |_, _, _, _| {},
-                )
-                .absolute()
-                .top_0()
-                .left_0()
-                .size_full(),
-            );
-            let outer = div().overflow_hidden().child(inner);
-            match fold {
-                Some(fold) => {
-                    let opening = fold.opening;
-                    outer
-                        .with_animation(
-                            ("fold", fold.id),
-                            Animation::new(fold_time).with_easing(gpui::ease_in_out),
-                            move |outer, t| {
-                                let shown = if opening { t } else { 1.0 - t };
-                                if opening && t >= 1.0 {
-                                    outer
-                                } else {
-                                    outer.max_h(px(height * shown)).opacity(shown)
-                                }
-                            },
-                        )
-                        .into_any_element()
-                }
-                None => outer.into_any_element(),
-            }
-        });
-        let block = div()
-            .flex()
-            .flex_col()
-            .child(row)
-            .children(panel.map(|panel| div().pt_2().child(panel)))
-            .children(grid);
-        if have {
-            block.into_any_element()
-        } else {
-            self.arriving(format!("season-{show}-{number}"), block)
-        }
-    }
-
-    fn field(label: &str, input: &Entity<TextInput>) -> AnyElement {
-        div()
-            .flex()
-            .flex_col()
-            .gap_1p5()
-            .child(
-                div()
-                    .text_sm()
-                    .text_color(rgb(MUTED))
-                    .child(label.to_string()),
+                    .child(content),
             )
-            .child(input.clone())
             .into_any_element()
-    }
-
-    /// "Streaming" and a button that opens a menu of quality presets, for
-    /// a server in Settings → Library.
-    fn quality_picker(&self, server: i64, window: &Window, cx: &mut Context<Self>) -> AnyElement {
-        let current = self.quality_for(server);
-        let mine = move |open: &(i64, Quality)| open.0 == server;
-        let label = self.changing_text(
-            format!("quality-{server}"),
-            format!("Streaming: {}", current.label()),
-            |label| div().child(label),
-        );
-        let mut picker = div().relative().flex().child(
-            menu::trigger(
-                SharedString::from(format!("quality-{server}")),
-                label,
-                self.quality_menu.lit(mine),
-            )
-            .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
-                if this.quality_menu.current().is_some_and(mine) {
-                    this.quality_menu.close();
-                } else {
-                    this.quality_menu.open((server, current));
-                }
-                cx.notify();
-            })),
-        );
-        for shown in self.quality_menu.drawn().iter().filter(|m| mine(m.value)) {
-            let items = QUALITIES
-                .iter()
-                .enumerate()
-                .map(|(i, &quality)| {
-                    menu::item(
-                        ("quality-choice", i),
-                        quality.menu_label(),
-                        quality == shown.value.1,
-                    )
-                    .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
-                        this.set_quality(server, quality);
-                        this.quality_menu.close();
-                        cx.notify();
-                    }))
-                    .into_any_element()
-                })
-                .collect();
-            picker = picker.child(menu::popup(
-                shown,
-                false,
-                items,
-                window,
-                cx.listener(|this, _: &MouseDownEvent, _, cx| {
-                    this.quality_menu.close();
-                    cx.notify();
-                }),
-            ));
-        }
-        picker.into_any_element()
     }
 }
 
 impl Render for Shell {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        if let Some(player) = &self.player {
-            return div()
-                .size_full()
-                .child(player.view.clone())
-                .into_any_element();
+        if let Some(player) = self.playback.read(cx).view() {
+            return div().size_full().child(player.clone()).into_any_element();
         }
-        // A library tab that's gone (the server's libraries changed, or the
-        // cache from before they were tracked was replaced) falls back to Home.
-        let gone = match &self.screen {
-            Screen::Movies(_) | Screen::Shows(_) => !self.library_screens().contains(&self.screen),
-            Screen::Source(origin) => !self.sources().iter().any(|s| s.origin == *origin),
-            Screen::Downloads => self.arr_apps().is_empty(),
-            Screen::Arr(server, kind)
-            | Screen::Tracked(server, kind, _)
-            | Screen::Found(server, kind, _) => self.arr_client(*server, *kind).is_none(),
-            _ => false,
-        };
-        if gone {
-            self.screen = Screen::Home;
-            self.tab = Screen::Home;
+        if self.screen_is_gone(cx) {
+            self.navigation.open_tab(Screen::Home);
         }
         self.update_scroll(window, cx);
-        posters::keep_animating(self, window);
-        self.columns_hint.set(browse::columns(window));
+        self.cards.keep_animating(window);
         // Refilled as this frame's cards are laid out.
-        self.card_bounds.borrow_mut().clear();
-        self.card_actions.borrow_mut().clear();
-        self.bounds_screen = Some(self.screen.clone());
-        let content = self.page(&self.screen.clone(), window, cx);
-        // Each new page fades in, in place, over the page it replaces fading
-        // out, so one turns into the other.
+        self.cards.start_frame();
+        self.navigation.cards_noted();
+        let content = self.page(&self.navigation.screen().clone(), window, cx);
         let leaving = self.leaving_page(window, cx);
-        let content = if crate::motion::enabled() {
-            let page_time = crate::motion::PAGE.time();
-            let entering = div()
-                .id("entering")
-                .flex()
-                .flex_col()
-                .flex_1()
-                .min_h(px(0.0))
-                .min_w(px(0.0))
-                // The page being left doesn't react to the mouse.
-                .occlude()
-                .child(content)
-                .with_animation(
-                    ("page", self.page_generation),
-                    Animation::new(page_time).with_easing(crate::motion::ease_in_out),
-                    |page, t| page.opacity(t),
-                );
-            div()
-                .relative()
-                .flex()
-                .flex_col()
-                .flex_1()
-                .min_h(px(0.0))
-                .min_w(px(0.0))
-                .children(leaving.map(|page| {
-                    div()
-                        .id("leaving")
-                        .absolute()
-                        .inset_0()
-                        .flex()
-                        .flex_col()
-                        .child(page)
-                        .with_animation(
-                            ("leaving", self.page_generation),
-                            Animation::new(page_time).with_easing(crate::motion::ease_in_out),
-                            |page, t| page.opacity(1.0 - t),
-                        )
-                }))
-                .child(entering)
-                .into_any_element()
-        } else {
-            content
-        };
-        // Settings has its own sidebar; everything else has the library's.
-        let main = if self.screen == Screen::Settings {
-            content
-        } else {
-            div()
-                .flex()
-                .flex_1()
-                .min_h(px(0.0))
-                .child(self.sidebar(cx))
-                .child(
-                    div()
-                        .flex()
-                        .flex_col()
-                        .flex_1()
-                        .min_w(px(0.0))
-                        .child(content),
-                )
-                .into_any_element()
-        };
+        let content = self.crossfade(content, leaving);
+        let main = self.beside_sidebar(content, cx);
+        let pages = self.library_pages.clone();
+        let card_menu = pages.update(cx, |pages, cx| pages.card_menu_view(window, cx));
         div()
             .size_full()
             .relative()
@@ -3242,7 +518,7 @@ impl Render for Shell {
             // Last, so it's drawn over the page.
             .children(self.frost(cx))
             .child(self.header(cx))
-            .children(self.card_menu_view(window, cx))
+            .children(card_menu)
             .into_any_element()
     }
 }

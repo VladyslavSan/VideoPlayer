@@ -1,21 +1,18 @@
-//! Details pages: a movie's page, and the header of a show's page. The
-//! server is asked for overview, genres, ratings, stream names and a large
-//! backdrop when the page opens; local files show what the library knows.
+//! What show and movie pages have in common, whichever view draws them:
+//! the extra information a server has for one (`Details`), the wide image
+//! with the title over it at the top, and the overview under it.
 
 use std::path::PathBuf;
 
 use gpui::{
-    Animation, AnimationExt, AnyElement, ClickEvent, Context, FontWeight, ObjectFit, SharedString,
-    Window, div, img, linear_color_stop, linear_gradient, prelude::*, px, rgb, rgba,
+    Animation, AnimationExt, AnyElement, App, FontWeight, ObjectFit, SharedString, Window, div,
+    img, linear_color_stop, linear_gradient, prelude::*, px, rgb, rgba,
 };
 
-use super::{BG, MUTED, Screen, Shell, TEXT};
-use crate::jellyfin::{Client, ItemInfo};
-use crate::library::{self, Item, Source};
+use super::page_motion::Motion;
+use super::{BG, MUTED};
+use crate::jellyfin::ItemInfo;
 
-/// Width of the backdrop downloaded for a details page.
-const BACKDROP_WIDTH: u32 = 1920;
-const HERO_HEIGHT: f32 = 420.0;
 /// Lower on a show's page, so its seasons are in view.
 pub(super) const SHOW_HERO_HEIGHT: f32 = 280.0;
 
@@ -36,7 +33,7 @@ pub struct Details {
 }
 
 impl Details {
-    fn from_info(info: &ItemInfo, backdrop: Option<PathBuf>) -> Self {
+    pub(super) fn from_info(info: &ItemInfo, backdrop: Option<PathBuf>) -> Self {
         Self {
             overview: info.overview.clone().filter(|o| !o.trim().is_empty()),
             tagline: info.taglines.first().cloned(),
@@ -66,502 +63,164 @@ pub fn format_runtime(seconds: f64) -> String {
     }
 }
 
-/// Fetches the item's info, and its backdrop at full width (cached on disk).
-fn fetch(
-    client: &Client,
-    user_id: &str,
-    item_id: &str,
-    thumbs: &std::path::Path,
-) -> anyhow::Result<Details> {
-    let info = client.item_info(user_id, item_id)?;
-    let backdrop = info.backdrop().and_then(|image| {
-        let path = image.cache_path_width(thumbs, BACKDROP_WIDTH);
-        if !path.exists()
-            && let Err(e) = client.download_image_width(&image, &path, BACKDROP_WIDTH)
-        {
-            eprintln!("[jellyfin] backdrop: {e:#}");
-            return None;
-        }
-        Some(path)
-    });
-    Ok(Details::from_info(&info, backdrop))
+/// Those of `images` loaded and ready to draw, in order. The rest are
+/// asked for (the page is drawn again when they're ready), so each
+/// fades in once it can be seen rather than finishing its fade before.
+pub(super) fn ready_pictures(
+    images: Vec<PathBuf>,
+    window: &mut Window,
+    cx: &mut App,
+) -> Vec<PathBuf> {
+    images
+        .into_iter()
+        .filter(|path| {
+            let source = gpui::Resource::Path(path.as_path().into());
+            window
+                .use_asset::<gpui::ImgResourceLoader>(&source, cx)
+                .is_some_and(|loaded| loaded.is_ok())
+        })
+        .collect()
 }
 
-impl Shell {
-    pub(super) fn open_details(&mut self, key: String, cx: &mut Context<Self>) {
-        self.screen = Screen::Details(key.clone());
-        let item = self.items().find(|i| i.key() == key).cloned();
-        if let Some(item) = item {
-            self.load_details(key, item, false, cx);
+/// The top of a page: a wide image with the title and facts over it.
+pub(super) struct Hero {
+    pub height: f32,
+    /// Bottom to top: a small picture first, the full backdrop once fetched.
+    pub images: Vec<PathBuf>,
+    pub title: String,
+    pub facts: Vec<String>,
+    pub tagline: Option<String>,
+}
+
+/// A wide image with the title and facts over a fade to the background.
+/// The images go bottom to top, each fading in over the ones below when
+/// it arrives, so one never cuts to another.
+pub(super) fn hero(motion: &Motion, hero: Hero) -> AnyElement {
+    let Hero {
+        height,
+        images,
+        title,
+        facts,
+        tagline,
+    } = hero;
+    let layers = images.into_iter().map(|path| {
+        let id = SharedString::from(format!("hero-{}", path.display()));
+        let layer = div()
+            .absolute()
+            .inset_0()
+            .child(img(path).size_full().object_fit(ObjectFit::Cover));
+        if crate::motion::enabled() {
+            layer
+                .with_animation(
+                    id,
+                    Animation::new(crate::motion::PICTURE.time())
+                        .with_easing(crate::motion::ease_in_out),
+                    |layer, t| layer.opacity(t),
+                )
+                .into_any_element()
+        } else {
+            layer.into_any_element()
         }
-        cx.notify();
-    }
-
-    /// Loads details for an item (`for_show = false`) or for the show an
-    /// episode belongs to, stored under `key`. Local files have no extra
-    /// details, and each key is only fetched once per session.
-    pub(super) fn load_details(
-        &mut self,
-        key: String,
-        item: Item,
-        for_show: bool,
-        cx: &mut Context<Self>,
-    ) {
-        let Source::Jellyfin { server, id } = &item.source else {
-            return;
-        };
-        if self.details.contains_key(&key) || !self.details_loading.insert(key.clone()) {
-            return;
-        }
-        let (Some(client), Some(user_id)) = (
-            self.client(*server),
-            self.servers
-                .iter()
-                .find(|s| s.id == *server)
-                .map(|s| s.user_id.clone()),
-        ) else {
-            self.details_loading.remove(&key);
-            return;
-        };
-        let id = id.clone();
-        let thumbs = self.paths.thumbs.clone();
-        cx.spawn(async move |this, cx| {
-            let result = cx
-                .background_executor()
-                .spawn(async move {
-                    let target = if for_show {
-                        // An episode knows its series; the series has the overview.
-                        client.item_info(&user_id, &id)?.series_id.unwrap_or(id)
-                    } else {
-                        id
-                    };
-                    fetch(&client, &user_id, &target, &thumbs)
-                })
-                .await;
-            this.update(cx, |this, cx| {
-                this.details_loading.remove(&key);
-                match result {
-                    Ok(details) => {
-                        this.details.insert(key.clone(), details);
-                        // A show's page can now find it in Sonarr.
-                        if let Some(show) = key.strip_prefix("show:") {
-                            this.load_sonarr(show.to_string(), cx);
-                        }
-                    }
-                    Err(e) => eprintln!("[jellyfin] details: {e:#}"),
-                }
-                cx.notify();
-            })
-            .ok();
-        })
-        .detach();
-    }
-
-    pub(super) fn action_button(
-        id: impl Into<gpui::ElementId>,
-        label: impl Into<SharedString>,
-        primary: bool,
-        cx: &mut Context<Self>,
-        action: impl Fn(&mut Self, &mut Window, &mut Context<Self>) + 'static,
-    ) -> AnyElement {
-        div()
-            .id(id.into())
-            .px_5()
-            .py_2()
-            .rounded_full()
-            .font_weight(FontWeight::SEMIBOLD)
-            .cursor_pointer()
-            .bg(rgba(if primary { 0xf4f5f7ff } else { 0xffffff1f }))
-            .text_color(rgb(if primary { 0x101218 } else { TEXT }))
-            .hover(|s| s.opacity(0.85))
-            .child(label.into())
-            .on_click(cx.listener(move |this, _: &ClickEvent, window, cx| action(this, window, cx)))
-            .into_any_element()
-    }
-
-    /// Those of `images` loaded and ready to draw, in order. The rest are
-    /// asked for (the page is drawn again when they're ready), so each
-    /// fades in once it can be seen rather than finishing its fade before.
-    pub(super) fn ready_pictures(
-        images: Vec<PathBuf>,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) -> Vec<PathBuf> {
-        images
-            .into_iter()
-            .filter(|path| {
-                let source = gpui::Resource::Path(path.as_path().into());
-                window
-                    .use_asset::<gpui::ImgResourceLoader>(&source, cx)
-                    .is_some_and(|loaded| loaded.is_ok())
-            })
-            .collect()
-    }
-
-    /// A wide image with the title and facts over a fade to the background.
-    /// `images` go bottom to top, each fading in over the ones below when
-    /// it arrives (a small picture first, the full backdrop once fetched),
-    /// so one never cuts to another.
-    pub(super) fn hero(
-        &self,
-        height: f32,
-        images: Vec<PathBuf>,
-        title: String,
-        facts: Vec<String>,
-        tagline: Option<String>,
-    ) -> AnyElement {
-        let layers = images.into_iter().map(|path| {
-            let id = SharedString::from(format!("hero-{}", path.display()));
-            let layer = div()
+    });
+    div()
+        .relative()
+        .w_full()
+        .h(px(height))
+        .mt_2()
+        .rounded_2xl()
+        .overflow_hidden()
+        .bg(rgb(0x1a1d26))
+        .children(layers)
+        .child(div().absolute().inset_0().bg(linear_gradient(
+            180.0,
+            linear_color_stop(rgba(BG << 8), 0.3),
+            linear_color_stop(rgba((BG << 8) | 0xf2), 1.0),
+        )))
+        .child(
+            div()
                 .absolute()
-                .inset_0()
-                .child(img(path).size_full().object_fit(ObjectFit::Cover));
-            if crate::motion::enabled() {
-                layer
-                    .with_animation(
-                        id,
-                        Animation::new(crate::motion::PICTURE.time())
-                            .with_easing(crate::motion::ease_in_out),
-                        |layer, t| layer.opacity(t),
+                .left_8()
+                .right_8()
+                .bottom_8()
+                .flex()
+                .flex_col()
+                .child(div().text_3xl().font_weight(FontWeight::BOLD).child(title))
+                // Details arriving add to the facts and bring a tagline:
+                // the facts dissolve into the longer ones, and the room
+                // for the tagline opens up (the title rising) as it
+                // fades in.
+                .when(!facts.is_empty(), |d| {
+                    d.child(
+                        motion.changing_text("hero-facts", facts.join("  ·  "), |facts| {
+                            div()
+                                .pt_2()
+                                .text_sm()
+                                .text_color(rgb(0xc9ceda))
+                                .child(facts)
+                        }),
                     )
-                    .into_any_element()
-            } else {
-                layer.into_any_element()
-            }
-        });
-        div()
-            .relative()
-            .w_full()
-            .h(px(height))
-            .mt_2()
-            .rounded_2xl()
-            .overflow_hidden()
-            .bg(rgb(0x1a1d26))
-            .children(layers)
-            .child(div().absolute().inset_0().bg(linear_gradient(
-                180.0,
-                linear_color_stop(rgba(BG << 8), 0.3),
-                linear_color_stop(rgba((BG << 8) | 0xf2), 1.0),
-            )))
-            .child(
-                div()
-                    .absolute()
-                    .left_8()
-                    .right_8()
-                    .bottom_8()
-                    .flex()
-                    .flex_col()
-                    .child(div().text_3xl().font_weight(FontWeight::BOLD).child(title))
-                    // Details arriving add to the facts and bring a tagline:
-                    // the facts dissolve into the longer ones, and the room
-                    // for the tagline opens up (the title rising) as it
-                    // fades in.
-                    .when(!facts.is_empty(), |d| {
-                        d.child(
-                            self.changing_text("hero-facts", facts.join("  ·  "), |facts| {
+                })
+                .child(
+                    motion.resizing(
+                        "hero-tagline",
+                        match tagline {
+                            Some(tagline) => motion.arriving(
+                                "hero-tagline",
                                 div()
                                     .pt_2()
                                     .text_sm()
-                                    .text_color(rgb(0xc9ceda))
-                                    .child(facts)
-                            }),
-                        )
-                    })
-                    .child(
-                        self.resizing(
-                            "hero-tagline",
-                            match tagline {
-                                Some(tagline) => self.arriving(
-                                    "hero-tagline",
-                                    div()
-                                        .pt_2()
-                                        .text_sm()
-                                        .italic()
-                                        .text_color(rgb(MUTED))
-                                        .child(tagline),
-                                ),
-                                None => div().into_any_element(),
-                            },
-                        ),
+                                    .italic()
+                                    .text_color(rgb(MUTED))
+                                    .child(tagline),
+                            ),
+                            None => div().into_any_element(),
+                        },
                     ),
-            )
-            .into_any_element()
-    }
-
-    pub(super) fn facts(
-        item_year: Option<u16>,
-        duration: Option<f64>,
-        details: Option<&Details>,
-    ) -> Vec<String> {
-        let mut facts = Vec::new();
-        facts.extend(item_year.map(|y| y.to_string()));
-        facts.extend(duration.filter(|d| *d > 0.0).map(format_runtime));
-        if let Some(d) = details {
-            facts.extend(d.official_rating.clone());
-            facts.extend(d.rating.map(|r| format!("★ {r:.1}")));
-            if !d.genres.is_empty() {
-                facts.push(
-                    d.genres
-                        .iter()
-                        .take(3)
-                        .cloned()
-                        .collect::<Vec<_>>()
-                        .join(", "),
-                );
-            }
-        }
-        facts
-    }
-
-    /// The item's overview; `lines` limits it (a show's page keeps it short
-    /// so the seasons follow soon).
-    pub(super) fn overview(
-        &self,
-        details: Option<&Details>,
-        loading: bool,
-        lines: Option<usize>,
-    ) -> Option<AnyElement> {
-        let paragraph = |text: SharedString, color: u32| {
-            div()
-                .pt_6()
-                .max_w(px(780.0))
-                .line_height(px(24.0))
-                .text_color(rgb(color))
-                .when_some(lines, |d, lines| d.line_clamp(lines))
-                .child(text)
-        };
-        let note = || paragraph("Loading details…".into(), MUTED);
-        // From one line to several: the box grows to fit, not in one jump.
-        let text = match details.and_then(|d| d.overview.clone()) {
-            Some(text) => self.arriving_over(
-                "overview-loading",
-                note(),
-                "overview",
-                paragraph(text.into(), 0xd5d9e3),
-            ),
-            None if loading => self.waiting("overview-loading", note()),
-            None => return None,
-        };
-        Some(self.resizing("overview-box", text))
-    }
-
-    fn info_row(label: &str, values: Vec<String>) -> Option<AnyElement> {
-        if values.is_empty() {
-            return None;
-        }
-        Some(
-            div()
-                .flex()
-                .gap_6()
-                .child(
-                    div()
-                        .w(px(110.0))
-                        .flex_none()
-                        .text_sm()
-                        .text_color(rgb(MUTED))
-                        .child(label.to_string()),
-                )
-                .child(div().flex().flex_col().gap_1().text_sm().children(values))
-                .into_any_element(),
+                ),
         )
-    }
+        .into_any_element()
+}
 
-    pub(super) fn details_page(
-        &self,
-        key: &str,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) -> Vec<AnyElement> {
-        let Some(item) = self.items().find(|i| i.key() == key) else {
-            return vec![
-                div()
-                    .pt_10()
-                    .text_color(rgb(MUTED))
-                    .child("This item is no longer in the library.")
-                    .into_any_element(),
-            ];
-        };
-        let details = self.details.get(key);
-        let loading = self.details_loading.contains(key);
-        let mut images: Vec<PathBuf> = item
-            .thumb
-            .iter()
-            .chain(details.and_then(|d| d.backdrop.as_ref()))
-            .cloned()
-            .collect();
-        images.dedup();
-        let images = Self::ready_pictures(images, window, cx);
-        let mut page = vec![self.hero(
-            HERO_HEIGHT,
-            images,
-            item.title.clone(),
-            Self::facts(item.year, item.duration, details),
-            details.and_then(|d| d.tagline.clone()),
-        )];
+/// An item's overview, as a page shows it.
+#[derive(Default)]
+pub(super) struct Overview<'a> {
+    pub details: Option<&'a Details>,
+    /// The details are being fetched: a note says so until they're here.
+    pub loading: bool,
+    /// The most lines shown (a show's page keeps it short so the seasons
+    /// follow soon); None for all of it.
+    pub lines: Option<usize>,
+}
 
-        let play_key = key.to_string();
-        let resume = item.progress().is_some();
-        let play_label = match (resume, item.duration) {
-            (true, Some(d)) => format!(
-                "▶  Resume · {} left",
-                format_runtime((d - item.position).max(0.0))
-            ),
-            (true, None) => "▶  Resume".into(),
-            (false, _) => "▶  Play".into(),
-        };
-        let restart_key = key.to_string();
-        let watched_key = key.to_string();
-        let watched = item.watched;
-        page.push(
-            div()
-                .flex()
-                .items_center()
-                .gap_3()
-                .pt_5()
-                .child(Self::action_button(
-                    "details-play",
-                    play_label,
-                    true,
-                    cx,
-                    move |this, window, cx| this.play(&play_key, window, cx),
-                ))
-                .when(resume, |d| {
-                    d.child(Self::action_button(
-                        "details-restart",
-                        "Play from beginning",
-                        false,
-                        cx,
-                        move |this, window, cx| this.play_from_start(&restart_key, window, cx),
-                    ))
-                })
-                .child(Self::action_button(
-                    "details-watched",
-                    if watched {
-                        "Mark as unwatched"
-                    } else {
-                        "Mark as watched"
-                    },
-                    false,
-                    cx,
-                    move |this, _, cx| {
-                        this.mark_watched(std::slice::from_ref(&watched_key), !watched, cx)
-                    },
-                ))
-                .into_any_element(),
-        );
-        page.extend(self.overview(details, loading, None));
-
-        let mut info = Vec::new();
-        if let Some(d) = details {
-            info.extend(Self::info_row("Video", d.video.clone()));
-            info.extend(Self::info_row("Audio", d.audio.clone()));
-            info.extend(Self::info_row("Subtitles", d.subtitles.clone()));
-        }
-        if let Source::Local { path, .. } = &item.source {
-            info.extend(Self::info_row("File", vec![path.display().to_string()]));
-        }
-        if !info.is_empty() {
-            page.push(self.arriving(
-                format!("details-info-{}", details.is_some()),
-                div().flex().flex_col().gap_3().pt_8().children(info),
-            ));
-        }
-        page
-    }
-
-    /// The episode to play from a show's page: next up if the show is being
-    /// watched, else something in progress, else the first unwatched
-    /// episode, else the first one.
-    pub(super) fn next_episode(&self, show: &str) -> Option<&Item> {
-        let mut ordered: Vec<&Item> = self
-            .items()
-            .filter(|i| i.show.as_deref() == Some(show))
-            .collect();
-        ordered.sort_by_key(|e| e.watch_order());
-        library::next_up(ordered.iter().copied())
-            .into_iter()
-            .map(|(_, e)| e)
-            .next()
-            .or_else(|| {
-                ordered
-                    .iter()
-                    .copied()
-                    .filter(|e| e.progress().is_some())
-                    .max_by_key(|e| e.last_played)
-            })
-            .or_else(|| ordered.iter().copied().find(|e| !e.watched))
-            .or_else(|| ordered.first().copied())
-    }
-
-    /// The top of a show's page: backdrop, facts, overview, and a button for
-    /// the episode to watch next.
-    pub(super) fn show_header(
-        &self,
-        show: &str,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) -> AnyElement {
-        let key = format!("show:{show}");
-        let details = self.details.get(&key);
-        let loading = self.details_loading.contains(&key);
-        let episodes: Vec<&Item> = self
-            .items()
-            .filter(|i| i.show.as_deref() == Some(show))
-            .collect();
-        let image = match details.and_then(|d| d.backdrop.clone()) {
-            Some(backdrop) => Some(backdrop),
-            None if loading => None,
-            None => episodes.iter().find_map(|e| e.thumb.clone()),
-        };
-        let mut facts = vec![format!("{} episodes", episodes.len())];
-        facts.extend(Self::facts(None, None, details));
-
-        let next = self.next_episode(show);
-
+/// The item's overview, if it has one or it's on its way.
+pub(super) fn overview(motion: &Motion, overview: Overview<'_>) -> Option<AnyElement> {
+    let Overview {
+        details,
+        loading,
+        lines,
+    } = overview;
+    let paragraph = |text: SharedString, color: u32| {
         div()
-            .flex()
-            .flex_col()
-            .child(self.hero(
-                SHOW_HERO_HEIGHT,
-                Self::ready_pictures(image.into_iter().collect(), window, cx),
-                show.to_string(),
-                facts,
-                None,
-            ))
-            .children(next.map(|episode| {
-                let key = episode.key();
-                let verb = if episode.progress().is_some() {
-                    "Resume"
-                } else {
-                    "Play"
-                };
-                let label = match episode.episode_label() {
-                    Some(l) => format!("▶  {verb} {l}"),
-                    None => format!("▶  {verb} {}", episode.title),
-                };
-                div()
-                    .flex()
-                    .items_center()
-                    .gap_4()
-                    .pt_5()
-                    .child(Self::action_button(
-                        "show-play",
-                        label,
-                        true,
-                        cx,
-                        move |this, window, cx| this.play(&key, window, cx),
-                    ))
-                    .child(
-                        div()
-                            .text_sm()
-                            .text_color(rgb(MUTED))
-                            .child(episode.title.clone()),
-                    )
-                    .into_any_element()
-            }))
-            .children(self.overview(details, loading, Some(3)))
-            .into_any_element()
-    }
+            .pt_6()
+            .max_w(px(780.0))
+            .line_height(px(24.0))
+            .text_color(rgb(color))
+            .when_some(lines, |d, lines| d.line_clamp(lines))
+            .child(text)
+    };
+    let note = || paragraph("Loading details…".into(), MUTED);
+    // From one line to several: the box grows to fit, not in one jump.
+    let text = match details.and_then(|d| d.overview.clone()) {
+        Some(text) => motion.arriving_over(
+            "overview-loading",
+            note(),
+            "overview",
+            paragraph(text.into(), 0xd5d9e3),
+        ),
+        None if loading => motion.waiting("overview-loading", note()),
+        None => return None,
+    };
+    Some(motion.resizing("overview-box", text))
 }
 
 #[cfg(test)]

@@ -13,12 +13,16 @@ use ureq::Agent;
 
 mod activity;
 mod add;
+pub mod connections;
+pub mod downloads;
 mod library;
 mod metadata;
 mod picture;
 mod seasons;
 pub use activity::{Download, Event, Recent, State as DownloadState, Subject};
 pub use add::{AddOptions, Candidate, Monitor, Setup};
+#[cfg(test)]
+pub use add::{Habits, RootFolder, Tag};
 pub use library::{Art, Have, Tracked};
 pub use metadata::{Collection, CollectionMovie, MetaEpisode, show_episodes};
 pub use picture::readable;

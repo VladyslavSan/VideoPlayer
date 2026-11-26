@@ -2,7 +2,7 @@ use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::Path;
 use std::sync::Mutex;
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context as _, Result, bail};
 use serde::de::DeserializeOwned;
@@ -14,7 +14,7 @@ use super::{
     PublicInfo, Server, UserData, seconds_to_ticks, ticks_to_seconds,
 };
 use crate::introdb;
-use crate::library::Library;
+use crate::library::Section;
 use crate::video::Segment;
 
 const CLIENT_NAME: &str = "VideoPlayer";
@@ -101,6 +101,22 @@ struct PlaybackReportBody<'a> {
 pub struct PlaySession {
     pub id: String,
     pub transcoding: bool,
+}
+
+impl PlaySession {
+    /// A fresh id for a play session.
+    pub fn new_id() -> String {
+        use std::hash::{BuildHasher, RandomState};
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or_default();
+        format!(
+            "{:016x}{:016x}",
+            RandomState::new().hash_one(nanos),
+            RandomState::new().hash_one(std::process::id())
+        )
+    }
 }
 
 impl Client {
@@ -241,7 +257,7 @@ impl Client {
                 continue;
             }
             let episodes = found.iter().filter(|i| i.kind == "Episode").count();
-            let library = Library {
+            let library = Section {
                 name: view.name.clone(),
                 order,
                 shows: match view.collection_type.as_deref() {

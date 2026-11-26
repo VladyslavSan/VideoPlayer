@@ -1,10 +1,8 @@
 //! Fading the player's overlays in and out, so nothing on it pops.
 //!
-//! The overlays come and go with the mouse, and often turn back halfway
-//! (the bar starts fading out, the mouse moves): a `Fade` (`motion`) eases from
-//! wherever it is to where it's going, so a reversal never jumps. Its value
-//! is computed from the clock when the player draws; the player keeps
-//! drawing every frame while one is on its way (`moving`).
+//! Overlays often turn back halfway (the bar starts fading out, the mouse moves): a
+//! `Fade` (`motion`) eases from wherever it is, so a reversal never jumps. Its value comes
+//! from the clock when the player draws, which it does every frame while one is `moving`.
 
 use std::cell::RefCell;
 use std::collections::HashMap;
@@ -14,7 +12,92 @@ use gpui::{
     Animation, AnimationExt, AnyElement, IntoElement, ParentElement, SharedString, Styled, div,
 };
 
+use super::panels::Panel;
 use crate::motion::{Fade, OVERLAY, ease_in_out};
+
+/// What the up-next card last showed: its countdown, and whether the video
+/// had ended (rather than being in its credits).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct UpNextShown {
+    pub seconds: u64,
+    pub ended: bool,
+}
+
+/// What things that come and go last showed: drawn so while they fade out.
+pub struct LastShown {
+    pub up_next: UpNextShown,
+    /// The skip button's label.
+    pub skip: &'static str,
+    /// The last speed other than normal, for the speed chip.
+    pub speed: f64,
+}
+
+/// The player's overlays, each fading in and out.
+pub struct Fades {
+    /// The control bar and the title.
+    pub controls: Fade,
+    /// Each panel, by `Panel::index`.
+    panels: [Fade; 3],
+    pub up_next: Fade,
+    pub skip: Fade,
+    /// The seek bar's time preview (and the bar thickening under it).
+    pub preview: Fade,
+    /// The speed chip in the control bar, when not at normal speed.
+    pub speed: Fade,
+    /// The video, as the black backdrop lifts off it.
+    pub video: Fade,
+    pub shown: LastShown,
+    /// Icons and values that dissolve when they change.
+    pub swaps: Swaps,
+}
+
+impl Fades {
+    pub fn new() -> Self {
+        Self {
+            controls: Fade::new(true),
+            panels: [Fade::new(false); 3],
+            up_next: Fade::new(false),
+            skip: Fade::new(false),
+            preview: Fade::new(false),
+            speed: Fade::new(false),
+            video: Fade::new(false),
+            shown: LastShown {
+                up_next: UpNextShown {
+                    seconds: 0,
+                    ended: false,
+                },
+                skip: "",
+                speed: 1.0,
+            },
+            swaps: Swaps::default(),
+        }
+    }
+
+    pub fn panel(&self, panel: Panel) -> &Fade {
+        &self.panels[panel.index()]
+    }
+
+    /// Points each panel's fade at whether it is the one open.
+    pub fn set_open_panel(&mut self, open: Option<Panel>) {
+        for panel in Panel::ALL {
+            self.panels[panel.index()].set(open == Some(panel));
+        }
+    }
+
+    pub fn moving(&self) -> bool {
+        [
+            &self.controls,
+            &self.up_next,
+            &self.skip,
+            &self.preview,
+            &self.speed,
+            &self.video,
+        ]
+        .into_iter()
+        .chain(&self.panels)
+        .any(Fade::moving)
+    }
+}
 
 /// Short notes in one place ("Volume 80%", "Loading…"): a new one fades
 /// in over the one before as that fades out.

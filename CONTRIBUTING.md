@@ -15,8 +15,8 @@ bug, however small or brief.
   animation, not a cut: pages crossfade in place (nothing slides or rises in), sections fold,
   overlays and bars fade. State that swaps in place (a poster loading, a badge changing) fades
   rather than pops. Something
-  that loads after its page opened fades in (`Shell::arriving`), and a "Loading…" note waits a
-  moment before fading in (`Shell::waiting`), so a quick answer never flashes one.
+  that loads after its page opened fades in (`Motion::arriving`), and a "Loading…" note waits a
+  moment before fading in (`Motion::waiting`), so a quick answer never flashes one.
 - **Standard timings.** Use the timings in `src/motion.rs` (`PAGE.time()`, `FOLD.time()`, …)
   and its easings, and add a named one there for a new kind of motion instead of a literal in
   place, so every timing is tuned in one file. They're 350 ms for now, easing in and out

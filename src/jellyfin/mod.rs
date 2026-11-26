@@ -13,7 +13,7 @@ use serde::{Deserialize, Serialize};
 
 pub use client::{Client, PlaySession, PlaybackReport, is_offline};
 
-use crate::library::{Item, Library, Source};
+use crate::library::{Item, Section, Source};
 use crate::video::{ExternalSubtitle, Segment, SegmentKind};
 
 const TICKS_PER_SECOND: f64 = 10_000_000.0;
@@ -105,7 +105,7 @@ pub struct BaseItem {
         rename = "VideoPlayerLibrary",
         skip_serializing_if = "Option::is_none"
     )]
-    pub library: Option<Library>,
+    pub library: Option<Section>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Deserialize, Serialize)]

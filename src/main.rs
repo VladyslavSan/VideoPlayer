@@ -24,7 +24,8 @@ use gpui::{
     App, Application, Bounds, KeyBinding, Menu, MenuItem, TitlebarOptions, WindowBounds,
     WindowOptions, actions, prelude::*, px, size,
 };
-use shell::{Paths, Shell};
+use library::Paths;
+use shell::Shell;
 
 actions!(video_player, [Quit]);
 

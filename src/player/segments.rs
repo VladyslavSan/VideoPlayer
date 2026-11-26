@@ -64,23 +64,39 @@ pub fn chapter_label(title: &str) -> Option<&str> {
     (!placeholder).then_some(title)
 }
 
+/// A chapter of the file: its name and where it starts, in seconds.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Chapter {
+    pub title: String,
+    pub start: f64,
+}
+
+impl Chapter {
+    /// The chapters as mpv lists them (title, start), in order.
+    pub fn list(read: Vec<(String, f64)>) -> Vec<Chapter> {
+        read.into_iter()
+            .map(|(title, start)| Chapter { title, start })
+            .collect()
+    }
+}
+
 /// The chapter playing at `time`: the last one starting at or before it.
-pub fn chapter_at(chapters: &[(String, f64)], time: f64) -> Option<&(String, f64)> {
-    chapters.iter().rev().find(|(_, start)| *start <= time)
+pub fn chapter_at(chapters: &[Chapter], time: f64) -> Option<&Chapter> {
+    chapters.iter().rev().find(|chapter| chapter.start <= time)
 }
 
 /// Segments for recognised chapters; each runs until the next chapter
 /// (or the end of the video).
-pub fn from_chapters(chapters: &[(String, f64)], duration: f64) -> Vec<Segment> {
+pub fn from_chapters(chapters: &[Chapter], duration: f64) -> Vec<Segment> {
     chapters
         .iter()
         .enumerate()
-        .filter_map(|(i, (title, start))| {
-            let kind = kind_of_chapter(title)?;
-            let end = chapters.get(i + 1).map_or(duration, |(_, t)| *t);
-            (end > *start).then_some(Segment {
+        .filter_map(|(i, chapter)| {
+            let kind = kind_of_chapter(&chapter.title)?;
+            let end = chapters.get(i + 1).map_or(duration, |next| next.start);
+            (end > chapter.start).then_some(Segment {
                 kind,
-                start: *start,
+                start: chapter.start,
                 end,
             })
         })
@@ -163,23 +179,21 @@ mod tests {
 
     #[test]
     fn chapter_at_a_time() {
-        let chapters = vec![("A".to_string(), 0.0), ("B".to_string(), 100.0)];
-        assert_eq!(chapter_at(&chapters, 50.0).map(|c| c.0.as_str()), Some("A"));
-        assert_eq!(
-            chapter_at(&chapters, 100.0).map(|c| c.0.as_str()),
-            Some("B")
-        );
+        let chapters = Chapter::list(vec![("A".to_string(), 0.0), ("B".to_string(), 100.0)]);
+        let title_at = |time| chapter_at(&chapters, time).map(|c| c.title.as_str());
+        assert_eq!(title_at(50.0), Some("A"));
+        assert_eq!(title_at(100.0), Some("B"));
         assert_eq!(chapter_at(&[], 5.0), None);
     }
 
     #[test]
     fn chapters_become_segments() {
-        let chapters = vec![
+        let chapters = Chapter::list(vec![
             ("Prologue".to_string(), 0.0),
             ("Opening".to_string(), 90.0),
             ("Part A".to_string(), 180.0),
             ("Ending".to_string(), 1300.0),
-        ];
+        ]);
         assert_eq!(
             from_chapters(&chapters, 1420.0),
             vec![
