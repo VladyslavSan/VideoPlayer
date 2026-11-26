@@ -48,6 +48,7 @@ mod reports;
 mod resize;
 mod settings;
 mod sonarr;
+mod sound_settings;
 mod sync;
 mod tracked_page;
 mod watched;
@@ -1604,6 +1605,8 @@ impl Shell {
         };
         self.error = None;
         let volume = self.saved_volume();
+        let sound_on = self.sound_on();
+        let sound = self.sound_settings();
         let controls = self.controls();
         if self.media.is_none() && crate::test_window::media_controls() {
             match MediaSession::new(window) {
@@ -1624,6 +1627,7 @@ impl Shell {
         let view = cx.new(|cx| {
             let mut player = Player::new(video, playback, volume, media, window, cx);
             player.set_controls(controls);
+            player.start_sound(sound_on, sound);
             if let Some(previews) = previews {
                 player.set_previews(previews);
             }
@@ -1683,6 +1687,7 @@ impl Shell {
                 cx.notify();
             }
             PlayerEvent::QualityChosen(quality) => self.change_quality(*quality, cx),
+            PlayerEvent::SoundChosen(on, profile) => self.sound_chosen(*on, *profile),
             PlayerEvent::AudioChosen(lang) => {
                 for scope in self.pref_scopes() {
                     if let Err(e) = self.db.save_audio_pref(&scope, lang) {

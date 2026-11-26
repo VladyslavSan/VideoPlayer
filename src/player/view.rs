@@ -4,7 +4,7 @@
 use std::time::Instant;
 
 use gpui::{
-    AnyElement, ClickEvent, Context, CursorStyle, ElementId, FontWeight, MouseButton,
+    AnyElement, ClickEvent, Context, CursorStyle, Div, ElementId, FontWeight, MouseButton,
     MouseDownEvent, ObjectFit, SharedString, Window, canvas, div, img, prelude::*, px, relative,
     rgb, rgba, svg,
 };
@@ -13,7 +13,7 @@ use super::{Panel, Player, TOAST_DURATION, segments, tracks};
 use crate::jellyfin::{QUALITIES, Quality};
 use crate::ui::icons::{Icon, icon};
 use crate::ui::menu;
-use crate::video::TrackKind;
+use crate::video::{SoundProfile, TrackKind};
 
 const TEXT: u32 = 0xf4f5f7;
 const MUTED: u32 = 0x9aa3b2;
@@ -720,18 +720,66 @@ impl Player {
                 }),
             ));
         }
+        Self::menu_option("Streaming quality", picker)
+    }
+
+    /// "Sound filter" with a button that opens a menu: off, the presets
+    /// and the custom tunings.
+    fn sound_picker(&self, window: &Window, cx: &mut Context<Self>) -> AnyElement {
+        let current = self.sound_choice();
+        let label = current.map_or_else(|| "Off".to_string(), |profile| profile.label());
+        let lit = self.sound_menu.lit(|_| true);
+        let mut picker = div().relative().flex().child(
+            menu::trigger(
+                "sound",
+                self.swaps.draw("sound", label, |label| div().child(label)),
+                lit,
+            )
+            .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
+                if !this.sound_menu.close() {
+                    this.sound_menu.open(current);
+                }
+                this.poke(cx);
+            })),
+        );
+        for shown in self.sound_menu.drawn() {
+            let choices = std::iter::once(None).chain(SoundProfile::ALL.map(Some));
+            let items = choices
+                .enumerate()
+                .map(|(i, choice)| {
+                    let label = choice.map_or_else(|| "Off".to_string(), |p| p.label());
+                    menu::item(("sound-choice", i), label, choice == *shown.value)
+                        .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
+                            this.choose_sound(choice, cx);
+                            this.poke(cx);
+                        }))
+                        .into_any_element()
+                })
+                .collect();
+            picker = picker.child(menu::popup(
+                &shown,
+                true,
+                items,
+                window,
+                cx.listener(|this, _: &MouseDownEvent, _, cx| {
+                    this.sound_menu.close();
+                    this.poke(cx);
+                }),
+            ));
+        }
+        Self::menu_option("Sound filter", picker)
+    }
+
+    /// An option in the tracks panel that's picked from a menu: its name
+    /// over the button.
+    fn menu_option(title: &'static str, picker: Div) -> AnyElement {
         div()
             .flex()
             .flex_col()
             .gap_1()
             .px_2()
             .py_1()
-            .child(
-                div()
-                    .text_xs()
-                    .text_color(rgb(MUTED))
-                    .child("Streaming quality"),
-            )
+            .child(div().text_xs().text_color(rgb(MUTED)).child(title))
             .child(picker)
             .into_any_element()
     }
@@ -808,6 +856,7 @@ impl Player {
             ),
         ];
         let mut options = options;
+        options.push(self.sound_picker(window, cx));
         if let Some(quality) = self.quality {
             options.push(self.quality_picker(quality, window, cx));
         }
@@ -1392,9 +1441,11 @@ impl Player {
 impl Render for Player {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let visible = self.controls_visible();
-        // The quality menu lives in the tracks panel and closes with it.
+        // The quality and sound menus live in the tracks panel and close
+        // with it.
         if self.panel != Some(Panel::Tracks) {
             self.quality_menu.close();
+            self.sound_menu.close();
         }
         self.update_fades(window);
 

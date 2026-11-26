@@ -127,11 +127,11 @@ impl Range {
         step: 0.01,
     };
 
-    fn fraction(self, value: f32) -> f32 {
+    pub(super) fn fraction(self, value: f32) -> f32 {
         ((value - self.min) / (self.max - self.min)).clamp(0.0, 1.0)
     }
 
-    fn at(self, fraction: f32) -> f32 {
+    pub(super) fn at(self, fraction: f32) -> f32 {
         let value = self.min + fraction.clamp(0.0, 1.0) * (self.max - self.min);
         ((value / self.step).round() * self.step).clamp(self.min, self.max)
     }
@@ -210,9 +210,13 @@ impl Shell {
             .rounded_lg()
             .bg(rgba(0xffffff0a))
             .child(
+                // Takes the room the track leaves, so a long description
+                // wraps (and the row grows) instead of being measured as
+                // one line and spilling over what follows.
                 div()
                     .flex()
                     .flex_col()
+                    .flex_1()
                     .gap_1()
                     .min_w(px(0.0))
                     .child(div().font_weight(FontWeight::MEDIUM).child(title.into()))

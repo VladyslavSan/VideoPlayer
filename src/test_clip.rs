@@ -8,13 +8,31 @@ use tempfile::TempDir;
 /// A 5 s, 320x240 clip with sound, made with `ffmpeg`. `None` (with the
 /// reason printed) when `ffmpeg` can't be run, so the test is skipped.
 pub fn make() -> Option<(TempDir, PathBuf)> {
+    make_with(&["-c:a", "aac"], "clip.mp4")
+}
+
+/// The same with 5.1 sound (a tone in every channel).
+pub fn make_surround() -> Option<(TempDir, PathBuf)> {
+    make_with(
+        &[
+            "-af",
+            "pan=5.1|c0=c0|c1=c0|c2=c0|c3=c0|c4=c0|c5=c0",
+            "-c:a",
+            "flac",
+        ],
+        "surround.mkv",
+    )
+}
+
+fn make_with(audio: &[&str], name: &str) -> Option<(TempDir, PathBuf)> {
     let dir = tempfile::tempdir().ok()?;
-    let path = dir.path().join("clip.mp4");
+    let path = dir.path().join(name);
     let made = Command::new("ffmpeg")
         .args(["-v", "error", "-f", "lavfi", "-i"])
         .arg("testsrc=duration=5:size=320x240:rate=25")
         .args(["-f", "lavfi", "-i", "sine=duration=5"])
-        .args(["-c:v", "libx264", "-pix_fmt", "yuv420p", "-c:a", "aac"])
+        .args(["-c:v", "libx264", "-pix_fmt", "yuv420p"])
+        .args(audio)
         .arg(&path)
         .stdin(Stdio::null())
         .status();

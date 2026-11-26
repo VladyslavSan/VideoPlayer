@@ -28,6 +28,10 @@ pub enum Action {
     Faster,
     SubtitlesEarlier,
     SubtitlesLater,
+    /// The sound filter on or off (night mode, as it was called: keys
+    /// saved then still load).
+    #[serde(alias = "NightMode")]
+    SoundFilter,
     Fullscreen,
     NextEpisode,
     EpisodesPanel,
@@ -38,7 +42,7 @@ pub enum Action {
 impl Action {
     /// In the order keys are tried: the skip first, since it only applies
     /// while offered.
-    pub const ALL: [Action; 21] = [
+    pub const ALL: [Action; 22] = [
         Action::Skip,
         Action::PlayPause,
         Action::Back,
@@ -55,6 +59,7 @@ impl Action {
         Action::Faster,
         Action::SubtitlesEarlier,
         Action::SubtitlesLater,
+        Action::SoundFilter,
         Action::Fullscreen,
         Action::NextEpisode,
         Action::EpisodesPanel,
@@ -80,6 +85,7 @@ impl Action {
             Action::Faster => "Faster",
             Action::SubtitlesEarlier => "Subtitles earlier",
             Action::SubtitlesLater => "Subtitles later",
+            Action::SoundFilter => "Sound filter on or off (the one last picked)",
             Action::Fullscreen => "Fullscreen",
             Action::NextEpisode => "Next episode",
             Action::EpisodesPanel => "Episodes",
@@ -111,6 +117,7 @@ impl Action {
             Action::Faster => &["]"],
             Action::SubtitlesEarlier => &["z"],
             Action::SubtitlesLater => &["x"],
+            Action::SoundFilter => &["shift-n"],
             Action::Fullscreen => &["f"],
             Action::NextEpisode => &["n"],
             Action::EpisodesPanel => &["e"],
@@ -320,6 +327,16 @@ mod tests {
         assert_eq!(loaded.keys(Action::NextMark), ["ctrl-right"]);
         assert_eq!(loaded.back_seconds, 5.0);
         assert_eq!(Controls::from_json("not json"), Controls::default());
+    }
+
+    #[test]
+    fn night_mode_keys_carry_over_to_the_sound_filter() {
+        let saved = Controls::default()
+            .to_json()
+            .replace(r#""SoundFilter":["shift-n"]"#, r#""NightMode":["ctrl-n"]"#);
+        assert!(saved.contains("NightMode"), "{saved}");
+        let loaded = Controls::from_json(&saved);
+        assert_eq!(loaded.keys(Action::SoundFilter), ["ctrl-n"]);
     }
 
     #[test]

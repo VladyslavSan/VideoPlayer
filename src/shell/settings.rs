@@ -4,14 +4,21 @@
 //! Appearance holds how bright posters are (`posters.rs`).
 
 use gpui::{
-    AnyElement, ClickEvent, Context, Focusable, FontWeight, SharedString, Window, div, prelude::*,
-    px, rgb, rgba,
+    Animation, AnimationExt, AnyElement, ClickEvent, Context, Focusable, FontWeight, SharedString,
+    Window, div, prelude::*, px, rgb, rgba,
 };
 
 use super::{ACCENT, ERROR, MUTED, Screen, Shell};
+use crate::video::{SoundProfile, SoundSettings};
 
 /// Whether headphone and media-key next/previous switch episodes.
 const MEDIA_SKIP_SETTING: &str = "media_skip_buttons";
+/// Whether the player's sound filter is on. (Saved under night mode's
+/// keys, from before it was more than that.)
+const SOUND_ON_SETTING: &str = "night_mode";
+/// Which sound filter: the preset or custom tuning picked, and the custom
+/// tunings (`SoundSettings`, as JSON).
+const SOUND_SETTINGS: &str = "night_mode_profiles";
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub(super) enum SettingsPage {
@@ -49,6 +56,37 @@ impl Shell {
         self.set_flag(MEDIA_SKIP_SETTING, on);
         if let Some(media) = &self.media {
             media.set_skip_buttons(on);
+        }
+    }
+
+    /// Whether videos start with the sound filter on. The player switches
+    /// it too, and saves what it was left at.
+    pub(super) fn sound_on(&self) -> bool {
+        self.flag(SOUND_ON_SETTING, false)
+    }
+
+    /// The player picked a sound filter or switched it off.
+    pub(super) fn sound_chosen(&self, on: bool, profile: SoundProfile) {
+        self.set_flag(SOUND_ON_SETTING, on);
+        let mut settings = self.sound_settings();
+        if settings.profile != profile {
+            settings.profile = profile;
+            self.set_sound_settings(settings);
+        }
+    }
+
+    pub(super) fn sound_settings(&self) -> SoundSettings {
+        self.db
+            .setting(SOUND_SETTINGS)
+            .ok()
+            .flatten()
+            .map(|json| SoundSettings::from_json(&json))
+            .unwrap_or_default()
+    }
+
+    pub(super) fn set_sound_settings(&self, settings: SoundSettings) {
+        if let Err(e) = self.db.set_setting(SOUND_SETTINGS, &settings.to_json()) {
+            eprintln!("[settings] saving the sound filter: {e:#}");
         }
     }
 
@@ -158,7 +196,12 @@ impl Shell {
                     .flex()
                     .flex_col()
                     .gap_2()
-                    .max_w(px(760.0))
+                    // A width, not just a cap: with only `max_w`, sections
+                    // were measured at the page's full width (descriptions
+                    // on one line) but drawn at 760 (wrapped), so a section
+                    // with wrapped rows ran into the next one.
+                    .w(px(760.0))
+                    .max_w_full()
                     // Taller than the window, the page scrolls; the
                     // sections mustn't shrink to fit it.
                     .children(
@@ -383,21 +426,24 @@ impl Shell {
 
     fn playback_settings(&self, cx: &mut Context<Self>) -> Vec<AnyElement> {
         let skip = self.media_skip_buttons();
-        vec![Self::section(
-            "Headphones and media keys",
-            switch_row(
-                "setting-media-skip",
-                "Next and previous switch episodes",
-                "When off, the skip buttons on headphones and keyboards do nothing in the player. \
-                 Play and pause always work.",
-                skip,
-                cx,
-                move |this, _, cx| {
-                    this.set_media_skip_buttons(!skip);
-                    cx.notify();
-                },
+        vec![
+            Self::section("Sound", self.sound_entry(cx)),
+            Self::section(
+                "Headphones and media keys",
+                self.switch_row(
+                    "setting-media-skip",
+                    "Next and previous switch episodes",
+                    "When off, the skip buttons on headphones and keyboards do nothing in the \
+                     player. Play and pause always work.",
+                    skip,
+                    cx,
+                    move |this, _, cx| {
+                        this.set_media_skip_buttons(!skip);
+                        cx.notify();
+                    },
+                ),
             ),
-        )]
+        ]
     }
 }
 
@@ -428,49 +474,96 @@ fn line(label: impl IntoElement) -> gpui::Div {
         .child(label)
 }
 
-/// A setting that's on or off: the text on the left, a switch on the right;
-/// clicking anywhere on the row flips it.
-fn switch_row(
-    id: &'static str,
-    title: &'static str,
-    description: &'static str,
-    on: bool,
-    cx: &mut Context<Shell>,
-    toggle: impl Fn(&mut Shell, &mut Window, &mut Context<Shell>) + 'static,
-) -> AnyElement {
-    div()
-        .id(id)
-        .flex()
-        .items_center()
-        .justify_between()
-        .gap_6()
-        .px_4()
-        .py_3()
-        .rounded_lg()
-        .bg(rgba(0xffffff0a))
-        .hover(|s| s.bg(rgba(0xffffff14)))
-        .cursor_pointer()
-        .child(
-            div()
-                .flex()
-                .flex_col()
-                .gap_1()
-                .min_w(px(0.0))
-                .child(div().font_weight(FontWeight::MEDIUM).child(title))
-                .child(div().text_sm().text_color(rgb(MUTED)).child(description)),
-        )
-        .child(
+impl Shell {
+    /// A setting that's on or off: the text on the left, a switch on the
+    /// right; clicking anywhere on the row flips it.
+    fn switch_row(
+        &self,
+        id: &'static str,
+        title: &'static str,
+        description: &'static str,
+        on: bool,
+        cx: &mut Context<Shell>,
+        toggle: impl Fn(&mut Shell, &mut Window, &mut Context<Shell>) + 'static,
+    ) -> AnyElement {
+        div()
+            .id(id)
+            .flex()
+            .items_center()
+            .justify_between()
+            .gap_6()
+            .px_4()
+            .py_3()
+            .rounded_lg()
+            .bg(rgba(0xffffff0a))
+            .hover(|s| s.bg(rgba(0xffffff14)))
+            .cursor_pointer()
+            .child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .flex_1()
+                    .gap_1()
+                    .min_w(px(0.0))
+                    .child(div().font_weight(FontWeight::MEDIUM).child(title))
+                    .child(div().text_sm().text_color(rgb(MUTED)).child(description)),
+            )
+            .child(self.switch(id, on))
+            .on_click(cx.listener(move |this, _: &ClickEvent, window, cx| {
+                this.revealed.borrow_mut().switch_flipped(id);
+                toggle(this, window, cx);
+            }))
+            .into_any_element()
+    }
+
+    /// The switch itself. Flipped, its knob glides across as its colour
+    /// changes; otherwise it's drawn at rest.
+    pub(super) fn switch(&self, id: &'static str, on: bool) -> AnyElement {
+        // 0: off, 1: on.
+        let track = |p: f32| {
+            let mix =
+                |from: u32, to: u32| (from as f32 + (to as f32 - from as f32) * p).round() as u32;
+            let color = (mix(0xff, ACCENT >> 16) << 24)
+                | (mix(0xff, (ACCENT >> 8) & 0xff) << 16)
+                | (mix(0xff, ACCENT & 0xff) << 8)
+                | mix(0x2e, 0xff);
             div()
                 .flex_none()
                 .w(px(40.0))
                 .h(px(22.0))
                 .p(px(2.0))
                 .rounded_full()
-                .bg(if on { rgb(ACCENT) } else { rgba(0xffffff2e) })
+                .bg(rgba(color))
                 .flex()
-                .when(on, |d| d.justify_end())
-                .child(div().size(px(18.0)).rounded_full().bg(rgb(0xffffff))),
-        )
-        .on_click(cx.listener(move |this, _: &ClickEvent, window, cx| toggle(this, window, cx)))
-        .into_any_element()
+                .child(
+                    div()
+                        .size(px(18.0))
+                        .ml(px(18.0 * p))
+                        .rounded_full()
+                        .bg(rgb(0xffffff)),
+                )
+        };
+        let moving = crate::motion::enabled()
+            .then(|| self.revealed.borrow().switch_moving(id))
+            .flatten();
+        let Some(flips) = moving else {
+            return track(if on { 1.0 } else { 0.0 }).into_any_element();
+        };
+        div()
+            .flex_none()
+            .w(px(40.0))
+            .h(px(22.0))
+            .child(
+                div().size_full().with_animation(
+                    SharedString::from(format!("{id}-switch-{flips}")),
+                    Animation::new(crate::motion::SWITCH.time())
+                        .with_easing(crate::motion::ease_in_out),
+                    move |d, t| {
+                        let p = if on { t } else { 1.0 - t };
+                        d.child(track(p))
+                    },
+                ),
+            )
+            .into_any_element()
+    }
 }

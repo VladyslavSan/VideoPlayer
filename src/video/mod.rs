@@ -3,12 +3,15 @@
 
 #[cfg(target_os = "macos")]
 mod mac;
+mod sound;
 #[cfg(windows)]
 mod win;
 
 use anyhow::{Result, anyhow};
 use gpui::Window;
 use libmpv2::{Mpv, MpvInitializer};
+
+pub use sound::{Downmix, SoundPreset, SoundProfile, SoundSettings, SoundTuning};
 
 #[cfg(target_os = "macos")]
 use mac::Host;
@@ -57,6 +60,23 @@ impl Snapshotter {
             _window: window,
         })
     }
+}
+
+/// Adds or removes the sound filter (`sound.rs`), while playing.
+/// `Err` if mpv can't build it.
+fn set_sound_filter(
+    mpv: &Mpv,
+    on: bool,
+    tuning: &SoundTuning,
+    channels: Option<u32>,
+) -> Result<()> {
+    // Removing one that isn't there is fine.
+    let _ = mpv.command("af", &["remove", "@sound"]);
+    if on {
+        mpv.command("af", &["add", &tuning.filter(channels)])
+            .map_err(|e| anyhow!("sound filter: {e}"))?;
+    }
+    Ok(())
 }
 
 /// The options every player instance gets, whatever draws its video.
@@ -407,6 +427,26 @@ impl VideoSurface {
         self.mpv.get_property("speed").unwrap_or(1.0)
     }
 
+    /// The sound filter on (sounding as `tuning` says, for a track with
+    /// `channels` channels) or off.
+    pub fn set_sound_filter(
+        &self,
+        on: bool,
+        tuning: &SoundTuning,
+        channels: Option<u32>,
+    ) -> Result<()> {
+        set_sound_filter(&self.mpv, on, tuning, channels)
+    }
+
+    /// How many channels the playing audio track decodes to.
+    pub fn audio_channels(&self) -> Option<u32> {
+        self.mpv
+            .get_property::<i64>("audio-params/channel-count")
+            .ok()
+            .and_then(|n| u32::try_from(n).ok())
+            .filter(|n| *n > 0)
+    }
+
     pub fn set_speed(&self, speed: f64) {
         let _ = self.mpv.set_property("speed", speed);
     }
@@ -498,6 +538,59 @@ mod tests {
             std::thread::sleep(std::time::Duration::from_millis(50));
         }
         panic!("{source} did not reach {start}s within {timeout_secs}s");
+    }
+
+    #[test]
+    fn sound_filters_exist() {
+        let Some((_dir, clip)) = crate::test_clip::make() else {
+            return;
+        };
+        let mpv = headless(None);
+        play_from(&mpv, &clip.to_string_lossy(), 0.5, 20);
+        let tuning = SoundTuning::default();
+        set_sound_filter(&mpv, true, &tuning, None).expect("the filter turns on");
+        set_sound_filter(&mpv, true, &tuning, None).expect("and on again, without doubling");
+        let filters: String = mpv.get_property("af").unwrap_or_default();
+        assert_eq!(filters.matches("@sound").count(), 1, "{filters}");
+        // The check means something: a filter mpv lacks is refused.
+        assert!(mpv.command("af", &["add", "lavfi=[nosuchfilter]"]).is_err());
+        set_sound_filter(&mpv, false, &tuning, None).expect("the filter turns off");
+        let filters: String = mpv.get_property("af").unwrap_or_default();
+        assert!(!filters.contains("@sound"), "{filters}");
+        // Every preset's chain is one this mpv builds.
+        for preset in SoundProfile::presets() {
+            set_sound_filter(&mpv, true, &preset.tuning(), Some(2))
+                .unwrap_or_else(|e| panic!("{preset:?}: {e:#}"));
+        }
+    }
+
+    #[test]
+    fn sound_filter_folds_surround_to_stereo() {
+        let Some((_dir, clip)) = crate::test_clip::make_surround() else {
+            return;
+        };
+        let mpv = headless(None);
+        play_from(&mpv, &clip.to_string_lossy(), 0.5, 20);
+        // The decoder reports its channels once it's running.
+        let until = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        let channels = loop {
+            let channels = mpv.get_property::<i64>("audio-params/channel-count");
+            if channels.is_ok() || std::time::Instant::now() > until {
+                break channels;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        };
+        assert_eq!(channels.ok(), Some(6));
+        for downmix in [Downmix::Dialogue, Downmix::Balanced] {
+            let tuning = SoundTuning {
+                downmix,
+                ..SoundTuning::default()
+            };
+            set_sound_filter(&mpv, true, &tuning, Some(6))
+                .unwrap_or_else(|e| panic!("{downmix:?}: {e:#}"));
+            let filters: String = mpv.get_property("af").unwrap_or_default();
+            assert!(filters.contains("pan"), "{filters}");
+        }
     }
 
     #[test]

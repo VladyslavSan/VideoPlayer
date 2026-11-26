@@ -87,6 +87,9 @@ pub enum PlayerEvent {
     SubtitleTuned(SubtitleTuning),
     /// The viewer picked a streaming quality (Jellyfin only).
     QualityChosen(Quality),
+    /// The viewer picked a sound filter or turned it off, to remember:
+    /// whether it's on, and the one picked (kept while it's off).
+    SoundChosen(bool, crate::video::SoundProfile),
 }
 
 /// An episode of the show being played, for the episode list and "next".
@@ -240,9 +243,20 @@ pub struct Player {
     up_next: Option<Instant>,
     prefs: TrackPrefs,
     quality: Option<Quality>,
+    /// The sound filter (`video/sound.rs`: night, dialogue, leveller…),
+    /// whether it's on, and the one picked with the custom tunings from
+    /// Settings.
+    sound_on: bool,
+    sound: crate::video::SoundSettings,
+    /// The audio channels the sound filter was built for: surround may be
+    /// folded to stereo, so it's built again when they change.
+    sound_channels: Option<u32>,
     /// The streaming quality menu (in the tracks panel), with the quality
     /// when it opened (the one checked, even as it fades out after a pick).
     quality_menu: menu::Shown<Quality>,
+    /// The sound filter menu (in the tracks panel), with the choice when
+    /// it opened (None: off).
+    sound_menu: menu::Shown<Option<crate::video::SoundProfile>>,
     /// When mpv's video output came up for the current source.
     video_ready_since: Option<Instant>,
     /// After `reload`, the new source; until mpv reports it, track and
@@ -469,6 +483,10 @@ impl Player {
             stall: None,
             panel: None,
             quality_menu: menu::Shown::default(),
+            sound_menu: menu::Shown::default(),
+            sound_on: false,
+            sound: Default::default(),
+            sound_channels: None,
             drag: None,
             scrub: None,
             seek_hover: None,
@@ -610,6 +628,7 @@ impl Player {
         if self.exited {
             return;
         }
+        self.follow_audio_channels();
         let v = &self.video;
         self.status = Status {
             position: v.position(),
@@ -1019,6 +1038,83 @@ impl Player {
         }
     }
 
+    /// The sound filter as saved, at the start (no note: it's how it was).
+    pub fn start_sound(&mut self, on: bool, sound: crate::video::SoundSettings) {
+        self.sound = sound;
+        if !on {
+            return;
+        }
+        self.sound_channels = self.video.audio_channels();
+        match self
+            .video
+            .set_sound_filter(true, &self.sound.tuning(), self.sound_channels)
+        {
+            Ok(()) => self.sound_on = true,
+            Err(e) => eprintln!("[player] {e:#}"),
+        }
+    }
+
+    /// The sound filter in use: None when it's off.
+    fn sound_choice(&self) -> Option<crate::video::SoundProfile> {
+        self.sound_on.then_some(self.sound.profile)
+    }
+
+    /// Some tunings fold surround to stereo: when the audio's channels
+    /// change (the file opened, another track picked), the filter is built
+    /// again for them.
+    fn follow_audio_channels(&mut self) {
+        let tuning = self.sound.tuning();
+        if !self.sound_on || tuning.downmix == crate::video::Downmix::Off {
+            return;
+        }
+        let channels = self.video.audio_channels();
+        if channels.is_none() || channels == self.sound_channels {
+            return;
+        }
+        self.sound_channels = channels;
+        if let Err(e) = self.video.set_sound_filter(true, &tuning, channels) {
+            eprintln!("[player] {e:#}");
+        }
+    }
+
+    /// Switches to `choice` (None: off), with a note, and has it remembered.
+    fn choose_sound(&mut self, choice: Option<crate::video::SoundProfile>, cx: &mut Context<Self>) {
+        self.sound_menu.close();
+        if choice == self.sound_choice() {
+            return;
+        }
+        let mut sound = self.sound;
+        if let Some(profile) = choice {
+            sound.profile = profile;
+        }
+        self.sound_channels = self.video.audio_channels();
+        if let Err(e) =
+            self.video
+                .set_sound_filter(choice.is_some(), &sound.tuning(), self.sound_channels)
+        {
+            eprintln!("[player] {e:#}");
+            self.toast("The sound filter isn't available here");
+            return;
+        }
+        self.sound = sound;
+        self.sound_on = choice.is_some();
+        self.toast(match choice {
+            Some(profile) => format!("Sound filter: {}", profile.label()),
+            None => "Sound filter off".to_string(),
+        });
+        cx.emit(PlayerEvent::SoundChosen(self.sound_on, self.sound.profile));
+    }
+
+    /// The sound filter off, or back on as last picked (its key).
+    fn toggle_sound(&mut self, cx: &mut Context<Self>) {
+        let choice = if self.sound_on {
+            None
+        } else {
+            Some(self.sound.profile)
+        };
+        self.choose_sound(choice, cx);
+    }
+
     fn toggle_mute(&mut self) {
         self.status.muted = !self.status.muted;
         self.video.set_muted(self.status.muted);
@@ -1229,7 +1325,7 @@ impl Player {
         let key = event.keystroke.unparse();
         if key == "escape" {
             // The innermost thing open closes first.
-            if self.quality_menu.close() {
+            if self.quality_menu.close() | self.sound_menu.close() {
                 // Closed (fading out).
             } else if self.panel.is_some() {
                 self.panel = None;
@@ -1302,6 +1398,7 @@ impl Player {
             Action::Faster => self.step_speed(1),
             Action::SubtitlesEarlier => self.step_subtitle_delay(-0.1, cx),
             Action::SubtitlesLater => self.step_subtitle_delay(0.1, cx),
+            Action::SoundFilter => self.toggle_sound(cx),
             Action::Fullscreen => window.toggle_fullscreen(),
             Action::NextEpisode if has_episodes => {
                 self.play_next(cx);

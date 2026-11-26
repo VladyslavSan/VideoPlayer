@@ -5,7 +5,9 @@
 //! never flashes one; if it did show, it fades out as what it waited for
 //! fades in.
 
+use std::cell::Cell;
 use std::collections::HashMap;
+use std::rc::Rc;
 use std::time::{Duration, Instant};
 
 use gpui::{
@@ -14,6 +16,13 @@ use gpui::{
 
 use super::Shell;
 use crate::motion::{APPEAR, WAIT};
+
+/// A tooltip `elapsed` after the mouse went onto its thing: nothing for a
+/// moment, then fading in.
+pub(super) fn tip_shown(elapsed: Duration) -> f32 {
+    let t = (elapsed.saturating_sub(TIP_DELAY)).as_secs_f32() / APPEAR.time().as_secs_f32();
+    crate::motion::ease_in_out(t.min(1.0))
+}
 
 /// Shown this soon after its page opened, it came with the page.
 const WITH_THE_PAGE: Duration = Duration::from_millis(30);
@@ -29,9 +38,122 @@ pub(super) struct Revealed {
     replaced: HashMap<SharedString, f32>,
     /// Text that changes in place: what it says, what it said, since when.
     texts: HashMap<SharedString, (SharedString, Option<SharedString>, Instant)>,
+    /// Switches, by id: how many times each was flipped, and when last
+    /// (kept across pages, so a switch only moves when it's flipped).
+    switches: HashMap<SharedString, (u32, Instant)>,
+    /// Entries that unfold (sound filters in Settings), by id: open or not.
+    open: HashMap<&'static str, bool>,
+    /// Their content's natural height, measured as they draw.
+    fold_heights: HashMap<&'static str, Rc<Cell<f32>>>,
+    /// Sliders, by id: (value, value it glides from, since when, how many
+    /// glides), so a value set from elsewhere (a preset) glides there.
+    glides: HashMap<&'static str, (f32, f32, Instant, u32)>,
+    /// The tooltip asked for (by hovering), since when, and which time
+    /// (to key its animation).
+    tip: Option<(&'static str, Instant, u32)>,
+    /// The one before, fading out: how visible it was, and which time.
+    tip_leaving: Option<(&'static str, f32, u32)>,
+    tips: u32,
 }
 
+/// Where a tooltip is.
+#[derive(Clone, Copy)]
+pub(super) enum Tip {
+    Hidden,
+    /// Waiting, then fading in; the number keys its animation.
+    Showing(u32),
+    /// Fading out from this visible, keyed by the number.
+    Leaving(f32, u32),
+}
+
+/// A tooltip waits this long under the mouse before fading in.
+pub(super) const TIP_DELAY: Duration = Duration::from_millis(450);
+
 impl Revealed {
+    pub(super) fn is_open(&self, id: &'static str) -> bool {
+        self.open.get(id).copied().unwrap_or(false)
+    }
+
+    /// Opens or closes `id`; its fold moves like a switch.
+    pub(super) fn toggle_open(&mut self, id: &'static str) {
+        let open = !self.is_open(id);
+        self.open.insert(id, open);
+        self.switch_flipped(id);
+    }
+
+    pub(super) fn fold_height(&mut self, id: &'static str) -> Rc<Cell<f32>> {
+        self.fold_heights.entry(id).or_default().clone()
+    }
+
+    /// Where a slider's knob is drawn from: `value`, or, just after it
+    /// changed other than by dragging, gliding there from the old one
+    /// (`Some((from, glides))`, the count keying its animation).
+    pub(super) fn glide(
+        &mut self,
+        id: &'static str,
+        value: f32,
+        dragging: bool,
+    ) -> Option<(f32, u32)> {
+        let now = Instant::now();
+        let entry = self.glides.entry(id).or_insert((value, value, now, 0));
+        if entry.0 != value {
+            *entry = if dragging {
+                (value, value, entry.2, entry.3)
+            } else {
+                (value, entry.0, now, entry.3 + 1)
+            };
+        }
+        (entry.1 != entry.0 && entry.2.elapsed() < crate::motion::SWITCH.time())
+            .then_some((entry.1, entry.3))
+    }
+
+    /// The mouse went onto (`true`) or off something with a tooltip.
+    pub(super) fn hover_tip(&mut self, id: &'static str, hovered: bool) {
+        let current = self.tip.is_some_and(|(tip, _, _)| tip == id);
+        if hovered && !current {
+            self.hover_tip_off();
+            self.tips += 1;
+            self.tip = Some((id, Instant::now(), self.tips));
+        } else if !hovered && current {
+            self.hover_tip_off();
+        }
+    }
+
+    fn hover_tip_off(&mut self) {
+        if let Some((id, since, _)) = self.tip.take() {
+            let shown = tip_shown(since.elapsed());
+            if shown > 0.0 {
+                self.tips += 1;
+                self.tip_leaving = Some((id, shown, self.tips));
+            }
+        }
+    }
+
+    pub(super) fn tip(&self, id: &'static str) -> Tip {
+        match (self.tip, self.tip_leaving) {
+            (Some((tip, _, n)), _) if tip == id => Tip::Showing(n),
+            (_, Some((tip, from, n))) if tip == id => Tip::Leaving(from, n),
+            _ => Tip::Hidden,
+        }
+    }
+
+    pub(super) fn switch_flipped(&mut self, id: &str) {
+        let entry = self
+            .switches
+            .entry(SharedString::from(id.to_string()))
+            .or_insert((0, Instant::now()));
+        *entry = (entry.0 + 1, Instant::now());
+    }
+
+    /// For a switch still on its way across: how many times it was
+    /// flipped (to key its animation). None once it's at rest.
+    pub(super) fn switch_moving(&self, id: &str) -> Option<u32> {
+        self.switches
+            .get(id)
+            .filter(|(_, at)| at.elapsed() < crate::motion::SWITCH.time())
+            .map(|(flips, _)| *flips)
+    }
+
     /// A new page: everything on it is new.
     pub(super) fn page_opened(&mut self) {
         self.since = Some(Instant::now());

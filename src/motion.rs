@@ -41,6 +41,9 @@ pub const HOVER: Timing = Timing::ms(350);
 /// opening and closing (also the subtitles moving out of the control bar's
 /// way, and the black lifting off the video once it's on screen).
 pub const OVERLAY: Timing = Timing::ms(350);
+/// A switch going from off to on or back: its knob gliding across, its
+/// colour changing.
+pub const SWITCH: Timing = Timing::ms(350);
 /// A mouse wheel step gliding to a stop (about 95% of the way).
 pub const WHEEL: Timing = Timing::ms(350);
 
